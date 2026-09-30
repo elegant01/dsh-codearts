@@ -205,6 +205,15 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
           setMsg(t('loginFailed'))
           return
         }
+        // 服务端已经不认识这个会话：登录完成/超时/插件重载都会走到这。继续空转
+        // 按钮就会永远停在「登录中」——把 idle 也当终止态，刷新一次让卡片反映
+        // 真实结果（加上就是多一个账号，没加上就是没变）。
+        if (st.status === 'idle') {
+          setLoginUrl(null)
+          setLoginPending(false)
+          await refresh()
+          return
+        }
         setTimeout(() => void poll(), 1500)
       }
       void poll()

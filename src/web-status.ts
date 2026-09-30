@@ -328,6 +328,8 @@ function accountsHandler(deps: CodeArtsStatusRouteOptions) {
 export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRouteOptions): void {
   ctx.effect(() => {
     const activeLogins = new Map<string, LoginSession>()
+    /** 已结束登录的终态，供迟到的轮询读取。被读一次即删。 */
+    const recentLogins = new Map<string, LoginOutcome>()
     const disposeStatus = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_STATUS_PATH,
@@ -354,12 +356,12 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
     const disposeLoginStart = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_LOGIN_PATH,
-      handler: loginStartHandler(deps, activeLogins),
+      handler: loginStartHandler(deps, activeLogins, recentLogins),
     })
     const disposeLoginStatus = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_LOGIN_STATUS_PATH,
-      handler: loginPollHandler(deps, activeLogins),
+      handler: loginPollHandler(deps, activeLogins, recentLogins),
     })
     const disposeAccounts = ctx.webServer.register({
       kind: 'exact',
@@ -388,8 +390,24 @@ function tokenHandler(deps: CodeArtsStatusRouteOptions) {
     req.method === 'DELETE' ? remove(req, res) : post(req, res)
 }
 
+/** 一次登录的终态。落库成功才算 done；落库失败按 error 报给卡片。 */
+type LoginOutcome = 'done' | 'error'
+
+/** 记一次登录终态；超出容量就丢最旧的，别让这个表无限长。 */
+function recordLoginOutcome(recent: Map<string, LoginOutcome>, url: string, outcome: LoginOutcome): void {
+  if (recent.size >= 20 && !recent.has(url)) {
+    const oldest = recent.keys().next().value
+    if (oldest !== undefined) recent.delete(oldest)
+  }
+  recent.set(url, outcome)
+}
+
 /** POST /api/codearts/login — 启动本地 OAuth 回调，返回授权 URL。 */
-function loginStartHandler(deps: CodeArtsStatusRouteOptions, active: Map<string, LoginSession>) {
+function loginStartHandler(
+  deps: CodeArtsStatusRouteOptions,
+  active: Map<string, LoginSession>,
+  recent: Map<string, LoginOutcome>,
+) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method !== 'POST') {
       json(res, 405, { error: 'method not allowed' })
@@ -401,14 +419,34 @@ function loginStartHandler(deps: CodeArtsStatusRouteOptions, active: Map<string,
     }
     try {
       const session = await startLogin()
-      // 5 分钟超时后自动清理
+      active.set(session.url, session)
+      // 终态只在 promise 兑现/失败时处理**一次**：落库 + 记下结果。之后不管卡片
+      // 轮询多少次、迟到的轮询什么时候到，都从 recent 里读这个终态——不能在每个
+      // 轮询里各自 .then 一遍（那样登录完成时所有叠着的回调会一起跑、把会话从
+      // active 里删掉，下一次轮询就只能看到 idle，卡片按钮永远停在「登录中」）。
+      session.promise.then(
+        async token => {
+          active.delete(session.url)
+          try {
+            await deps.store.upsertFromOAuth(token)
+            recordLoginOutcome(recent, session.url, 'done')
+          } catch {
+            recordLoginOutcome(recent, session.url, 'error')
+          }
+        },
+        () => {
+          active.delete(session.url)
+          recordLoginOutcome(recent, session.url, 'error')
+        },
+      )
+      // 5 分钟超时：关回调端口。注意此时 promise 永远不会兑现（take() 没有等
+      // 到 code 就一直挂着），所以终态要在这里自己记，不能指望上面的 .then。
       const timer = setTimeout(() => {
         session.close()
-        active.delete(session.url)
+        if (active.delete(session.url)) recordLoginOutcome(recent, session.url, 'error')
       }, 5 * 60 * 1000)
       // finally 派生出的 promise 会继承 rejection —— 登录失败时同样会变成未处理 rejection。
       session.promise.finally(() => clearTimeout(timer)).catch(() => {})
-      active.set(session.url, session)
       json(res, 200, { url: session.url, port: session.port })
     } catch (error: unknown) {
       json(res, 500, { error: safeMessage(error) })
@@ -416,11 +454,12 @@ function loginStartHandler(deps: CodeArtsStatusRouteOptions, active: Map<string,
   }
 }
 
-/** GET /api/codearts/login/status — 轮询登录结果，完成则落库并清理。 */
-function loginPollHandler(deps: CodeArtsStatusRouteOptions, active: Map<string, LoginSession>) {
-  // 每次轮询都会给同一个 session.promise 挂一个 .then，登录完成时这些回调会
-  // 一起跑 —— 不拦一道就会出现多次并发 setFromOAuth（并发写同一份凭证文件）。
-  const claimed = new WeakSet<LoginSession>()
+/** GET /api/codearts/login/status — 轮询登录结果。 */
+function loginPollHandler(
+  _deps: CodeArtsStatusRouteOptions,
+  active: Map<string, LoginSession>,
+  recent: Map<string, LoginOutcome>,
+) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method !== 'GET') {
       json(res, 405, { error: 'method not allowed' })
@@ -432,32 +471,18 @@ function loginPollHandler(deps: CodeArtsStatusRouteOptions, active: Map<string, 
     }
     const url = new URL(req.url ?? '', 'http://localhost')
     const key = url.searchParams.get('url') ?? ''
-    const session = active.get(key)
-    if (!session) {
-      json(res, 200, { status: 'idle' })
+    if (active.has(key)) {
+      json(res, 200, { status: 'pending' })
       return
     }
-    const result = await Promise.race([
-      session.promise.then(
-        (token): { status: string } => {
-          if (!claimed.has(session)) {
-            claimed.add(session)
-            // 必须吞掉 rejection：宿主把未处理的 rejection 当 fatal，整个应用会退出。
-            // upsert 语义：同一个账号（userId 相同）是更新，别的账号是**新增** ——
-            // 所以「再登录一次」就是「添加一个账号」，登录路由本身不用改。
-            void deps.store.upsertFromOAuth(token).catch(() => {})
-          }
-          active.delete(key)
-          return { status: 'done' }
-        },
-        (): { status: string } => {
-          active.delete(key)
-          return { status: 'error' }
-        },
-      ),
-      // 避免长轮询阻塞：若还没完成，返回 pending
-      new Promise<{ status: string }>(resolve => setTimeout(() => resolve({ status: 'pending' }), 0)),
-    ])
-    json(res, 200, result)
+    const outcome = recent.get(key)
+    if (outcome !== undefined) {
+      // 读完即消费：这个终态只告诉第一个来问的轮询。卡片侧把 idle 也当终止态
+      // 兜底，所以第二个轮询拿不到 done 也不会卡死。
+      recent.delete(key)
+      json(res, 200, { status: outcome })
+      return
+    }
+    json(res, 200, { status: 'idle' })
   }
 }

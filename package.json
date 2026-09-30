@@ -2,7 +2,7 @@
   "name": "dsh-codearts",
   "displayName": "DSH CodeArts Connect",
   "description": "把华为云 CodeArts 接入 DeepSeek Harness —— 内置 OAuth2 登录（PKCE + DPoP），登录后即可在 DSH 对话窗口使用 CodeArts 的模型。",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "elegant01",
   "keywords": [
     "dsh-plugin",
