@@ -1,5 +1,7 @@
 # dsh-codearts 安装与验证指引
 
+[English](./INSTALL.en.md) | 中文
+
 把华为云 CodeArts 接入 DeepSeek Harness 桌面版（DSH）的插件。
 
 ## 一、安装到 desktop profile

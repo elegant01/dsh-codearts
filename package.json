@@ -48,6 +48,10 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "README.en.md",
+    "INSTALL.md",
+    "INSTALL.en.md",
+    "DEV.md",
     "LICENSE"
   ],
   "license": "MIT",
