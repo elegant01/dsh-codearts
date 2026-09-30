@@ -218,12 +218,19 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     const reader = upstream.getReader()
     const decoder = new TextDecoder()
     let buf = ''
+    // 上游流里可能已经带了终止帧（openAIDone）。收尾时只在没写过的情况下补，
+    // 否则下游会连续收到两个 data: [DONE]。
+    let sawDone = false
+    const finish = (): void => {
+      if (!res.writable || res.writableEnded) return
+      res.end(sawDone ? undefined : 'data: [DONE]\n\n')
+    }
     const pump = async (): Promise<void> => {
       try {
         for (;;) {
           const { done, value } = await reader.read()
           if (done) {
-            if (res.writable && !res.writableEnded) res.end('data: [DONE]\n\n')
+            finish()
             return
           }
           buf += decoder.decode(value, { stream: true })
@@ -232,7 +239,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           while ((idx = buf.indexOf('\n\n')) >= 0) {
             const frame = buf.slice(0, idx)
             buf = buf.slice(idx + 2)
-            if (frame && res.writable) res.write(frame + '\n\n')
+            if (!frame) continue
+            if (frame.trim() === 'data: [DONE]') sawDone = true
+            if (res.writable) res.write(frame + '\n\n')
           }
         }
       } catch (error: unknown) {
@@ -240,7 +249,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         if (!controller.signal.aborted) {
           logger?.warn('dsh-codearts: upstream stream failed mid-flight', error)
         }
-        if (res.writable && !res.writableEnded) res.end('data: [DONE]\n\n')
+        finish()
       }
     }
     void pump()

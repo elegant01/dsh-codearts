@@ -235,73 +235,100 @@ export async function chatStream(
   const decoder = new TextDecoder()
   let lastText = ''
   let sentAny = false
+  // 终止帧只允许出现一次：上游可能已经发过裸 data:[DONE]，流正常结束时
+  // 不能再补一个，否则下游会看到重复的收尾帧。
+  let doneSent = false
   // SSE 帧可能跨 TCP chunk 被切断；攒 buffer 按 \n 切行。
   let sseBuf = ''
 
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
-        const { done, value } = await reader.read()
-        if (done) {
-          if (sentAny) controller.enqueue(openAIDone())
-          controller.close()
-          return
-        }
-        sseBuf += decoder.decode(value, { stream: true })
-        const lines = sseBuf.split('\n')
-        sseBuf = lines.pop() ?? ''
-        for (const raw of lines) {
-          const trimmed = raw.trim()
-          if (!trimmed.startsWith('data:')) continue
-          const payload = trimmed.slice(5).trim()
-          // 裸 data:[DONE] 是流终止帧,原样透传给下游(pi-ai 依赖它收尾)。
-          if (payload === '[DONE]') {
-            sentAny = true
-            controller.enqueue(openAIDone())
-            continue
-          }
-          if (!payload) continue
-          let ev: any
-          try {
-            ev = JSON.parse(payload)
-          } catch {
-            continue
-          }
-          if (ev.error_code && ev.error_code !== '0' && ev.error_code !== 0) {
-            controller.enqueue(
-              openAIData({
-                choices: [{ delta: { content: '' }, finish_reason: 'stop' }],
-                error: { code: ev.error_code, message: ev.error_msg ?? 'upstream error' },
-              }),
-            )
-            controller.enqueue(openAIDone())
+        // 这一层必须一直读到「至少产出一帧」或上游结束为止,不能只 read 一次。
+        //
+        // 单次 read 拿到的数据可能什么都不产出:半行 JSON（帧被 TCP 切断）、
+        // SSE 注释/心跳、空行,或旧协议的 {"type":"answer","text":""} 开头帧
+        // 和 {"text":"[DONE]"} 收尾帧。此时若直接 return,运行时不会再回调
+        // pull,整个流就永久卡死——客户端一直转圈,既不结束也不报错。
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) {
+            if (sentAny && !doneSent) controller.enqueue(openAIDone())
             controller.close()
             return
           }
-          // 2026-09-30 实测:当前上游直接回标准 OpenAI chat.completion.chunk
-          // (choices[].delta.content / reasoning_content),且流以裸 data:[DONE]
-          // 结束。这种帧原样透传,不做任何转换。
-          if (Array.isArray(ev.choices) && ev.choices.length > 0) {
-            sentAny = true
-            controller.enqueue(enc.encode(`data: ${JSON.stringify(ev)}\n\n`))
-            continue
-          }
-          // ——以下为旧版协议帧(累计全文快照),保留兼容——
-          // 增量 delta
-          if (ev.delta?.content) {
-            sentAny = true
-            controller.enqueue(openAIData({ model, choices: [{ delta: { content: ev.delta.content }, finish_reason: null }] }))
-          }
-          // 累计全文快照：用替换语义算增量
-          if (typeof ev.text === 'string' && ev.text !== '[DONE]') {
-            const cur = ev.text
-            if (cur.length > lastText.length && cur.startsWith(lastText)) {
-              const delta = cur.slice(lastText.length)
+          sseBuf += decoder.decode(value, { stream: true })
+          const lines = sseBuf.split('\n')
+          sseBuf = lines.pop() ?? ''
+          let emitted = false
+          for (const raw of lines) {
+            const trimmed = raw.trim()
+            if (!trimmed.startsWith('data:')) continue
+            const payload = trimmed.slice(5).trim()
+            // 裸 data:[DONE] 是流终止帧,原样透传给下游(pi-ai 依赖它收尾)。
+            if (payload === '[DONE]') {
               sentAny = true
-              controller.enqueue(openAIData({ model, choices: [{ delta: { content: delta }, finish_reason: null }] }))
+              if (!doneSent) {
+                doneSent = true
+                controller.enqueue(openAIDone())
+                emitted = true
+              }
+              continue
             }
-            lastText = cur
+            if (!payload) continue
+            let ev: any
+            try {
+              ev = JSON.parse(payload)
+            } catch {
+              continue
+            }
+            if (ev.error_code && ev.error_code !== '0' && ev.error_code !== 0) {
+              controller.enqueue(
+                openAIData({
+                  choices: [{ delta: { content: '' }, finish_reason: 'stop' }],
+                  error: { code: ev.error_code, message: ev.error_msg ?? 'upstream error' },
+                }),
+              )
+              controller.enqueue(openAIDone())
+              controller.close()
+              return
+            }
+            // 2026-09-30 实测:当前上游直接回标准 OpenAI chat.completion.chunk
+            // (choices[].delta.content / reasoning_content),且流以裸 data:[DONE]
+            // 结束。这种帧原样透传,不做任何转换。
+            //
+            // 注意判据是「有 choices 字段」而不是「choices 非空」：开了
+            // stream_options.include_usage 后,承载 usage 的收尾帧形如
+            // {"choices":[],"usage":{...}}。用 length > 0 会把这一帧漏掉——
+            // 它既没有 legacy 的 delta/text,就会一路掉到函数末尾被丢弃,
+            // 于是 DSH 底部的用量药丸永远拿不到数据。
+            if (Array.isArray(ev.choices)) {
+              sentAny = true
+              controller.enqueue(enc.encode(`data: ${JSON.stringify(ev)}\n\n`))
+              emitted = true
+              continue
+            }
+            // ——以下为旧版协议帧(累计全文快照),保留兼容——
+            // 增量 delta
+            if (ev.delta?.content) {
+              sentAny = true
+              controller.enqueue(openAIData({ model, choices: [{ delta: { content: ev.delta.content }, finish_reason: null }] }))
+              emitted = true
+            }
+            // 累计全文快照：用替换语义算增量
+            if (typeof ev.text === 'string' && ev.text !== '[DONE]') {
+              const cur = ev.text
+              if (cur.length > lastText.length && cur.startsWith(lastText)) {
+                const delta = cur.slice(lastText.length)
+                sentAny = true
+                controller.enqueue(openAIData({ model, choices: [{ delta: { content: delta }, finish_reason: null }] }))
+                emitted = true
+              }
+              lastText = cur
+            }
           }
+          // 有产出就交还给消费者；没有则继续读，直到读到有产出的帧或上游结束。
+          if (emitted) return
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
