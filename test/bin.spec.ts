@@ -79,6 +79,24 @@ describe('status', () => {
     expect(res.code).toBe(0)
   })
 
+  // 回归：登录响应里的 user_name/user_id 是空串，会被原样写进 label。用 `??` 兜底
+  // 会打印出「-   (expires …)」这种认不出是哪个账号的行。
+  it('falls back to the account id when the stored label is empty', async () => {
+    await writeFile(authPath, JSON.stringify({
+      token: FAKE_TOKEN,
+      accessKeyId: FAKE_AK,
+      secretAccessKey: FAKE_SECRET,
+      label: '   ',
+      userName: '',
+      storedAt: Date.now(),
+      expiration: '2030-01-01T00:00:00Z',
+    }), 'utf8')
+    const res = await cli(home, ['status'])
+    const accountLine = res.stdout.split('\n').find(line => line.includes('expires')) ?? ''
+    expect(accountLine.trim()).toMatch(/^-\s+\S/) // 有名字，而不是「-   (expires …)」
+    expect(accountLine).not.toMatch(/^-\s{2,}\(/)
+  })
+
   it('emits a machine-readable document with --json', async () => {
     await seed()
     const res = await cli(home, ['status', '--json'])

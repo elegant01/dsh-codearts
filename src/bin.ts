@@ -76,14 +76,28 @@ interface DoctorOut {
   hints: string[]
 }
 
-/** 一句话描述一个账号，供人类可读输出用。 */
+/**
+ * 一句话描述一个账号，供人类可读输出用。
+ *
+ * 注意空串也要当「没有」：`credentialFromOAuth` 会把上游返回的空 `user_name` /
+ * `user_id` 原样写进 label，用 `??` 兜底会得到一个空名字，于是 `status` 打印出
+ * `-   (expires …)` 这种认不出是哪个账号的行。
+ */
 function describeAccount(account: CodeArtsAccountSummary): string {
-  const name = account.label ?? account.userName ?? account.id
+  const name = firstNonEmpty(account.label, account.userName, `${account.id.slice(0, 12)}…`)
   const notes: string[] = []
   if (account.stale) notes.push('needs sign-in')
   else if (typeof account.expiration === 'string') notes.push(`expires ${account.expiration}`)
   if (!account.signable) notes.push('no AK/SK')
   return notes.length === 0 ? name : `${name}  (${notes.join(', ')})`
+}
+
+/** 第一个非空（去空白后）的字符串。 */
+function firstNonEmpty(...values: readonly (string | undefined)[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  }
+  return ''
 }
 
 function store(): CodeArtsAccountStore {
