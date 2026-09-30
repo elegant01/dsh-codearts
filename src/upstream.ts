@@ -287,6 +287,12 @@ export async function chatStream(
     resp = await fetch(req, { signal })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
+    // 用户点「停止生成」会让 fetch 抛 AbortError，它也会走到这里。那不是上游故障，
+    // 绝不能归类成 'server' —— 调用方会据此把账号判为故障（冷却/停用），于是「打断
+    // 一次」就变成「这个账号三十秒内不可用」。调用方仍必须先看 signal.aborted。
+    if (signal?.aborted === true) {
+      return { ok: false, kind: 'client', status: 0, message: 'aborted by client' }
+    }
     return { ok: false, kind: 'server', status: 0, message }
   }
   if (!resp.ok) {

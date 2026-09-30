@@ -59,6 +59,32 @@ function post(port: number, bearer: string): Promise<{ status: number; text: str
   })
 }
 
+/** 发起一次聊天，`abortAfterMs` 之后模拟用户点「停止生成」（断开连接）。 */
+function postAbortable(port: number, bearer: string, abortAfterMs: number): Promise<void> {
+  return new Promise(resolve => {
+    const payload = JSON.stringify({ model: 'GLM-5.2', messages: [{ role: 'user', content: 'hi' }], stream: true })
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: {
+        host: `127.0.0.1:${port}`,
+        authorization: `Bearer ${bearer}`,
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload),
+      },
+    }, res => {
+      res.on('data', () => {})
+      res.on('end', () => resolve())
+    })
+    req.on('error', () => resolve())
+    setTimeout(() => { req.destroy(); resolve() }, abortAfterMs)
+    req.write(payload)
+    req.end()
+  })
+}
+
 let shim: CodeArtsShim
 let port: number
 let bearer: string
@@ -181,6 +207,71 @@ describe('cross-account failover', () => {
     expect(res.status).toBe(200)
     expect(res.text).toContain('来自 B')
     expect(pool.get('A')?.disabled).toBe(true)
+  })
+
+  // 用户「随时打断」不该有任何代价。曾经不是这样：在收到第一个字节之前中止，
+  // fetch 抛的 AbortError 被当成上游 5xx，于是这个账号被冷却 30 秒 —— 打断几次
+  // 之后 pick() 选不出账号，表现就是「打断之后再也问不动了」。
+  describe('client abort', () => {
+    /**
+     * 第一个请求永远不响应，直到客户端断开 —— 模拟「还没出字就点了停止」，
+     * 也就是最容易踩到那个误判的时机。之后放行，便于测紧接着的请求。
+     */
+    async function startWithHangingFirstCall(): Promise<void> {
+      ids = ['A']
+      seenTokens = []
+      let hang = true
+      vi.stubGlobal('fetch', vi.fn(async (_input: Request, init?: { signal?: AbortSignal }) => {
+        seenTokens.push('A')
+        if (hang) {
+          hang = false
+          // 忠实模拟 fetch：signal 中止时以 AbortError 拒绝。
+          await new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              const err = new Error('This operation was aborted')
+              err.name = 'AbortError'
+              reject(err)
+            }, { once: true })
+          })
+        }
+        return sseResponse(OK_CHUNKS)
+      }))
+      pool = new CodeArtsAccountPool([])
+      shim = createCodeArtsShim({
+        store: { ids: async () => ids, resolve: async (id: string) => credentialFor(id) } as never,
+        catalog: { current: () => [] } as never,
+        pool,
+      })
+      await shim.ready
+      port = Number(new URL(shim.baseUrl()).port)
+      bearer = shim.token()
+    }
+
+    const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 100))
+
+    it('does not cool down or disable the account', async () => {
+      await startWithHangingFirstCall()
+      await postAbortable(port, bearer, 150)
+      await settle()
+
+      const account = pool.get('A')
+      expect(account?.disabled).toBe(false)
+      expect(account?.coolUntil).toBe(0)
+      expect(account?.activeConcurrent).toBe(0)
+      expect(pool.healthy('A')).toBe(true)
+    })
+
+    it('lets the very next request through immediately', async () => {
+      await startWithHangingFirstCall()
+      await postAbortable(port, bearer, 150)
+      await settle()
+
+      const started = Date.now()
+      const res = await post(port, bearer)
+      expect(res.status).toBe(200)
+      // 没有被冷却的话，第二次请求应当是毫秒级；30 秒冷却会在这里露馅。
+      expect(Date.now() - started).toBeLessThan(3_000)
+    })
   })
 
   // 单账号没有别的号可换，只能原地等槽位释放 —— 这是兜底路径。

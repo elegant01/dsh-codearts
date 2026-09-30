@@ -269,13 +269,15 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           continue
         }
         const result = await chatStream(credential, prepared, controller.signal)
+        // 用户点「停止生成」时这次上游调用会以 AbortError 失败。那**不是账号故障**，
+        // 必须在这里就返回：放它落到下面的分类里，每打断一次就会把这个账号冷却 30 秒，
+        // 几次之后 pick() 选不出账号，表现就是「打断之后再也问不动了」。
+        if (controller.signal.aborted) {
+          if (result.ok) await result.stream.cancel().catch(() => {})
+          return
+        }
         if (result.ok) {
           pool.noteSuccess(id)
-          if (controller.signal.aborted) {
-            // 断开发生在等上游响应头期间：把上游连接释放掉再走人。
-            await result.stream.cancel().catch(() => {})
-            return
-          }
           await pipeToResponse(res, result.stream, controller.signal)
           return
         }
@@ -317,12 +319,13 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           const credential = await store.resolve(cappedAccount)
           if (credential !== undefined) {
             const result = await openStream(credential, prepared, controller.signal)
+            // 同上：客户端主动中止不算账号故障，不要拿它去回写池状态。
+            if (controller.signal.aborted) {
+              if (result.ok) await result.stream.cancel().catch(() => {})
+              return
+            }
             if (result.ok) {
               pool.noteSuccess(cappedAccount)
-              if (controller.signal.aborted) {
-                await result.stream.cancel().catch(() => {})
-                return
-              }
               await pipeToResponse(res, result.stream, controller.signal)
               return
             }
