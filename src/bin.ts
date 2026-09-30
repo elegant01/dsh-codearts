@@ -2,10 +2,16 @@
 /**
  * dsh-codearts CLI: sign-in state, diagnostics and sign-out.
  *
- *   dsh plugin --profile web exec dsh-codearts status        # sign-in state + models
+ *   dsh plugin --profile web exec dsh-codearts status        # sign-in state + seed models
  *   dsh plugin --profile web exec dsh-codearts status --json # machine-readable
+ *   dsh plugin --profile web exec dsh-codearts models        # discover the account's real models
+ *   dsh plugin --profile web exec dsh-codearts models --json # machine-readable
  *   dsh plugin --profile web exec dsh-codearts doctor        # secret-free diagnostics
  *   dsh plugin --profile web exec dsh-codearts logout        # drop the plugin's credential
+ *
+ * `models` asks the upstream for the account's real catalog (built-in, limited-time
+ * benefit and agent-center sources) instead of printing the hand-maintained seed —
+ * that is the first thing to run when a model is missing from the picker.
  *
  * `doctor` never prints token material — only paths, booleans and versions —
  * so its output is safe to paste into a bug report. `logout` removes only this
@@ -16,13 +22,14 @@
 
 import { existsSync, statSync } from 'node:fs'
 import { codeartsAccountsPath, CodeArtsAccountStore, type CodeArtsAccountSummary } from './auth.ts'
-import { FALLBACK_CODEARTS_MODELS } from './catalog.ts'
+import { FALLBACK_CODEARTS_MODELS, isBenefitModel } from './catalog.ts'
+import { discoverModels } from './discovery.ts'
 import { CODEARTS_VERSION } from './version.ts'
 
-/** Bumped when a `--json` document changes shape (2: multi-account). */
-const JSON_SCHEMA_VERSION = 2
+/** Bumped when a `--json` document changes shape (3: dynamic model discovery). */
+const JSON_SCHEMA_VERSION = 3
 
-type Action = 'doctor' | 'logout' | 'status'
+type Action = 'doctor' | 'logout' | 'models' | 'status'
 
 interface StatusOut {
   schemaVersion: number
@@ -106,6 +113,85 @@ async function status(jsonOutput: boolean): Promise<number> {
   return out.signedIn ? 0 : 1
 }
 
+/**
+ * 动态发现当前可用模型（三路：内置 / 限时福利 / agent-center）。
+ *
+ * 这是排查「模型选择器里没有某个模型」的第一手段：它打印的是上游真实返回，
+ * 而不是插件里那份手维护的种子清单。未登录时退回种子清单并说明原因。
+ */
+async function models(jsonOutput: boolean): Promise<number> {
+  const accounts = await store().list()
+  if (accounts.length === 0) {
+    if (jsonOutput) {
+      process.stdout.write(JSON.stringify({
+        schemaVersion: JSON_SCHEMA_VERSION,
+        version: CODEARTS_VERSION,
+        discovered: false,
+        reason: 'not signed in',
+        models: FALLBACK_CODEARTS_MODELS.map(m => ({ id: m.id, name: m.name, benefit: isBenefitModel(m.id) })),
+      }, null, 2) + '\n')
+    } else {
+      process.stdout.write('not signed in — showing the built-in seed catalog\n')
+      for (const m of FALLBACK_CODEARTS_MODELS) {
+        process.stdout.write(`  - ${m.id}  ${m.name}${isBenefitModel(m.id) ? '  [benefit]' : ''}\n`)
+      }
+    }
+    return 1
+  }
+
+  const outcome = await discoverModels(store())
+  if (jsonOutput) {
+    process.stdout.write(JSON.stringify({
+      schemaVersion: JSON_SCHEMA_VERSION,
+      version: CODEARTS_VERSION,
+      discovered: outcome.anySucceeded,
+      accounts: outcome.accounts.map(account => ({
+        accountId: account.accountId,
+        label: account.label,
+        ok: account.ok,
+        sources: account.sources,
+        modelCount: account.models.length,
+        errors: account.errors,
+      })),
+      models: outcome.models.map(m => ({
+        id: m.id,
+        name: m.name,
+        contextWindow: m.contextWindow,
+        maxTokens: m.maxTokens,
+        supportsImages: m.supportsImages,
+        benefit: m.benefit === true || isBenefitModel(m.id),
+      })),
+    }, null, 2) + '\n')
+    return outcome.anySucceeded ? 0 : 1
+  }
+
+  for (const account of outcome.accounts) {
+    const name = account.label ?? account.accountId
+    process.stdout.write(account.ok
+      ? `discovered ${account.models.length} model(s) for ${name} via ${account.sources.join(', ')}\n`
+      : `discovery failed for ${name}: ${account.errors.map(e => `${e.source}: ${e.message}`).join('; ')}\n`)
+    for (const error of account.ok ? account.errors : []) {
+      process.stdout.write(`  warning: ${error.source} source failed (${error.message})\n`)
+    }
+  }
+  if (!outcome.anySucceeded) {
+    process.stdout.write('no account could be queried; nothing to list\n')
+    return 1
+  }
+  process.stdout.write(`models (${outcome.models.length}):\n`)
+  for (const m of outcome.models) {
+    const benefit = m.benefit === true || isBenefitModel(m.id)
+    const flags = [
+      benefit ? 'benefit' : '',
+      m.supportsImages ? 'images' : '',
+      `max ${m.maxTokens}`,
+      `ctx ${m.contextWindow}`,
+    ].filter(Boolean).join(', ')
+    process.stdout.write(`  - ${m.id}  ${m.name}  (${flags})\n`)
+  }
+  return 0
+}
+
 async function doctor(jsonOutput: boolean): Promise<number> {
   const accountsPath = codeartsAccountsPath()
   const exists = existsSync(accountsPath)
@@ -180,9 +266,9 @@ async function main(): Promise<void> {
   const unknown = args.filter(arg => arg.startsWith('--') && arg !== '--json')
 
   const raw = positional[0] ?? 'status'
-  const actions: readonly Action[] = ['doctor', 'logout', 'status']
+  const actions: readonly Action[] = ['doctor', 'logout', 'models', 'status']
   if (!actions.includes(raw as Action)) {
-    process.stderr.write(`dsh-codearts: expected doctor, logout, or status; got ${JSON.stringify(raw)}\n`)
+    process.stderr.write(`dsh-codearts: expected doctor, logout, models, or status; got ${JSON.stringify(raw)}\n`)
     process.exit(2)
   }
   if (unknown.length > 0) {
@@ -195,7 +281,9 @@ async function main(): Promise<void> {
     ? await doctor(jsonOutput)
     : action === 'logout'
       ? await logout(jsonOutput)
-      : await status(jsonOutput)
+      : action === 'models'
+        ? await models(jsonOutput)
+        : await status(jsonOutput)
   process.exit(code)
 }
 

@@ -13,13 +13,23 @@
 
 import { createHash, randomBytes } from 'node:crypto'
 import { signRequest, type SignCredential } from './signer.ts'
-import { isBenefitModel } from './catalog.ts'
+import {
+  fillFromSeed,
+  isBenefitModel,
+  mergeModelLists,
+  type CodeArtsModelInfo,
+} from './catalog.ts'
 
 export const SNAP_HOST = 'https://snap-access.cn-north-4.myhuaweicloud.com'
 const EP_CHAT = '/api/v2/chat/completions'
 // 限时福利（免费套餐）网关：领取接口（幂等）。对齐 codearts2api 的 BenefitHost/EpBenefitClaim。
 const BENEFIT_HOST = 'https://opengw.developer.huaweicloud.com'
 const EP_BENEFIT_CLAIM = '/api/v1/benefit/claim'
+// 模型清单三路来源（对齐 codearts2api 的 const.go，2026-09 逆向自官方 CodeArts Agent 客户端）。
+const EP_MODEL_BUILTIN = '/v1/model/builtin'
+const EP_BENEFIT_CONFIG = '/api/v1/gateway/config'
+const EP_AGENT_LIST = '/v1/agent-center/agents/useragents'
+const EP_AGENT_DETAIL = '/v1/agent-center/agents/detail'
 
 export type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client'
 
@@ -80,6 +90,33 @@ interface OpenAIMessage {
 
 /** 上游对 max_tokens 的服务端硬上限（2026-09-30 直连二分实测）。 */
 export const MAX_TOKENS_CEILING = 65_536
+
+/**
+ * 实测过的、**按模型**的 max_tokens 上限（小写 id → 上限）。
+ *
+ * 这个上限是模型相关的，不能用一个全局值：
+ *  - 免费（限时福利）DeepSeek 系列：> 65536 会被流内 InferHub.001001005.400
+ *    "The request param is invalid" 拒掉，而福利网关标称的是 393216 / 384000；
+ *  - GLM-5.2：实测 131072 可用（2026-09-30 逐值直连验证：8000/65536/131072 均正常，
+ *    再往上会先撞上并发上限而测不出来）。
+ *
+ * 没测过的模型一律退回 `MAX_TOKENS_CEILING`（保守但可用），而不是照抄标称值 ——
+ * DSH 会把 catalog 的 maxTokens 原样当 max_tokens 发出去，照抄标称值等于让请求失败。
+ * 新增实测结果时往这里加一行即可（scripts/param-probe.mjs 与
+ * scripts/probe-models.ts 是得到这些数字的工具）。
+ */
+const MEASURED_MAX_TOKENS: Readonly<Record<string, number>> = {
+  'deepseek-v4-flash-0731': 65_536,
+  'deepseek-v4-pro-0813': 65_536,
+  'deepseek-v4.1-flash': 65_536,
+  'glm-5.3-flash': 65_536,
+  'glm-5.2': 131_072,
+}
+
+/** 该模型可用的 max_tokens 上限（没实测过的退回全局保守值）。 */
+export function maxTokensCeilingFor(id: string): number {
+  return MEASURED_MAX_TOKENS[id.trim().toLowerCase()] ?? MAX_TOKENS_CEILING
+}
 
 /** 上游要求 chat_id 为 32 位小写十六进制。 */
 const CHAT_ID_RE = /^[0-9a-f]{32}$/
@@ -173,10 +210,11 @@ export function prepareChatBody(rawJson: string): { url: string; body: string; m
   if (body.max_tokens === undefined && typeof parsed.max_completion_tokens === 'number') {
     body.max_tokens = parsed.max_completion_tokens
   }
-  // max_tokens 超过服务端上限会被流内拒绝（InferHub.001001005.400），
+  // max_tokens 超过该模型的上限会被流内拒绝（InferHub.001001005.400），
   // 钳到实测上限，保证生成不被截断的前提下请求能过。
-  if (typeof body.max_tokens === 'number' && body.max_tokens > MAX_TOKENS_CEILING) {
-    body.max_tokens = MAX_TOKENS_CEILING
+  const ceiling = maxTokensCeilingFor(model)
+  if (typeof body.max_tokens === 'number' && body.max_tokens > ceiling) {
+    body.max_tokens = ceiling
   }
   // strict 是 OpenAI 专有，华为 schema 不认识。
   if (Array.isArray(body.tools)) {
@@ -419,8 +457,282 @@ export async function chatStream(
   return { ok: true, stream }
 }
 
-export async function fetchModels(_credential: CodeArtsResolved): Promise<never> {
-  throw new Error('dsh-codearts: dynamic model discovery not implemented; use the static catalog')
+/** 模型清单的三路来源。任一路失败都不阻断，只有三路全失败才算失败。 */
+export type ModelSource = 'builtin' | 'benefit' | 'agent'
+
+export interface ModelDiscoveryResult {
+  /** 合并后的清单（已去重、已排序）。 */
+  models: readonly CodeArtsModelInfo[]
+  /** 本轮成功应答的来源。 */
+  sources: readonly ModelSource[]
+  /** 失败来源及原因（不阻断，供 doctor/日志展示）。 */
+  errors: readonly { source: ModelSource; message: string }[]
+}
+
+/** 发现不到 contextWindow 时的保守默认值：只影响 DSH 的上下文计量条与截断余量。 */
+const UNKNOWN_CONTEXT_WINDOW = 32_768
+
+/** 发现不到 maxTokens 时的默认值（低于服务端上限，保证请求能过）。 */
+const UNKNOWN_MAX_TOKENS = 8_000
+
+/** 带 AK/SK 签名的 GET；body 为空（签名按空载荷算）。 */
+async function signedGet(
+  url: string,
+  credential: CodeArtsResolved,
+  agentType: 'AgentCenter' | 'PromptCenter' | undefined,
+  signal?: AbortSignal,
+): Promise<{ ok: true; text: string } | { ok: false; status: number; message: string }> {
+  const req = new Request(url, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Language': 'zh-cn',
+      ...(agentType === undefined ? {} : { 'Agent-Type': agentType }),
+      'X-Security-Token': credential.securityToken,
+    },
+  })
+  if (credential.accessKeyId && credential.secretAccessKey) {
+    signRequest(req, Buffer.from(''), {
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey,
+      securityToken: credential.securityToken,
+    })
+  }
+  let resp: Response
+  try {
+    resp = await fetch(req, { signal })
+  } catch (error) {
+    return { ok: false, status: 0, message: error instanceof Error ? error.message : String(error) }
+  }
+  const text = await resp.text().catch(() => '')
+  if (!resp.ok) return { ok: false, status: resp.status, message: text.slice(0, 300) }
+  return { ok: true, text }
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
+}
+
+function positive(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+}
+
+function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  }
+  return ''
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+/**
+ * 内置模型：`GET /v1/model/builtin`（`Agent-Type: PromptCenter`）。
+ * 实测响应 `{ count, builtinModels: [{ model_id, model_name, model_desc,
+ * enable, display_enabled, supports_images, ... }] }` —— 注意它**不带**
+ * context_window / max_tokens，那两项要靠合并种子或福利来源补。
+ */
+async function fetchBuiltinModels(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<readonly CodeArtsModelInfo[]> {
+  const resp = await signedGet(`${SNAP_HOST}${EP_MODEL_BUILTIN}`, credential, 'PromptCenter', signal)
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.message}`)
+  const body = asRecord(parseJson(resp.text))
+  const out: CodeArtsModelInfo[] = []
+  for (const raw of asArray(body.builtinModels)) {
+    const model = asRecord(raw)
+    if (model.enable === false) continue
+    const id = firstString(model.model_id, model.model_name)
+    if (id === '') continue
+    out.push({
+      id,
+      name: firstString(model.model_name, id),
+      contextWindow: positive(model.context_window),
+      maxTokens: positive(model.max_tokens),
+      supportsImages: model.supports_images === true,
+    })
+  }
+  return out
+}
+
+/**
+ * 限时福利模型：`GET {opengw}/api/v1/gateway/config`。
+ * 实测响应 `{ error_code: '0000', result: { base_url, models: [{ model_id,
+ * model_name, context_window, max_tokens, sort }] } }`，整份标记福利。
+ */
+async function fetchBenefitModels(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<readonly CodeArtsModelInfo[]> {
+  const resp = await signedGet(`${BENEFIT_HOST}${EP_BENEFIT_CONFIG}`, credential, undefined, signal)
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.message}`)
+  const body = asRecord(parseJson(resp.text))
+  const code = firstString(body.error_code)
+  if (code !== '' && code !== '0000') {
+    throw new Error(`gateway/config error_code=${code} ${firstString(body.error_msg)}`)
+  }
+  const out: CodeArtsModelInfo[] = []
+  for (const raw of asArray(asRecord(body.result).models)) {
+    const model = asRecord(raw)
+    const id = firstString(model.model_id, model.model_name)
+    if (id === '') continue
+    out.push({
+      id,
+      name: firstString(model.model_name, id),
+      contextWindow: positive(model.context_window),
+      maxTokens: positive(model.max_tokens),
+      supportsImages: model.supports_images === true,
+      benefit: true,
+    })
+  }
+  return out
+}
+
+/**
+ * agent-center 的模型清单：先 `useragents` 找一个 CodeAgent，再取 detail 的
+ * `gpts.models`。过滤条件与官方客户端一致（`agent_name === 'CodeAgent'` 且
+ * IDE 可见），退化为 primary，再退化为第一个。
+ */
+async function fetchAgentModels(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<readonly CodeArtsModelInfo[]> {
+  const listResp = await signedGet(
+    `${SNAP_HOST}${EP_AGENT_LIST}?offset=0&limit=100&is_primary_agent=true`,
+    credential,
+    'AgentCenter',
+    signal,
+  )
+  if (!listResp.ok) throw new Error(`agent list HTTP ${listResp.status} ${listResp.message}`)
+  const agents = asArray(asRecord(parseJson(listResp.text)).agents).map(asRecord)
+  let agentId = ''
+  for (const agent of agents) {
+    const alias = asRecord(agent.alias)
+    if (
+      firstString(agent.agent_name) === 'CodeAgent' &&
+      firstString(alias.alias_zh_cn) === '智能体' &&
+      agent.show_in_ide === true
+    ) {
+      agentId = firstString(agent.agent_id)
+      if (agentId !== '') break
+    }
+  }
+  if (agentId === '') {
+    for (const agent of agents) {
+      if (agent.is_primary_agent === true) {
+        agentId = firstString(agent.agent_id)
+        if (agentId !== '') break
+      }
+    }
+  }
+  if (agentId === '' && agents.length > 0) agentId = firstString(agents[0]?.agent_id)
+  if (agentId === '') throw new Error('no agent found to read gpts.models from')
+
+  const detailResp = await signedGet(
+    `${SNAP_HOST}${EP_AGENT_DETAIL}?agent_id=${encodeURIComponent(agentId)}`,
+    credential,
+    'AgentCenter',
+    signal,
+  )
+  if (!detailResp.ok) throw new Error(`agent detail HTTP ${detailResp.status} ${detailResp.message}`)
+  const gpts = asRecord(asRecord(parseJson(detailResp.text)).gpts)
+  const out: CodeArtsModelInfo[] = []
+  for (const raw of asArray(gpts.models)) {
+    const model = asRecord(raw)
+    const params = asRecord(model.model_parameters)
+    // id 取**注册名**而不是 `model_name`：两者并不总是同一个字符串。实测
+    // `glm-5.2-sft-harmony` 这条的 model_name 是显示名 `GLM-5.2-ArkTS-SPARK`，
+    // 而内置来源的 model_id 与这里的 params.model_id 都写着 glm-5.2-sft-harmony。
+    // 聊天按注册名路由，取错就会多出一个根本不存在的模型条目（且选它必然 404）。
+    const id = firstString(params.model_id, model.model_id, model.model_alias, model.model_name)
+    if (id === '') continue
+    out.push({
+      id,
+      name: firstString(model.model_name, model.model_alias, id),
+      contextWindow: positive(params.context_window),
+      maxTokens: positive(params.max_tokens),
+      supportsImages: model.supports_images === true,
+    })
+  }
+  return out
+}
+
+/**
+ * 动态发现当前账号可用的模型清单（三路合并）。
+ *
+ * 与 codearts2api 的 `Client.FetchModels` 等价：内置、限时福利、agent-center 三路
+ * 各自独立，任一路失败只记进 `errors` 不阻断 —— 福利网关抖动时仍能拿到内置模型。
+ *
+ * 上标的两个「实测 vs 标称」处理（很重要，别照搬标称值）：
+ *  - **maxTokens 钳到该模型的实测上限**（`MEASURED_MAX_TOKENS`）。上游
+ *    `gateway/config` 给福利模型标的是 393216 / 384000，而聊天端点实测超过 65536
+ *    就流内报 InferHub.001001005.400；DSH 会把 catalog 的 maxTokens 原样当
+ *    max_tokens 发出去，照抄标称值等于让每个请求都失败。
+ *  - contextWindow 用发现值（只影响 DSH 的上下文计量与截断余量，不影响路由）。
+ *
+ * @throws 三路全失败，或合并结果为空。
+ */
+export async function fetchModels(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<ModelDiscoveryResult> {
+  const settled = await Promise.all([
+    fetchBuiltinModels(credential, signal).then(
+      models => ({ source: 'builtin' as const, models }),
+      error => ({ source: 'builtin' as const, error: error as Error }),
+    ),
+    fetchBenefitModels(credential, signal).then(
+      models => ({ source: 'benefit' as const, models }),
+      error => ({ source: 'benefit' as const, error: error as Error }),
+    ),
+    fetchAgentModels(credential, signal).then(
+      models => ({ source: 'agent' as const, models }),
+      error => ({ source: 'agent' as const, error: error as Error }),
+    ),
+  ])
+
+  const sources: ModelSource[] = []
+  const errors: { source: ModelSource; message: string }[] = []
+  const discovered: (readonly CodeArtsModelInfo[])[] = []
+  for (const item of settled) {
+    if ('error' in item) errors.push({ source: item.source, message: item.error.message })
+    else {
+      sources.push(item.source)
+      discovered.push(item.models)
+    }
+  }
+  if (sources.length === 0) {
+    throw new Error(`model discovery failed on every source: ${errors.map(e => `${e.source}: ${e.message}`).join('; ')}`)
+  }
+
+  // 种子只用来补缺（补发现结果里缺席的模型、补齐为 0 的参数），不参与竞争 ——
+  // 否则种子里的占位参数会压过上游返回的真实值（见 fillFromSeed 的注释）。
+  const merged = fillFromSeed(mergeModelLists(discovered))
+  if (merged.length === 0) throw new Error('model discovery returned an empty catalog')
+
+  const models = merged.map(model => ({
+    ...model,
+    contextWindow: model.contextWindow > 0 ? model.contextWindow : UNKNOWN_CONTEXT_WINDOW,
+    maxTokens: Math.min(
+      model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS,
+      maxTokensCeilingFor(model.id),
+    ),
+  }))
+
+  // 这里**不**改全局福利集：多账号时要取并集，由调用方（discovery.ts）统一提交，
+  // 否则最后拉的那个账号会覆盖掉别的账号确认过的福利模型。
+  return { models, sources, errors }
 }
 
 /**

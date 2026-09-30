@@ -77,6 +77,11 @@ node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh
 - 免费/福利模型（`deepseek-v4-flash-0731`、`deepseek-v4-pro-0813`、`deepseek-v4.1-flash`、
   `glm-5.3-flash`）已支持：聊天前自动 `claimBenefit`，并在签名前带 `maas_type: benefit`
   头，可零成本使用。商业模型（GLM-5.2 等）同样正常。
+- 模型清单为**动态发现**（内置 `/v1/model/builtin`、限时福利 `/api/v1/gateway/config`、
+  agent-center 的 `gpts.models` 三路合并），启动与每小时各刷新一次；任一路失败或未登录时
+  退回内置种子清单。用 `dsh-codearts models` 可看上游真实返回。
+- 上游标称的 `max_tokens` 高于聊天端点实际接受的量（福利网关标 393216，端点实测 65536 就报
+  `InferHub.001001005.400`），插件按实测上限下发，见 `MEASURED_MAX_TOKENS`。
 - 凭证有效期约 24 小时，过期后插件会自动用 refresh_token 续期。
 - 无头环境无法渲染 DSH GUI，故 GUI 内的端到端渲染需你在本机确认。
 

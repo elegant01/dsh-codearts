@@ -10,9 +10,12 @@
  * as a degraded path: without AK/SK the signature cannot be produced, so the
  * gateway rejects the chat.
  *
+ * The model catalog is seeded statically and refreshed by dynamic discovery
+ * (`src/discovery.ts`): the plugin asks CodeArts for the account's real model
+ * list on startup and hourly, and falls back to the seed when that fails.
+ *
  * Deliberately out of scope for now:
  *   - no credits / balance (CodeArts exposes none; free quota resets monthly)
- *   - no multi-account (a single credential file)
  *   - no per-model reasoning ladder (models surface as plain chat models)
  *
  * @module dsh-codearts
@@ -25,6 +28,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import { CodeArtsAccountStore, codeartsAccountsPath } from './auth.ts'
 import { CodeArtsAccountPool } from './account-pool.ts'
 import { CodeArtsCatalog, filterEnabledModels } from './catalog.ts'
+import { refreshCatalog } from './discovery.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { createCodeArtsShim } from './shim.ts'
 import { registerCodeArtsStatusRoute } from './web-status.ts'
@@ -140,12 +144,47 @@ export function apply(ctx: Context, rawConfig: Config): void {
     void shim.close().catch(() => {})
   })
 
+  // 动态模型发现：启动后拉一次真实目录，之后每小时刷新。失败只记日志 —— 目录保留
+  // 上一次的结果（冷启动时就是种子清单），不因为上游抖动把模型选择器清空。
+  const CATALOG_REFRESH_MS = 60 * 60 * 1000
+  const abort = new AbortController()
+  const discover = async (): Promise<void> => {
+    if (stopped) return
+    try {
+      const outcome = await refreshCatalog(store, catalog, abort.signal)
+      if (outcome === undefined || stopped) return
+      if (outcome.anySucceeded) {
+        const free = outcome.models.filter(model => model.benefit === true).length
+        ctx.logger.debug(
+          `dsh-codearts: model discovery refreshed the catalog (${outcome.models.length} models, ${free} benefit)`,
+        )
+      } else {
+        ctx.logger.warn(
+          'dsh-codearts: model discovery found nothing usable; keeping the current catalog',
+          outcome.accounts.flatMap(account => account.errors),
+        )
+      }
+    } catch (error) {
+      ctx.logger.debug('dsh-codearts: model discovery failed; keeping the current catalog', error)
+    }
+  }
+  ctx.effect(() => {
+    const timer = setInterval(() => void discover(), CATALOG_REFRESH_MS)
+    timer.unref?.()
+    return () => {
+      abort.abort()
+      clearInterval(timer)
+    }
+  })
+
   // Build the loopback shim first; the adapter reads its origin at construction.
   const shim = createCodeArtsShim({ store, catalog, pool, logger: ctx.logger })
 
   void shim.ready
     .then(() => {
       if (stopped) return
+      // 先让 provider 挂上（用种子目录即可服务），再异步换成真实清单。
+      void discover()
       const codearts = createCodeArtsAdapter({
         shim,
         catalog,

@@ -85,7 +85,7 @@ describe('status', () => {
     const doc = JSON.parse(res.stdout) as { signedIn: boolean; signable: boolean; schemaVersion: number; models: unknown[] }
     expect(doc.signedIn).toBe(true)
     expect(doc.signable).toBe(true)
-    expect(doc.schemaVersion).toBe(2)
+    expect(doc.schemaVersion).toBe(3)
     expect(doc.models.length).toBeGreaterThan(0)
   })
 
@@ -164,12 +164,33 @@ describe('argument handling', () => {
   it('rejects an unknown action', async () => {
     const res = await cli(home, ['frobnicate'])
     expect(res.code).toBe(2)
-    expect(res.stderr).toContain('expected doctor, logout, or status')
+    expect(res.stderr).toContain('expected doctor, logout, models, or status')
   })
 
   it('rejects an unknown flag', async () => {
     const res = await cli(home, ['status', '--verbose'])
     expect(res.code).toBe(2)
     expect(res.stderr).toContain('unknown flag')
+  })
+})
+
+// 已登录的 `models` 会真的去问上游，所以这里只覆盖离线分支（未登录退回种子清单）；
+// 三路解析与合并由 test/models.spec.ts 打桩 fetch 覆盖。
+describe('models', () => {
+  it('falls back to the seed catalog when signed out', async () => {
+    const res = await cli(home, ['models'])
+    expect(res.code).toBe(1)
+    expect(res.stdout).toContain('not signed in')
+    expect(res.stdout).toContain('GLM-5.2')
+    expect(res.stdout).toContain('[benefit]')
+  })
+
+  it('reports the fallback reason in JSON', async () => {
+    const res = await cli(home, ['models', '--json'])
+    const doc = JSON.parse(res.stdout) as { discovered: boolean; reason: string; models: unknown[]; schemaVersion: number }
+    expect(doc.discovered).toBe(false)
+    expect(doc.reason).toBe('not signed in')
+    expect(doc.schemaVersion).toBe(3)
+    expect(doc.models.length).toBeGreaterThan(0)
   })
 })
