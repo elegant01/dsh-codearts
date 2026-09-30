@@ -25,6 +25,9 @@ pnpm install && pnpm run build
 node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh/profiles/desktop
 ```
 
+改代码调试时不必反复重启：见 [DEV.md](./DEV.md)（宿主侧走 `dsh-hmr` 模块热重载，客户端卡片走
+`dsh-client-hmr` 自动替换进浏览器）。
+
 ## 使用
 
 1. 打开 DSH 设置 → CodeArts 卡片 → 「使用华为云账号登录」。

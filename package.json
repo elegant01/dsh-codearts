@@ -25,7 +25,12 @@
     "build": "tsdown && node scripts/wrap-client.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
-    "check": "pnpm run typecheck && pnpm run test && pnpm run build"
+    "check": "pnpm run typecheck && pnpm run test && pnpm run build",
+    "deploy": "node scripts/deploy.mjs",
+    "dev": "node scripts/dev.mjs",
+    "hmr:on": "node scripts/hmr.mjs on",
+    "hmr:off": "node scripts/hmr.mjs off",
+    "hmr:status": "node scripts/hmr.mjs status"
   },
   "exports": {
     ".": {

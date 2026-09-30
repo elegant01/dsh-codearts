@@ -19,6 +19,9 @@ node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh
 
 > 备份：脚本改动的 profile 文件会留下 `*.bak-codearts-*` 备份，回滚直接还原即可。
 
+> 部署是**原地覆盖**（内容没变的文件连 mtime 都不动）：这样已启用的 `dsh-hmr` 模块监听才能
+> 把改动当成一次变更并热重载插件。开发循环与热重载的完整说明见 [DEV.md](./DEV.md)。
+
 ## 二、在 DSH 桌面端验证
 
 1. **完全退出** DeepSeek Harness（托盘退出，确保进程不在）。
