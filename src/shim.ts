@@ -29,6 +29,7 @@ import {
   type UpstreamErrorKind,
 } from './upstream.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
+import type { CodeArtsUsageTracker } from './usage.ts'
 
 export interface ShimLogger {
   warn(...args: unknown[]): void
@@ -47,6 +48,8 @@ export interface CodeArtsShimOptions {
   catalog: CodeArtsCatalog
   /** 账号池。不传则内部自建一个，并在每次请求前与账号文档对齐。 */
   pool?: CodeArtsAccountPool
+  /** 用量账本。给了就在转发流的同时把 usage 帧记下来（卡片上的「今日用量」）。 */
+  usage?: CodeArtsUsageTracker
   logger?: ShimLogger
 }
 
@@ -140,6 +143,7 @@ async function openStream(
 export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   const { store, catalog } = options
   const logger = options.logger
+  const usage = options.usage
   // 账号池。空池起步，每次请求前用 store.ids() 对齐（新增/删除账号自动跟上）。
   const pool = options.pool ?? new CodeArtsAccountPool([])
 
@@ -278,7 +282,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         }
         if (result.ok) {
           pool.noteSuccess(id)
-          await pipeToResponse(res, result.stream, controller.signal)
+          await pipeToResponse(res, result.stream, controller.signal, { accountId: id, model: prepared.model })
           return
         }
         lastKind = result.kind
@@ -326,7 +330,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             }
             if (result.ok) {
               pool.noteSuccess(cappedAccount)
-              await pipeToResponse(res, result.stream, controller.signal)
+              await pipeToResponse(res, result.stream, controller.signal, { accountId: cappedAccount, model: prepared.model })
               return
             }
             lastKind = result.kind
@@ -356,6 +360,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     res: ServerResponse,
     stream: ReadableStream<Uint8Array>,
     signal: AbortSignal,
+    attribution?: { accountId: string; model: string },
   ): Promise<void> {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -366,6 +371,10 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     const reader = stream.getReader()
     const decoder = new TextDecoder()
     let buf = ''
+    // 这次请求记一次账：拿不到 usage 帧（被中止、上游没回）时，请求数也要算上。
+    if (usage !== undefined && attribution !== undefined) {
+      usage.noteRequest(attribution.accountId, attribution.model)
+    }
     // 上游流里可能已经带了终止帧（openAIDone）。收尾时只在没写过的情况下补，
     // 否则下游会连续收到两个 data: [DONE]。
     let sawDone = false
@@ -388,6 +397,10 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           buf = buf.slice(idx + 2)
           if (!frame) continue
           if (frame.trim() === 'data: [DONE]') sawDone = true
+          // usage 帧形如 {"choices":[],"usage":{...}}，只在记账时解析，别影响转发。
+          if (usage !== undefined && attribution !== undefined && frame.includes('"usage"')) {
+            recordFrameUsage(frame, attribution)
+          }
           if (res.writable) res.write(frame + '\n\n')
         }
       }
@@ -397,6 +410,25 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         logger?.warn('dsh-codearts: upstream stream failed mid-flight', error)
       }
       finish()
+    }
+  }
+
+  /** 从一帧 SSE 文本里取 usage 计入账本（解析失败就算了，不能影响转发）。 */
+  function recordFrameUsage(frame: string, attribution: { accountId: string; model: string }): void {
+    if (usage === undefined) return
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed.startsWith('data:')) continue
+      const payload = trimmed.slice(5).trim()
+      if (payload === '' || payload === '[DONE]') continue
+      try {
+        const parsed = JSON.parse(payload) as { usage?: Record<string, unknown> }
+        if (parsed.usage !== undefined && parsed.usage !== null) {
+          usage.noteUsage(attribution.accountId, attribution.model, parsed.usage)
+        }
+      } catch {
+        // 半帧/非 JSON：忽略
+      }
     }
   }
 

@@ -6,12 +6,17 @@
  *   dsh plugin --profile web exec dsh-codearts status --json # machine-readable
  *   dsh plugin --profile web exec dsh-codearts models        # discover the account's real models
  *   dsh plugin --profile web exec dsh-codearts models --json # machine-readable
+ *   dsh plugin --profile web exec dsh-codearts usage         # local token accounting
+ *   dsh plugin --profile web exec dsh-codearts usage --json  # machine-readable
  *   dsh plugin --profile web exec dsh-codearts doctor        # secret-free diagnostics
  *   dsh plugin --profile web exec dsh-codearts logout        # drop the plugin's credential
  *
  * `models` asks the upstream for the account's real catalog (built-in, limited-time
  * benefit and agent-center sources) instead of printing the hand-maintained seed —
  * that is the first thing to run when a model is missing from the picker.
+ *
+ * `usage` reads the plugin's own ledger of requests this machine sent. CodeArts has
+ * no quota API, so it is not an account balance.
  *
  * `doctor` never prints token material — only paths, booleans and versions —
  * so its output is safe to paste into a bug report. `logout` removes only this
@@ -24,12 +29,13 @@ import { existsSync, statSync } from 'node:fs'
 import { codeartsAccountsPath, CodeArtsAccountStore, type CodeArtsAccountSummary } from './auth.ts'
 import { FALLBACK_CODEARTS_MODELS, isBenefitModel } from './catalog.ts'
 import { discoverModels } from './discovery.ts'
+import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CODEARTS_VERSION } from './version.ts'
 
-/** Bumped when a `--json` document changes shape (3: dynamic model discovery). */
-const JSON_SCHEMA_VERSION = 3
+/** Bumped when a `--json` document changes shape (4: local usage accounting). */
+const JSON_SCHEMA_VERSION = 4
 
-type Action = 'doctor' | 'logout' | 'models' | 'status'
+type Action = 'doctor' | 'logout' | 'models' | 'status' | 'usage'
 
 interface StatusOut {
   schemaVersion: number
@@ -192,6 +198,54 @@ async function models(jsonOutput: boolean): Promise<number> {
   return 0
 }
 
+/**
+ * 本机用量账本（插件自己记的，不是账号额度）。
+ *
+ * 为什么要用 CLI 暴露它：账本是插件进程边跑边写的，GUI 卡片能看，但这个命令让
+ * 「今天到底花了多少 token」在无图形界面时也能查，且输出可以直接贴进问题反馈。
+ */
+async function usage(jsonOutput: boolean): Promise<number> {
+  const tracker = new CodeArtsUsageTracker({ path: codeartsUsagePath() })
+  await tracker.load()
+  const snapshot = tracker.snapshot()
+
+  if (jsonOutput) {
+    process.stdout.write(JSON.stringify({
+      schemaVersion: JSON_SCHEMA_VERSION,
+      version: CODEARTS_VERSION,
+      today: snapshot.today,
+      allTime: snapshot.allTime,
+      byModelToday: snapshot.byModelToday,
+      byAccountToday: snapshot.byAccountToday,
+      days: snapshot.days,
+      lastAt: snapshot.lastAt,
+    }, null, 2) + '\n')
+    return 0
+  }
+
+  if (snapshot.allTime.requests === 0) {
+    process.stdout.write('no usage recorded yet (nothing this plugin has sent)\n')
+    return 0
+  }
+  process.stdout.write(`today      ${snapshot.today.requests} request(s), in ${snapshot.today.promptTokens} / out ${snapshot.today.completionTokens} tokens\n`)
+  process.stdout.write(`all time   ${snapshot.allTime.requests} request(s), in ${snapshot.allTime.promptTokens} / out ${snapshot.allTime.completionTokens} tokens (${snapshot.days} day(s) kept)\n`)
+  if (snapshot.byModelToday.length > 0) {
+    process.stdout.write('today by model:\n')
+    for (const entry of snapshot.byModelToday) {
+      process.stdout.write(`  - ${entry.id}  ${entry.totals.requests} req  in ${entry.totals.promptTokens} / out ${entry.totals.completionTokens}\n`)
+    }
+  }
+  const accounts = Object.entries(snapshot.byAccountToday)
+  if (accounts.length > 0) {
+    process.stdout.write('today by account:\n')
+    for (const [id, totals] of accounts) {
+      process.stdout.write(`  - ${id.slice(0, 12)}…  ${totals.requests} req  in ${totals.promptTokens} / out ${totals.completionTokens}\n`)
+    }
+  }
+  process.stdout.write('note: CodeArts exposes no quota API; this counts requests this machine sent through the plugin\n')
+  return 0
+}
+
 async function doctor(jsonOutput: boolean): Promise<number> {
   const accountsPath = codeartsAccountsPath()
   const exists = existsSync(accountsPath)
@@ -266,9 +320,9 @@ async function main(): Promise<void> {
   const unknown = args.filter(arg => arg.startsWith('--') && arg !== '--json')
 
   const raw = positional[0] ?? 'status'
-  const actions: readonly Action[] = ['doctor', 'logout', 'models', 'status']
+  const actions: readonly Action[] = ['doctor', 'logout', 'models', 'status', 'usage']
   if (!actions.includes(raw as Action)) {
-    process.stderr.write(`dsh-codearts: expected doctor, logout, models, or status; got ${JSON.stringify(raw)}\n`)
+    process.stderr.write(`dsh-codearts: expected doctor, logout, models, status, or usage; got ${JSON.stringify(raw)}\n`)
     process.exit(2)
   }
   if (unknown.length > 0) {
@@ -283,7 +337,9 @@ async function main(): Promise<void> {
       ? await logout(jsonOutput)
       : action === 'models'
         ? await models(jsonOutput)
-        : await status(jsonOutput)
+        : action === 'usage'
+          ? await usage(jsonOutput)
+          : await status(jsonOutput)
   process.exit(code)
 }
 

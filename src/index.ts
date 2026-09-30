@@ -15,7 +15,9 @@
  * list on startup and hourly, and falls back to the seed when that fails.
  *
  * Deliberately out of scope for now:
- *   - no credits / balance (CodeArts exposes none; free quota resets monthly)
+ *   - no account balance/credits: CodeArts exposes no such API. The plugin keeps
+ *     its own ledger of requests it sent (`src/usage.ts`) and links to the
+ *     official usage page instead of inventing a number.
  *   - no per-model reasoning ladder (models surface as plain chat models)
  *
  * @module dsh-codearts
@@ -29,6 +31,7 @@ import { CodeArtsAccountStore, codeartsAccountsPath } from './auth.ts'
 import { CodeArtsAccountPool } from './account-pool.ts'
 import { CodeArtsCatalog, filterEnabledModels } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
+import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { createCodeArtsShim } from './shim.ts'
 import { registerCodeArtsStatusRoute } from './web-status.ts'
@@ -52,10 +55,20 @@ export {
 } from './auth.ts'
 export { CodeArtsAccountPool, type AccountRuntime } from './account-pool.ts'
 export {
+  CodeArtsUsageTracker,
+  codeartsUsagePath,
+  type UsageSnapshot,
+  type UsageTotals,
+} from './usage.ts'
+export { discoverModels, refreshCatalog, type DiscoveryOutcome } from './discovery.ts'
+export {
   SNAP_HOST,
   chatStream,
   prepareChatBody,
   canonicalModel,
+  fetchModels,
+  maxTokensCeilingFor,
+  type ModelDiscoveryResult,
   type UpstreamErrorKind,
 } from './upstream.ts'
 
@@ -107,6 +120,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
   const store = new CodeArtsAccountStore(accountsPath)
   const pool = new CodeArtsAccountPool([])
   const catalog = new CodeArtsCatalog()
+  // 用量账本：CodeArts 没有额度 API，只能记本机经插件发出的请求（见 usage.ts）。
+  const usage = new CodeArtsUsageTracker({ path: codeartsUsagePath() })
 
   let current = (): Config => config
   const enabledModels = (): readonly string[] | undefined => current().enabledModels
@@ -119,11 +134,14 @@ export function apply(ctx: Context, rawConfig: Config): void {
   }
 
   // Same-origin status/token routes backing the Plugin-configuration card.
+  // 卡片另外读账号池的槽位占用与用量账本：这两个都是本机事实，不涉及令牌。
   ctx.inject(['webServer'], webCtx => registerCodeArtsStatusRoute(webCtx, {
     store,
     models: () => catalog.current(),
     enabledModels,
     setEnabledModels,
+    pool: () => pool.list(),
+    usage: () => usage.snapshot(),
   }))
 
   // The settings section keeps the enabled-model allowlist live. On hosts with
@@ -141,6 +159,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
   let stopped = false
   ctx.effect(() => () => {
     stopped = true
+    // 账本落盘再关：不然最后几秒的用量会随进程一起丢。
+    void usage.flush().catch(() => {})
     void shim.close().catch(() => {})
   })
 
@@ -178,7 +198,10 @@ export function apply(ctx: Context, rawConfig: Config): void {
   })
 
   // Build the loopback shim first; the adapter reads its origin at construction.
-  const shim = createCodeArtsShim({ store, catalog, pool, logger: ctx.logger })
+  const shim = createCodeArtsShim({ store, catalog, pool, usage, logger: ctx.logger })
+
+  // 账本懒加载：读盘失败/文件不存在都不影响插件启动。
+  void usage.load().catch(() => {})
 
   void shim.ready
     .then(() => {

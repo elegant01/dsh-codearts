@@ -37,6 +37,19 @@ export interface CodeArtsSettingsKey {
   manualToken: string
   loginFailed: string
   modelsLoading: string
+  usageTitle: string
+  usageToday: string
+  usageRequests: string
+  usageTokens: string
+  usageAllTime: string
+  usageByModel: string
+  usageSlots: string
+  usageStateOk: string
+  usageStateCapped: string
+  usageStateCooling: string
+  usageStateDisabled: string
+  usageNoQuota: string
+  usageEmpty: string
   [key: string]: string
 }
 
@@ -79,6 +92,19 @@ export const zh: CodeArtsSettingsKey = {
   manualToken: '手动粘贴 token（降级）',
   loginFailed: '登录失败，请重试',
   modelsLoading: '模型勾选区加载中…（若长期不出现，请确认已登录且 DSH 已完全重启）',
+  usageTitle: '本机用量',
+  usageToday: '今日',
+  usageRequests: '{n} 次请求',
+  usageTokens: '输入 {prompt} · 输出 {completion}',
+  usageAllTime: '累计（{days} 天）',
+  usageByModel: '今日按模型',
+  usageSlots: '会话槽位',
+  usageStateOk: '可用',
+  usageStateCapped: '撞上限，优先避开',
+  usageStateCooling: '冷却中',
+  usageStateDisabled: '已停用',
+  usageNoQuota: 'CodeArts 没有额度接口，这里统计的是本机经插件发出的请求；官方用量明细见',
+  usageEmpty: '还没有记录：发一条消息就会开始累计。',
 }
 
 export const en: CodeArtsSettingsKey = {
@@ -120,4 +146,17 @@ export const en: CodeArtsSettingsKey = {
   manualToken: 'Paste token manually (fallback)',
   loginFailed: 'Sign-in failed, please retry',
   modelsLoading: 'Loading model selection… (if it never appears, make sure you are signed in and DSH was fully restarted)',
+  usageTitle: 'Local usage',
+  usageToday: 'Today',
+  usageRequests: '{n} request(s)',
+  usageTokens: 'in {prompt} · out {completion}',
+  usageAllTime: 'All time ({days} days)',
+  usageByModel: 'Today by model',
+  usageSlots: 'Session slots',
+  usageStateOk: 'Ready',
+  usageStateCapped: 'Cap hit, avoiding',
+  usageStateCooling: 'Cooling down',
+  usageStateDisabled: 'Disabled',
+  usageNoQuota: 'CodeArts exposes no quota API — this counts the requests this machine sent through the plugin. Official usage:',
+  usageEmpty: 'Nothing recorded yet: send a message to start counting.',
 }

@@ -1,6 +1,7 @@
 import { request as httpRequest } from 'node:http'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createCodeArtsShim, type CodeArtsShim } from '../src/shim.ts'
+import { CodeArtsUsageTracker } from '../src/usage.ts'
 
 /**
  * Drives the shim over raw node:http rather than fetch, because fetch refuses
@@ -186,5 +187,83 @@ describe('shim routing', () => {
       body: JSON.stringify({ model: 'GLM-5.2', messages: [] }),
     })
     expect(res.status).toBe(401)
+  })
+})
+
+/**
+ * 用量记账走的是真实 HTTP 路径：请求体 -> 上游（打桩 SSE）-> 转发 -> 账本。
+ * 这是「卡片上今日用量」唯一的真源，所以按端到端来测，而不是直接调账本 API。
+ */
+describe('usage accounting', () => {
+  const SSE = [
+    'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+    '',
+    'data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}',
+    '',
+    'data: [DONE]',
+    '',
+    '',
+  ].join('\n')
+
+  async function chatAndDrain(tracker: CodeArtsUsageTracker, port: number, bearer: string): Promise<void> {
+    const res = await raw(port, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: {
+        host: `127.0.0.1:${port}`,
+        authorization: `Bearer ${bearer}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'GLM-5.2', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(res.status).toBe(200)
+    // raw() 读到流结束才 resolve，此时记账已经发生。
+    expect(tracker.snapshot().today.requests).toBeGreaterThan(0)
+  }
+
+  it('records the usage frame that the upstream sends at the end of the stream', async () => {
+    vi.stubGlobal('fetch', async () => new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const usage = new CodeArtsUsageTracker()
+    const withUsage = createCodeArtsShim({
+      store: { ids: async () => ['acct'], resolve: async () => ({ token: 'sts-token', accessKeyId: 'AKID', secretAccessKey: 'SK', securityToken: 'sts-token' }) } as never,
+      catalog: { current: () => CATALOG } as never,
+      usage,
+    })
+    try {
+      await withUsage.ready
+      const p = Number(new URL(withUsage.baseUrl()).port)
+      await chatAndDrain(usage, p, withUsage.token())
+      const snapshot = usage.snapshot()
+      expect(snapshot.today).toEqual({ requests: 1, promptTokens: 12, completionTokens: 3, totalTokens: 15 })
+      expect(snapshot.byAccountToday['acct']?.totalTokens).toBe(15)
+      expect(snapshot.byModelToday[0]?.id).toBe('GLM-5.2')
+    } finally {
+      await withUsage.close()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('counts the request even when the stream dies before any usage frame', async () => {
+    vi.stubGlobal('fetch', async () => new Response('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }))
+    const usage = new CodeArtsUsageTracker()
+    const withUsage = createCodeArtsShim({
+      store: { ids: async () => ['acct'], resolve: async () => ({ token: 'sts-token', accessKeyId: 'AKID', secretAccessKey: 'SK', securityToken: 'sts-token' }) } as never,
+      catalog: { current: () => CATALOG } as never,
+      usage,
+    })
+    try {
+      await withUsage.ready
+      const p = Number(new URL(withUsage.baseUrl()).port)
+      await chatAndDrain(usage, p, withUsage.token())
+      const snapshot = usage.snapshot()
+      expect(snapshot.today.requests).toBe(1)
+      expect(snapshot.today.totalTokens).toBe(0)
+    } finally {
+      await withUsage.close()
+      vi.unstubAllGlobals()
+    }
   })
 })

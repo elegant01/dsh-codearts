@@ -82,6 +82,8 @@ node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh
   退回内置种子清单。用 `dsh-codearts models` 可看上游真实返回。
 - 上游标称的 `max_tokens` 高于聊天端点实际接受的量（福利网关标 393216，端点实测 65536 就报
   `InferHub.001001005.400`），插件按实测上限下发，见 `MEASURED_MAX_TOKENS`。
+- 卡片与 `dsh-codearts usage` 里的用量是**本机账本**（`$DSH_HOME/.codearts-usage.json`，按天保留
+  60 天）：CodeArts 没有额度接口，官方明细在 `codearts.huaweicloud.com/portal/settings/personal-usage`。
 - 凭证有效期约 24 小时，过期后插件会自动用 refresh_token 续期。
 - 无头环境无法渲染 DSH GUI，故 GUI 内的端到端渲染需你在本机确认。
 

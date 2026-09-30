@@ -1,15 +1,17 @@
 import { useEffect, useState } from 'react'
 import { Button, Checkbox, Input, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { CodeArtsWebStatus } from '../web-status.ts'
+import type { CodeArtsWebStatus, CodeArtsWebUsage } from '../web-status.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
 export interface CodeArtsPluginCardInjected {
   t: (key: string, params?: Record<string, string | number>) => string
 }
 
-interface LocalStatus extends Omit<CodeArtsWebStatus, 'models'> {
+interface LocalStatus extends Omit<CodeArtsWebStatus, 'models' | 'usage'> {
   models?: readonly { id: string; name: string }[]
+  /** 老宿主/取不到账本时可能没有这一块，卡片据此隐藏用量区块。 */
+  usage?: CodeArtsWebUsage
 }
 
 interface ModelChoice {
@@ -43,8 +45,123 @@ function modelName(choice: ModelChoice): string {
   return choice.free === true ? choice.name.replace(TRAILING_FREE, '') : choice.name
 }
 
-export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.ReactElement {
-  const [status, setStatus] = useState<LocalStatus | null>(null)
+/** 官方用量明细页（CodeArts 没有额度接口，只能给链接）。 */
+const OFFICIAL_USAGE_URL = 'https://codearts.huaweicloud.com/portal/settings/personal-usage'
+
+/** token 数按人类习惯缩写：12345 -> 12.3k。 */
+function formatTokens(value: number): string {
+  if (!Number.isFinite(value)) return '0'
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`
+  return String(Math.round(value))
+}
+
+function formatCount(value: number): string {
+  return Number.isFinite(value) ? String(Math.round(value)) : '0'
+}
+
+/**
+ * 用量区块。
+ *
+ * 只展示**本机经插件发出**的请求：上游没有额度/积分接口（README 与 codearts2api
+ * 都是这个结论），所以这里明确写出这一点并给出官方明细页链接，别让用户误以为
+ * 这是账号总额度。会话槽位是真事实 —— 每账号 3 个并发会话、被占时要等约 52 秒
+ * 才释放，这也正是「打断后重新提问要等」的原因。
+ */
+function UsageSection({
+  usage,
+  t,
+}: {
+  usage: CodeArtsWebUsage
+  t: CodeArtsPluginCardInjected['t']
+}): React.ReactElement {
+  const total = usage.today.requests
+  const stateLabel: Record<CodeArtsWebUsage['slots'][number]['state'], string> = {
+    ok: t('usageStateOk'),
+    capped: t('usageStateCapped'),
+    cooling: t('usageStateCooling'),
+    disabled: t('usageStateDisabled'),
+  }
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionHead}>
+        <span className={styles.sectionLabel}>{t('usageTitle')}</span>
+        <span className={styles.count}>{t('usageRequests', { n: formatCount(total) })}</span>
+      </div>
+
+      {total === 0 ? (
+        <p className={styles.hint}>{t('usageEmpty')}</p>
+      ) : (
+        <>
+          <div className={styles.choiceRow}>
+            <span className={styles.name}>{t('usageToday')}</span>
+            <span className={styles.meta}>
+              {t('usageTokens', {
+                prompt: formatTokens(usage.today.promptTokens),
+                completion: formatTokens(usage.today.completionTokens),
+              })}
+            </span>
+          </div>
+          <div className={styles.choiceRow}>
+            <span className={styles.name}>{t('usageAllTime', { days: formatCount(usage.days) })}</span>
+            <span className={styles.meta}>
+              {t('usageRequests', { n: formatCount(usage.allTime.requests) })}
+              {' · '}
+              {t('usageTokens', {
+                prompt: formatTokens(usage.allTime.promptTokens),
+                completion: formatTokens(usage.allTime.completionTokens),
+              })}
+            </span>
+          </div>
+          {usage.byModelToday.length > 0 && (
+            <>
+              <p className={styles.hint}>{t('usageByModel')}</p>
+              {usage.byModelToday.slice(0, 5).map(entry => (
+                <div key={entry.id} className={styles.choiceRow}>
+                  <span className={styles.name}>{entry.id}</span>
+                  <span className={styles.meta}>
+                    {t('usageRequests', { n: formatCount(entry.totals.requests) })}
+                    {' · '}
+                    {t('usageTokens', {
+                      prompt: formatTokens(entry.totals.promptTokens),
+                      completion: formatTokens(entry.totals.completionTokens),
+                    })}
+                  </span>
+                </div>
+              ))}
+            </>
+          )}
+        </>
+      )}
+
+      {usage.slots.length > 0 && (
+        <>
+          <p className={styles.hint}>{t('usageSlots')}</p>
+          {usage.slots.map(slot => (
+            <div key={slot.id} className={styles.choiceRow}>
+              <span className={styles.name}>{`${slot.active}/${slot.max}`}</span>
+              {slot.state === 'ok' ? (
+                <Tag tone="success">{stateLabel.ok}</Tag>
+              ) : (
+                <Tag>{stateLabel[slot.state]}</Tag>
+              )}
+            </div>
+          ))}
+        </>
+      )}
+
+      <p className={styles.hint}>
+        {t('usageNoQuota')}
+        {' '}
+        <a className={styles.link} href={OFFICIAL_USAGE_URL} target="_blank" rel="noreferrer">
+          {OFFICIAL_USAGE_URL}
+        </a>
+      </p>
+    </div>
+  )
+}
+
+export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.ReactElement {  const [status, setStatus] = useState<LocalStatus | null>(null)
   const [token, setToken] = useState('')
   const [label, setLabel] = useState('')
   const [busy, setBusy] = useState(false)
@@ -394,6 +511,8 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         ) : (
           <p className={styles.hint}>{t('modelsLoading')}</p>
         )}
+
+        {status?.usage !== undefined && <UsageSection usage={status.usage} t={t} />}
       </div>
     </div>
   )

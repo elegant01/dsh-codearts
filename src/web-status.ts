@@ -2,9 +2,9 @@
  * Same-origin status + token routes for the CodeArts card.
  *
  * Minimal surface vs dsh-codebuddy-cli: no credits, no check-in. The browser
- * half calls these to read sign-in state / model list / the account list, and
- * to add or remove accounts. The route answers loopback browser requests only
- * and never returns token material.
+ * half calls these to read sign-in state / model list / the account list /
+ * local usage, and to add or remove accounts. The route answers loopback
+ * browser requests only and never returns token material.
  *
  * @module dsh-codearts/web-status
  */
@@ -13,7 +13,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { CodeArtsAccountStore, CodeArtsAccountSummary } from './auth.ts'
+import type { AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
+import type { UsageSnapshot, UsageTotals } from './usage.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { filterEnabledModels, isBenefitModel } from './catalog.ts'
 import { startLogin, type LoginSession } from './oauth.ts'
@@ -74,6 +76,40 @@ export interface CodeArtsWebStatus {
   models: readonly CodeArtsWebModelBadge[]
   /** 已存账号。多个账号时会自动轮转，某个号忙就换下一个。 */
   accounts: readonly CodeArtsAccountSummary[]
+  /** 本机经插件发出的请求统计（CodeArts 没有额度 API，只能自己记）。 */
+  usage: CodeArtsWebUsage
+}
+
+/**
+ * 卡片上的用量区块。
+ *
+ * 只报**本机经插件发出**的请求：上游没有任何额度/积分接口（codearts2api 的 pool 里
+ * credits 恒为 0），所以卡片必须把这一点说清楚，官方额度明细在
+ * `codearts.huaweicloud.com/portal/settings/personal-usage`。
+ */
+export interface CodeArtsWebUsage {
+  /** 今天的合计。 */
+  today: UsageTotals
+  /** 账本里保留天数的合计。 */
+  allTime: UsageTotals
+  /** 今天按模型，按 token 降序（卡片只展示前几条）。 */
+  byModelToday: readonly { id: string; totals: UsageTotals }[]
+  /** 账本覆盖天数。 */
+  days: number
+  lastAt?: number
+  /** 每个账号的会话槽位占用与池状态 —— 这是「为什么刚才要等」的直接答案。 */
+  slots: readonly CodeArtsWebAccountSlot[]
+}
+
+export interface CodeArtsWebAccountSlot {
+  id: string
+  /** 本机正在飞的请求数 / 允许的并发数。 */
+  active: number
+  max: number
+  /** 账号池里的状态。 */
+  state: 'ok' | 'capped' | 'cooling' | 'disabled'
+  /** 卡片用的说明文字（英文，由卡片侧本地化）。 */
+  detail?: string
 }
 
 export interface CodeArtsWebModelBadge {
@@ -85,6 +121,10 @@ export interface CodeArtsStatusRouteOptions {
   store: CodeArtsAccountStore
   models: () => readonly CodeArtsModelInfo[]
   enabledModels?: () => readonly string[] | undefined
+  /** 账号池运行时（槽位占用/冷却/禁用）。省略则卡片不显示槽位区块。 */
+  pool?: () => readonly AccountRuntime[]
+  /** 用量账本快照。省略则卡片不显示用量区块。 */
+  usage?: () => UsageSnapshot
   /**
    * Persist a new allowlist. Resolves false when no settings provider is
    * attached, which the card renders as a read-only selection.
@@ -133,13 +173,57 @@ function accountUsable(summary: CodeArtsAccountSummary): boolean {
   return !Number.isFinite(at) || at > Date.now()
 }
 
+/** 池状态 -> 卡片能直接渲染的槽位信息。 */
+function slotsOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebAccountSlot[] {
+  const runtime = deps.pool?.() ?? []
+  const now = Date.now()
+  return runtime.map(account => {
+    const state: CodeArtsWebAccountSlot['state'] = account.disabled
+      ? 'disabled'
+      : now < account.coolUntil
+        ? 'cooling'
+        : now < account.cappedUntil
+          ? 'capped'
+          : 'ok'
+    const detail = state === 'capped'
+      ? `upstream session cap hit; avoiding it for ~${Math.ceil((account.cappedUntil - now) / 1000)}s`
+      : state === 'cooling'
+        ? `cooling down for ~${Math.ceil((account.coolUntil - now) / 1000)}s`
+        : state === 'disabled'
+          ? account.lastError ?? 'disabled'
+          : undefined
+    return {
+      id: account.id,
+      active: account.activeConcurrent,
+      max: account.maxConcurrent,
+      state,
+      ...(detail === undefined ? {} : { detail }),
+    }
+  })
+}
+
+/** 用量账本 -> 卡片文档；没有账本（未注入）时给一份空壳，卡片就不会瞎显示。 */
+function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
+  const snapshot: UsageSnapshot | undefined = deps.usage?.()
+  const noTotals: UsageTotals = { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+  return {
+    today: snapshot?.today ?? noTotals,
+    allTime: snapshot?.allTime ?? noTotals,
+    byModelToday: snapshot?.byModelToday ?? [],
+    days: snapshot?.days ?? 0,
+    ...snapshot?.lastAt === undefined ? {} : { lastAt: snapshot.lastAt },
+    slots: slotsOf(deps),
+  }
+}
+
 async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWebStatus> {
   const models = deps.models().map(m => ({ id: m.id, name: m.name }))
   const accounts = await deps.store.list()
   const cred = await deps.store.current()
+  const usage = usageOf(deps)
 
   if (accounts.length === 0 || cred === undefined) {
-    return { status: 'signed-out', models, accounts }
+    return { status: 'signed-out', models, accounts, usage }
   }
   // 只要还有**任意一个**账号能用就算登录中 —— 别的号过期了不影响轮转。
   const usable = accounts.some(accountUsable)
@@ -149,6 +233,7 @@ async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWe
     ...cred.storedAt === undefined ? {} : { storedAt: cred.storedAt },
     models,
     accounts,
+    usage,
   }
 }
 

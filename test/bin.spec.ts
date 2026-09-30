@@ -85,7 +85,7 @@ describe('status', () => {
     const doc = JSON.parse(res.stdout) as { signedIn: boolean; signable: boolean; schemaVersion: number; models: unknown[] }
     expect(doc.signedIn).toBe(true)
     expect(doc.signable).toBe(true)
-    expect(doc.schemaVersion).toBe(3)
+    expect(doc.schemaVersion).toBe(4)
     expect(doc.models.length).toBeGreaterThan(0)
   })
 
@@ -164,7 +164,7 @@ describe('argument handling', () => {
   it('rejects an unknown action', async () => {
     const res = await cli(home, ['frobnicate'])
     expect(res.code).toBe(2)
-    expect(res.stderr).toContain('expected doctor, logout, models, or status')
+    expect(res.stderr).toContain('expected doctor, logout, models, status, or usage')
   })
 
   it('rejects an unknown flag', async () => {
@@ -190,7 +190,31 @@ describe('models', () => {
     const doc = JSON.parse(res.stdout) as { discovered: boolean; reason: string; models: unknown[]; schemaVersion: number }
     expect(doc.discovered).toBe(false)
     expect(doc.reason).toBe('not signed in')
-    expect(doc.schemaVersion).toBe(3)
+    expect(doc.schemaVersion).toBe(4)
     expect(doc.models.length).toBeGreaterThan(0)
+  })
+})
+
+// 账本是插件自己写的文件，这里只覆盖「空账本」这条离线分支；记账与跨天逻辑由
+// test/usage.spec.ts 与 test/shim.spec.ts 覆盖。
+describe('usage', () => {
+  it('says nothing was recorded yet on a fresh DSH_HOME', async () => {
+    const res = await cli(home, ['usage'])
+    expect(res.code).toBe(0)
+    expect(res.stdout).toContain('no usage recorded yet')
+  })
+
+  it('prints zeroed totals in JSON', async () => {
+    const res = await cli(home, ['usage', '--json'])
+    const doc = JSON.parse(res.stdout) as {
+      today: { requests: number; totalTokens: number }
+      allTime: { requests: number }
+      days: number
+      schemaVersion: number
+    }
+    expect(doc.today.requests).toBe(0)
+    expect(doc.allTime.requests).toBe(0)
+    expect(doc.days).toBe(0)
+    expect(doc.schemaVersion).toBe(4)
   })
 })

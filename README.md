@@ -10,6 +10,7 @@
   请求会自动换到下一个账号，不必干等 —— 这是「停止生成后重新提问要等半分钟」的正解。
 - **可选模型**：可在设置卡片里勾选要出现在模型选择器中的模型（配置项 `enabledModels`）。未勾选的模型只是不再被推荐，已经选定它的会话仍可继续使用；不勾选等同于提供全部模型。
 - **模型清单自动发现**：启动后与每小时各拉一次账号真实可用的模型（内置 / 限时福利 / agent-center 三路合并），失败时退回内置种子清单。
+- **本机用量**：卡片与 `dsh-codearts usage` 展示今日/累计的请求数与输入输出 token（按模型、按账号），以及每个账号的**会话槽位占用**（占用时正好解释了「为什么刚才要等半分钟」）。CodeArts 没有额度接口，这里只统计本机经插件发出的请求，官方额度明细见卡片上的链接。
 - **图片输入**：支持视觉的模型可直接在对话里粘贴或拖入图片。
 - **降级路径**：也可以在卡片里直接粘贴安全令牌，适用于脚本或排查场景。
 - **命令行**：提供 `status` / `doctor` / `logout` 三个子命令，便于在无图形界面时检查登录状态。
@@ -41,12 +42,17 @@ node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh
 ```sh
 dsh plugin --profile <profile> exec dsh-codearts status [--json]   # 登录状态与种子模型清单
 dsh plugin --profile <profile> exec dsh-codearts models [--json]   # 向上游发现当前账号的真实模型
+dsh plugin --profile <profile> exec dsh-codearts usage [--json]    # 本机用量账本（非账号额度）
 dsh plugin --profile <profile> exec dsh-codearts doctor            # 不涉及密钥的环境诊断
 dsh plugin --profile <profile> exec dsh-codearts logout            # 清除本插件保存的凭证
 ```
 
 `models` 是排查「模型选择器里怎么没有某个模型」的第一手段：它打印上游真实返回的清单
 （内置 / 限时福利 / agent-center 三路合并），而不是插件里那份手维护的种子清单。
+
+`usage` 读的是插件自己的账本（`$DSH_HOME/.codearts-usage.json`，按天保留 60 天）——
+**不是账号额度**：CodeArts 没有额度接口，官方明细在
+`codearts.huaweicloud.com/portal/settings/personal-usage`，卡片上也有这个链接。
 
 `doctor` 只输出路径、状态与版本，不会打印任何令牌内容，输出可以直接贴进问题反馈；`logout`
 只删除本插件自己的凭证副本，不影响账号本身。
@@ -87,6 +93,8 @@ shim 只监听回环地址，并校验 Host、Origin 与本进程随机密钥，
   65536 就报 `InferHub.001001005.400`。插件按**实测上限**下发请求（免费 DeepSeek 系列
   65536、GLM-5.2 已实测可到 131072），没实测过的模型退回 65536 保守值。上下文长度用发现值，
   它只影响 DSH 的上下文计量与截断余量。
+- 用量账本只统计**本机经插件发出**的请求：CodeArts 不提供额度/积分接口，所以卡片上的数字
+  不等于账号总额度；官方明细请走卡片里的链接。账本按天保留 60 天，换机器/清 `$DSH_HOME` 即丢失。
 - 目前只提供中文文档。
 
 ## 免责声明
