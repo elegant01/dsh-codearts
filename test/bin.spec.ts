@@ -85,7 +85,7 @@ describe('status', () => {
     const doc = JSON.parse(res.stdout) as { signedIn: boolean; signable: boolean; schemaVersion: number; models: unknown[] }
     expect(doc.signedIn).toBe(true)
     expect(doc.signable).toBe(true)
-    expect(doc.schemaVersion).toBe(1)
+    expect(doc.schemaVersion).toBe(2)
     expect(doc.models.length).toBeGreaterThan(0)
   })
 
@@ -114,7 +114,7 @@ describe('doctor', () => {
   it('says it is signed in once a credential exists', async () => {
     await seed()
     const res = await cli(home, ['doctor'])
-    expect(res.stdout).toContain('signed in   : yes')
+    expect(res.stdout).toContain('accounts    : 1')
     expect(res.stdout).toContain('signable    : yes')
   })
 

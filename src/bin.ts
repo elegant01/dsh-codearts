@@ -15,12 +15,12 @@
  */
 
 import { existsSync, statSync } from 'node:fs'
-import { codeartsAuthPath, clearCredential, loadCredential } from './auth.ts'
+import { codeartsAccountsPath, CodeArtsAccountStore, type CodeArtsAccountSummary } from './auth.ts'
 import { FALLBACK_CODEARTS_MODELS } from './catalog.ts'
 import { CODEARTS_VERSION } from './version.ts'
 
-/** Bumped when a `--json` document changes shape. */
-const JSON_SCHEMA_VERSION = 1
+/** Bumped when a `--json` document changes shape (2: multi-account). */
+const JSON_SCHEMA_VERSION = 2
 
 type Action = 'doctor' | 'logout' | 'status'
 
@@ -34,8 +34,10 @@ interface StatusOut {
   expiration?: string
   /** The stored credential failed its last refresh; the user must sign in again. */
   stale?: boolean
-  /** True when the credential carries AK/SK, i.e. chat requests can be signed. */
+  /** True when at least one account carries AK/SK, i.e. chat requests can be signed. */
   signable: boolean
+  /** All stored accounts; requests rotate across them. */
+  accounts: readonly CodeArtsAccountSummary[]
   models: readonly { id: string; name: string }[]
 }
 
@@ -49,27 +51,36 @@ interface DoctorOut {
   signedIn: boolean
   /** The stored credential carries AK/SK, so SDK-HMAC signing is possible. */
   signable: boolean
+  accounts: readonly CodeArtsAccountSummary[]
   hints: string[]
 }
 
-function buildStatus(): StatusOut {
-  return {
-    schemaVersion: JSON_SCHEMA_VERSION,
-    version: CODEARTS_VERSION,
-    signedIn: false,
-    signable: false,
-    models: FALLBACK_CODEARTS_MODELS.map(m => ({ id: m.id, name: m.name })),
-  }
+/** 一句话描述一个账号，供人类可读输出用。 */
+function describeAccount(account: CodeArtsAccountSummary): string {
+  const name = account.label ?? account.userName ?? account.id
+  const notes: string[] = []
+  if (account.stale) notes.push('needs sign-in')
+  else if (typeof account.expiration === 'string') notes.push(`expires ${account.expiration}`)
+  if (!account.signable) notes.push('no AK/SK')
+  return notes.length === 0 ? name : `${name}  (${notes.join(', ')})`
+}
+
+function store(): CodeArtsAccountStore {
+  return new CodeArtsAccountStore(codeartsAccountsPath())
 }
 
 async function status(jsonOutput: boolean): Promise<number> {
-  const authPath = codeartsAuthPath()
-  const out = buildStatus()
-  const cred = await loadCredential(authPath)
+  const accounts = await store().list()
+  const cred = await store().current()
+  const out: StatusOut = {
+    schemaVersion: JSON_SCHEMA_VERSION,
+    version: CODEARTS_VERSION,
+    signedIn: accounts.length > 0,
+    signable: accounts.some(account => account.signable),
+    accounts,
+    models: FALLBACK_CODEARTS_MODELS.map(m => ({ id: m.id, name: m.name })),
+  }
   if (cred !== undefined) {
-    out.signedIn = true
-    out.signable = typeof cred.accessKeyId === 'string' && cred.accessKeyId !== '' &&
-      typeof cred.secretAccessKey === 'string' && cred.secretAccessKey !== ''
     if (cred.label !== undefined) out.label = cred.label
     if (cred.storedAt !== undefined) out.storedAt = cred.storedAt
     if (cred.expiration !== undefined) out.expiration = cred.expiration
@@ -82,17 +93,13 @@ async function status(jsonOutput: boolean): Promise<number> {
   }
 
   if (out.signedIn) {
-    process.stdout.write(`signed in${out.label ? ` as ${out.label}` : ''}${out.storedAt ? ` (stored ${new Date(out.storedAt).toISOString()})` : ''}\n`)
-    if (out.stale === true) {
-      process.stdout.write('credential marked stale after a failed refresh; sign in again\n')
-    } else if (out.expiration !== undefined) {
-      process.stdout.write(`expires ${out.expiration}\n`)
-    }
+    process.stdout.write(`signed in — ${accounts.length} account${accounts.length === 1 ? '' : 's'}:\n`)
+    for (const account of accounts) process.stdout.write(`  - ${describeAccount(account)}\n`)
     if (!out.signable) {
-      process.stdout.write('warning: stored credential has no AK/SK, so requests cannot be signed and chats will be rejected\n')
+      process.stdout.write('warning: no account carries AK/SK, so requests cannot be signed and chats will be rejected\n')
     }
   } else {
-    process.stdout.write('not signed in (no credential stored; sign in from the CodeArts settings card)\n')
+    process.stdout.write('not signed in (no account stored; sign in from the CodeArts settings card)\n')
   }
   process.stdout.write(`models (${out.models.length}):\n`)
   for (const m of out.models) process.stdout.write(`  - ${m.id}  ${m.name}\n`)
@@ -100,22 +107,22 @@ async function status(jsonOutput: boolean): Promise<number> {
 }
 
 async function doctor(jsonOutput: boolean): Promise<number> {
-  const authPath = codeartsAuthPath()
-  const exists = existsSync(authPath)
-  const cred = await loadCredential(authPath)
-  const signable = cred !== undefined &&
-    typeof cred.accessKeyId === 'string' && cred.accessKeyId !== '' &&
-    typeof cred.secretAccessKey === 'string' && cred.secretAccessKey !== ''
+  const accountsPath = codeartsAccountsPath()
+  const exists = existsSync(accountsPath)
+  const accounts = await store().list()
+  const signable = accounts.some(account => account.signable)
 
   const hints: string[] = []
-  if (!exists) {
-    hints.push('No credential file yet: sign in from the CodeArts settings card (or paste a token).')
-  } else if (cred === undefined) {
-    hints.push('The credential file exists but could not be parsed; sign in again to rewrite it.')
-  } else if (cred.stale === true) {
-    hints.push('The credential was marked stale after a failed refresh; sign in again.')
-  } else if (!signable) {
-    hints.push('Stored credential has no AK/SK. CodeArts rejects unsigned chat requests — sign in with the OAuth flow rather than pasting a bare token.')
+  if (accounts.length === 0) {
+    hints.push('No account stored yet: sign in from the CodeArts settings card.')
+  } else {
+    const stale = accounts.filter(account => account.stale)
+    if (stale.length > 0) {
+      hints.push(`${stale.length} of ${accounts.length} account(s) were marked stale after a failed refresh; sign in again.`)
+    }
+    if (!signable) {
+      hints.push('No account carries AK/SK. CodeArts rejects unsigned chat requests — sign in with the OAuth flow rather than pasting a bare token.')
+    }
   }
   if (!process.env.DSH_HOME) {
     hints.push('DSH_HOME is unset; the credential path fell back to ~/.dsh — set DSH_HOME if your harness lives elsewhere.')
@@ -126,10 +133,11 @@ async function doctor(jsonOutput: boolean): Promise<number> {
     version: CODEARTS_VERSION,
     node: process.version,
     platform: `${process.platform} ${process.arch}`,
-    authPath,
+    authPath: accountsPath,
     authFileExists: exists,
-    signedIn: cred !== undefined,
+    signedIn: accounts.length > 0,
     signable,
+    accounts,
     hints,
   }
 
@@ -139,9 +147,10 @@ async function doctor(jsonOutput: boolean): Promise<number> {
   }
 
   process.stdout.write(`dsh-codearts ${out.version}  (node ${out.node}, ${out.platform})\n`)
-  process.stdout.write(`credential: ${out.authPath}\n`)
-  process.stdout.write(`  file exists : ${out.authFileExists ? 'yes' : 'no'}${exists ? ` (${statSync(authPath).size} bytes)` : ''}\n`)
-  process.stdout.write(`  signed in   : ${out.signedIn ? 'yes' : 'no'}\n`)
+  process.stdout.write(`accounts: ${out.authPath}\n`)
+  process.stdout.write(`  file exists : ${out.authFileExists ? 'yes' : 'no'}${exists ? ` (${statSync(accountsPath).size} bytes)` : ''}\n`)
+  process.stdout.write(`  accounts    : ${accounts.length}\n`)
+  for (const account of accounts) process.stdout.write(`    - ${describeAccount(account)}\n`)
   process.stdout.write(`  signable    : ${out.signable ? 'yes (AK/SK present)' : 'no (no AK/SK)'}\n`)
   if (hints.length === 0) {
     process.stdout.write('no issues found\n')
@@ -153,12 +162,13 @@ async function doctor(jsonOutput: boolean): Promise<number> {
 }
 
 async function logout(jsonOutput: boolean): Promise<number> {
-  const authPath = codeartsAuthPath()
-  await clearCredential(authPath)
+  const accountsPath = codeartsAccountsPath()
+  const removed = (await store().list()).length
+  await store().clear()
   if (jsonOutput) {
-    process.stdout.write(JSON.stringify({ schemaVersion: JSON_SCHEMA_VERSION, signedOut: true, authPath }, null, 2) + '\n')
+    process.stdout.write(JSON.stringify({ schemaVersion: JSON_SCHEMA_VERSION, signedOut: true, removed, authPath: accountsPath }, null, 2) + '\n')
   } else {
-    process.stdout.write(`signed out; removed ${authPath}\n`)
+    process.stdout.write(`signed out; removed ${removed} account${removed === 1 ? '' : 's'}\n`)
   }
   return 0
 }

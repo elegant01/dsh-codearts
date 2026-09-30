@@ -100,6 +100,7 @@ async function startShim(chunks: readonly string[]): Promise<void> {
   vi.stubGlobal('fetch', vi.fn(async () => sseResponse(chunks)))
   shim = createCodeArtsShim({
     store: {
+      ids: async () => ['acct'],
       resolve: async () => ({ token: 'sts', accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }),
     } as never,
     catalog: { current: () => [] } as never,

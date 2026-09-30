@@ -54,8 +54,11 @@ let shim: CodeArtsShim
 let port: number
 let bearer: string
 let resolveCredential: () => Promise<unknown>
+/** 账号存储里现有的账号 id；空数组即「没登录」。 */
+let storeIds: string[]
 
 beforeEach(async () => {
+  storeIds = ['acct']
   resolveCredential = async () => ({
     token: 'sts-token',
     accessKeyId: 'AKID',
@@ -63,7 +66,7 @@ beforeEach(async () => {
     securityToken: 'sts-token',
   })
   shim = createCodeArtsShim({
-    store: { resolve: () => resolveCredential() } as never,
+    store: { ids: async () => storeIds, resolve: () => resolveCredential() } as never,
     catalog: { current: () => CATALOG } as never,
   })
   await shim.ready
@@ -175,7 +178,7 @@ describe('shim routing', () => {
   })
 
   it('reports not-signed-in as 401 when the store has no credential', async () => {
-    resolveCredential = async () => undefined
+    storeIds = []
     const res = await raw(port, {
       method: 'POST',
       path: '/v1/chat/completions',

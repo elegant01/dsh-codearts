@@ -22,7 +22,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { CodeArtsCredentialStore, codeartsAuthPath } from './auth.ts'
+import { CodeArtsAccountStore, codeartsAccountsPath } from './auth.ts'
+import { CodeArtsAccountPool } from './account-pool.ts'
 import { CodeArtsCatalog, filterEnabledModels } from './catalog.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { createCodeArtsShim } from './shim.ts'
@@ -39,9 +40,13 @@ export {
 } from './catalog.ts'
 export {
   codeartsAuthPath,
+  codeartsAccountsPath,
+  CodeArtsAccountStore,
   CodeArtsCredentialStore,
+  type CodeArtsAccountSummary,
   type CodeArtsCredential,
 } from './auth.ts'
+export { CodeArtsAccountPool, type AccountRuntime } from './account-pool.ts'
 export {
   SNAP_HOST,
   chatStream,
@@ -93,8 +98,10 @@ function settingsCompatNamespace(ctx: Context): SettingsNamespace {
 
 export function apply(ctx: Context, rawConfig: Config): void {
   const config = unwrapConfig(rawConfig)
-  const authPath = codeartsAuthPath()
-  const store = new CodeArtsCredentialStore(authPath)
+  const accountsPath = codeartsAccountsPath()
+  // 多账号：池与账号文档分离——文档管凭证，池管「谁现在能接活」。
+  const store = new CodeArtsAccountStore(accountsPath)
+  const pool = new CodeArtsAccountPool([])
   const catalog = new CodeArtsCatalog()
 
   let current = (): Config => config
@@ -134,7 +141,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
   })
 
   // Build the loopback shim first; the adapter reads its origin at construction.
-  const shim = createCodeArtsShim({ store, catalog, logger: ctx.logger })
+  const shim = createCodeArtsShim({ store, catalog, pool, logger: ctx.logger })
 
   void shim.ready
     .then(() => {

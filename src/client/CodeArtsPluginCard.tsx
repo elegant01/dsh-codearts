@@ -63,7 +63,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       const data = (await res.json()) as LocalStatus
       setStatus(data)
     } catch {
-      setStatus({ status: 'signed-out', models: [] })
+      setStatus({ status: 'signed-out', models: [], accounts: [] })
     }
   }
 
@@ -120,6 +120,16 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     setBusy(true)
     try {
       await fetch('/api/codearts/token', { method: 'DELETE' })
+      await refresh()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeAccount(id: string): Promise<void> {
+    setBusy(true)
+    try {
+      await fetch(`/api/codearts/accounts?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
       await refresh()
     } finally {
       setBusy(false)
@@ -208,6 +218,9 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
 
   const signedIn = status?.status === 'signed-in'
   const expired = status?.status === 'expired'
+  const accounts = status?.accounts ?? []
+  const accountName = (account: { label?: string; userName?: string; id: string }): string =>
+    account.label?.trim() || account.userName?.trim() || account.id
   const dotState: StateDotState = signedIn ? 'done' : expired ? 'warning' : 'idle'
   const statusText = signedIn ? t('statusSignedIn') : expired ? t('statusExpired') : t('statusSignedOut')
   const storedTime = formatStored(status?.storedAt)
@@ -237,10 +250,43 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
 
       <div className={styles.body}>
         {signedIn ? (
-          <div className={styles.actions}>
-            <Button variant="outline" size="sm" className={styles.danger} disabled={busy} onClick={() => void clearToken()}>
-              {t('clearToken')}
-            </Button>
+          <div className={styles.section}>
+            <div className={styles.sectionHead}>
+              <span className={styles.sectionLabel}>{t('accountsTitle')}</span>
+              <span className={styles.count}>{accounts.length}</span>
+            </div>
+            {accounts.length > 1 && <p className={styles.hint}>{t('accountsRotateHint')}</p>}
+            {accounts.map(account => (
+              <div key={account.id} className={styles.choiceRow}>
+                <span className={styles.name}>{accountName(account)}</span>
+                {account.stale && <Tag>{t('accountNeedsSignIn')}</Tag>}
+                {!account.signable && <Tag>{t('accountNoKey')}</Tag>}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={styles.danger}
+                  disabled={busy}
+                  onClick={() => void removeAccount(account.id)}
+                >
+                  {t('accountRemove')}
+                </Button>
+              </div>
+            ))}
+            <div className={styles.actions}>
+              <Button variant="primary" size="sm" disabled={busy || loginPending} onClick={() => void startOAuthLogin()}>
+                {loginPending ? t('signingIn') : t('addAccount')}
+              </Button>
+              <Button variant="outline" size="sm" className={styles.danger} disabled={busy} onClick={() => void clearToken()}>
+                {t('clearToken')}
+              </Button>
+            </div>
+            {loginUrl !== null && (
+              <p className={styles.hint}>
+                {t('openManually')}
+                {' '}
+                <a className={styles.link} href={loginUrl} target="_blank" rel="noreferrer">{loginUrl}</a>
+              </p>
+            )}
           </div>
         ) : (
           <div className={styles.section}>

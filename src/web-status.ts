@@ -1,10 +1,10 @@
 /**
  * Same-origin status + token routes for the CodeArts card.
  *
- * Minimal surface vs dsh-codebuddy-cli: no credits, no check-in, no multi-account.
- * The browser half calls these to read sign-in state / model list and to write
- * or clear the pasted `cloud_dragon_token`. The route answers loopback browser
- * requests only and never returns token material.
+ * Minimal surface vs dsh-codebuddy-cli: no credits, no check-in. The browser
+ * half calls these to read sign-in state / model list / the account list, and
+ * to add or remove accounts. The route answers loopback browser requests only
+ * and never returns token material.
  *
  * @module dsh-codearts/web-status
  */
@@ -12,7 +12,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type { CodeArtsCredentialStore } from './auth.ts'
+import type { CodeArtsAccountStore, CodeArtsAccountSummary } from './auth.ts'
 import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { filterEnabledModels, isBenefitModel } from './catalog.ts'
@@ -25,6 +25,8 @@ export const CODEARTS_MODELS_SELECTION_PATH = '/api/codearts/enabled-models'
 export const CODEARTS_TOKEN_PATH = '/api/codearts/token'
 export const CODEARTS_LOGIN_PATH = '/api/codearts/login'
 export const CODEARTS_LOGIN_STATUS_PATH = '/api/codearts/login/status'
+/** 删除某个账号：DELETE /api/codearts/accounts?id=<accountId> */
+export const CODEARTS_ACCOUNTS_PATH = '/api/codearts/accounts'
 
 /** 勾选 UI 的一个选项。 */
 export interface CodeArtsModelChoice {
@@ -70,6 +72,8 @@ export interface CodeArtsWebStatus {
   label?: string
   storedAt?: number
   models: readonly CodeArtsWebModelBadge[]
+  /** 已存账号。多个账号时会自动轮转，某个号忙就换下一个。 */
+  accounts: readonly CodeArtsAccountSummary[]
 }
 
 export interface CodeArtsWebModelBadge {
@@ -78,7 +82,7 @@ export interface CodeArtsWebModelBadge {
 }
 
 export interface CodeArtsStatusRouteOptions {
-  store: CodeArtsCredentialStore
+  store: CodeArtsAccountStore
   models: () => readonly CodeArtsModelInfo[]
   enabledModels?: () => readonly string[] | undefined
   /**
@@ -121,30 +125,30 @@ function readBody(req: IncomingMessage, limit = 1 << 20): Promise<string> {
 }
 
 /** Build the status document (no token material crosses to the browser). */
+/** 账号还能用吗（没被标 stale、也没过期）。 */
+function accountUsable(summary: CodeArtsAccountSummary): boolean {
+  if (summary.stale) return false
+  if (typeof summary.expiration !== 'string') return true
+  const at = Date.parse(summary.expiration)
+  return !Number.isFinite(at) || at > Date.now()
+}
+
 async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWebStatus> {
-  const cred = await deps.store.current()
   const models = deps.models().map(m => ({ id: m.id, name: m.name }))
-  if (cred === undefined) {
-    return { status: 'signed-out', models }
+  const accounts = await deps.store.list()
+  const cred = await deps.store.current()
+
+  if (accounts.length === 0 || cred === undefined) {
+    return { status: 'signed-out', models, accounts }
   }
-  const expired =
-    cred.stale === true ||
-    (typeof cred.expiration === 'string' &&
-      Number.isFinite(Date.parse(cred.expiration)) &&
-      Date.parse(cred.expiration) <= Date.now())
-  if (expired) {
-    return {
-      status: 'expired',
-      ...cred.label === undefined ? {} : { label: cred.label },
-      ...cred.storedAt === undefined ? {} : { storedAt: cred.storedAt },
-      models,
-    }
-  }
+  // 只要还有**任意一个**账号能用就算登录中 —— 别的号过期了不影响轮转。
+  const usable = accounts.some(accountUsable)
   return {
-    status: 'signed-in',
+    status: usable ? 'signed-in' : 'expired',
     ...cred.label === undefined ? {} : { label: cred.label },
     ...cred.storedAt === undefined ? {} : { storedAt: cred.storedAt },
     models,
+    accounts,
   }
 }
 
@@ -289,6 +293,37 @@ function tokenDeleteHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/**
+ * DELETE /api/codearts/accounts?id=<accountId> — 删掉一个账号。
+ *
+ * id 必须显式给：多账号下「删掉当前那个」是歧义的。改状态的路由，所以和
+ * /token 一样走 Host + Origin 双校验。
+ */
+function accountsHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'DELETE') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    const url = new URL(req.url ?? '', 'http://localhost')
+    const id = (url.searchParams.get('id') ?? '').trim()
+    if (id === '') {
+      json(res, 400, { error: 'expected ?id=<accountId>' })
+      return
+    }
+    try {
+      await deps.store.remove(id)
+      json(res, 200, await buildStatus(deps))
+    } catch (error: unknown) {
+      json(res, 500, { error: safeMessage(error) })
+    }
+  }
+}
+
 /** Mount the status / models / token routes. */
 export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRouteOptions): void {
   ctx.effect(() => {
@@ -326,12 +361,19 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_LOGIN_STATUS_PATH,
       handler: loginPollHandler(deps, activeLogins),
     })
+    const disposeAccounts = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_ACCOUNTS_PATH,
+      handler: accountsHandler(deps),
+    })
     return () => {
       disposeStatus()
       disposeModels()
+      disposeModelsSelection()
       disposeToken()
       disposeLoginStart()
       disposeLoginStatus()
+      disposeAccounts()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()
     }
@@ -401,7 +443,9 @@ function loginPollHandler(deps: CodeArtsStatusRouteOptions, active: Map<string, 
           if (!claimed.has(session)) {
             claimed.add(session)
             // 必须吞掉 rejection：宿主把未处理的 rejection 当 fatal，整个应用会退出。
-            void deps.store.setFromOAuth(token).catch(() => {})
+            // upsert 语义：同一个账号（userId 相同）是更新，别的账号是**新增** ——
+            // 所以「再登录一次」就是「添加一个账号」，登录路由本身不用改。
+            void deps.store.upsertFromOAuth(token).catch(() => {})
           }
           active.delete(key)
           return { status: 'done' }

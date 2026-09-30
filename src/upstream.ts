@@ -124,6 +124,14 @@ function conversationChatId(parsed: Record<string, unknown>): string {
 }
 
 /**
+ * 由 chat_id 派生稳定的会话标识，作为 `Session-Id` 头发给上游。
+ * 与参考实现 codearts2api 的 sessionIDFor 一致（sha256 前 16 字节）。
+ */
+function sessionIdFor(chatId: string): string {
+  return createHash('sha256').update(`codearts-session:${chatId}`).digest('hex').slice(0, 32)
+}
+
+/**
  * 把 OpenAI 风格 chat body 适配给 CodeArts /api/v2/chat/completions。
  * 该端点虽是 OpenAI 兼容，但网关按自己的 schema 严格校验参数。所以这里
  * 不做原样透传，而是：
@@ -137,13 +145,13 @@ function conversationChatId(parsed: Record<string, unknown>): string {
  *  5. 注入 CodeArts 特有字段：chat_id（按对话派生，见 conversationChatId）、
  *     prompt_cache_key、tool_stream
  */
-export function prepareChatBody(rawJson: string): { url: string; body: string; model: string } {
+export function prepareChatBody(rawJson: string): { url: string; body: string; model: string; chatId: string } {
   let parsed: Record<string, unknown> = {}
   try {
     parsed = JSON.parse(rawJson) as Record<string, unknown>
   } catch {
     // 解析失败仍拼一个最小请求，让上游自己报错
-    return { url: `${SNAP_HOST}${EP_CHAT}`, body: rawJson, model: '' }
+    return { url: `${SNAP_HOST}${EP_CHAT}`, body: rawJson, model: '', chatId: '' }
   }
   const model = typeof parsed.model === 'string' ? canonicalModel(parsed.model) : ''
   const chatId = conversationChatId(parsed)
@@ -186,7 +194,7 @@ export function prepareChatBody(rawJson: string): { url: string; body: string; m
   body.chat_id = chatId
   body.prompt_cache_key = chatId
   body.tool_stream = true
-  return { url: `${SNAP_HOST}${EP_CHAT}`, body: JSON.stringify(body), model }
+  return { url: `${SNAP_HOST}${EP_CHAT}`, body: JSON.stringify(body), model, chatId }
 }
 
 /**
@@ -234,7 +242,7 @@ function openAIDone(): Uint8Array {
  */
 export async function chatStream(
   credential: CodeArtsResolved,
-  prepared: { url: string; body: string; model: string },
+  prepared: { url: string; body: string; model: string; chatId?: string },
   signal?: AbortSignal,
 ): Promise<ChatResult> {
   const traceId = randomTraceId()
@@ -265,6 +273,13 @@ export async function chatStream(
       securityToken: credential.securityToken,
     }
     signRequest(req, bodyBuf, signCred)
+  }
+  // Chat-Id / Session-Id 必须在签名**之后**追加，否则会被计入 SignedHeaders，
+  // 网关可能拒签。上游按这组标识给会话计数与做 prompt cache 亲和：只把 chat_id
+  // 放在 body 里不够，头也得带上，否则每个请求照样各算一个会话。
+  if (prepared.chatId) {
+    req.headers.set('Chat-Id', prepared.chatId)
+    req.headers.set('Session-Id', sessionIdFor(prepared.chatId))
   }
 
   let resp: Response

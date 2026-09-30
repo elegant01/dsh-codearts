@@ -17,7 +17,8 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
-import type { CodeArtsCredentialStore } from './auth.ts'
+import type { CodeArtsAccountStore } from './auth.ts'
+import { CodeArtsAccountPool, ERROR_THRESHOLD } from './account-pool.ts'
 import type { CodeArtsCatalog } from './catalog.ts'
 import {
   prepareChatBody,
@@ -42,8 +43,10 @@ export interface CodeArtsShim {
 }
 
 export interface CodeArtsShimOptions {
-  store: CodeArtsCredentialStore
+  store: CodeArtsAccountStore
   catalog: CodeArtsCatalog
+  /** 账号池。不传则内部自建一个，并在每次请求前与账号文档对齐。 */
+  pool?: CodeArtsAccountPool
   logger?: ShimLogger
 }
 
@@ -91,78 +94,37 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   })
 }
 
+/** 一次请求最多试几个账号（与 Go 参考的 MaxRotate 一致）。 */
+const MAX_ROTATE = 3
 /**
- * 上游免费档只允许 3 个并发会话（实测 TM.00001041）。闸门设 2：给 CodeArts 网页端
- * 留一个坑，别让我们把账号占满。
- */
-const UPSTREAM_SLOTS = 2
-/**
- * 撞上限后在本地排队重发的上限。
+ * 所有账号都撞上并发上限时，回落到「在同一账号上原地重发」的预算。
  *
- * 2026-09-30 实测：一个上游会话要 ~52s 才被释放，而且**中途打断并不减免** —— 只跑了
- * 98ms 就中止的请求，同样占满一个名额 52s。所以用户「打断 → 马上重问」时，等的
- * 就是这个 52s。预算必须盖过它，否则用户看到的不是「稍等一下」，而是直接失败。
+ * 2026-09-30 实测：一个上游会话要 ~52s 才被释放，而且**中途打断并不减免** ——
+ * 只跑了 98ms 就中止的请求，同样占满一个名额 52s。所以用户「打断 → 马上重问」
+ * 时等的就是这个 52s。池里有别的账号时下面会直接换号（不用等）；这条是最后一根
+ * 稻草，必须盖过 52s，否则用户看到的不是「稍等一下」而是直接失败。
  *
  * 上限受 pi-ai 的 90s idle 超时约束：等待期间我们发不出任何内容，超过 90s 用户
  * 看到的就是超时。75s 给 52s 留了余量，也还在 90s 之内。
  */
 const CAP_WAIT_LIMIT = 75_000
 const CAP_RETRY_GAP = 3_000
-/** 排队等坑的上限。超过就明确失败，不能让请求无界堆在队列里。 */
-const SLOT_WAIT_LIMIT = 60_000
-
-let slotsInUse = 0
-const slotQueue: Array<() => void> = []
+/** 上游 5xx 后短时冷却该账号。 */
+const SERVER_COOLDOWN_MS = 30_000
+/** 零散错误累计到阈值后冷却该账号。 */
+const ERROR_COOLDOWN_MS = 60_000
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 /**
- * 占一个上游会话坑；满了就排队。排队超时或客户端已走则返回 null ——
- * 闸门自己不能变成新的死锁源。成功时返回幂等的释放函数。
- */
-function acquireSlot(signal: AbortSignal): Promise<(() => void) | null> {
-  return new Promise(resolve => {
-    let settled = false
-    const cleanup = (): void => {
-      const at = slotQueue.indexOf(grant)
-      if (at >= 0) slotQueue.splice(at, 1)
-      clearTimeout(timer)
-      signal.removeEventListener('abort', giveUp)
-    }
-    const grant = (): void => {
-      if (settled) return
-      settled = true
-      cleanup()
-      slotsInUse += 1
-      let released = false
-      resolve(() => {
-        if (released) return
-        released = true
-        slotsInUse -= 1
-        slotQueue.shift()?.()
-      })
-    }
-    const giveUp = (): void => {
-      if (settled) return
-      settled = true
-      cleanup()
-      resolve(null)
-    }
-    const timer = setTimeout(giveUp, SLOT_WAIT_LIMIT)
-    signal.addEventListener('abort', giveUp, { once: true })
-    if (slotsInUse < UPSTREAM_SLOTS) grant()
-    else slotQueue.push(grant)
-  })
-}
-
-/**
- * 打开上游流。命中并发上限时不把它甩给 pi-ai —— 429 会被重试 5 次，每次再去要
- * 一个会话，越试越满 —— 而是在本地排队重发；等不到才原样返回错误。
- * 客户端中途离开就不再空等。
+ * 在**同一个账号**上重发，直到不再撞上限或预算耗尽。
+ *
+ * 只在没有别的账号可选时使用 —— 等 52s 是最后手段，能换号就换号。
+ * 命中上限不甩给 pi-ai：429 会被重试 5 次，每次再去要一个会话，越试越满。
  */
 async function openStream(
   credential: CodeArtsResolved,
-  prepared: { url: string; body: string; model: string },
+  prepared: { url: string; body: string; model: string; chatId?: string },
   signal: AbortSignal,
 ): Promise<ChatResult> {
   const until = Date.now() + CAP_WAIT_LIMIT
@@ -178,6 +140,8 @@ async function openStream(
 export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   const { store, catalog } = options
   const logger = options.logger
+  // 账号池。空池起步，每次请求前用 store.ids() 对齐（新增/删除账号自动跟上）。
+  const pool = options.pool ?? new CodeArtsAccountPool([])
 
   const SHARED_SECRET = randomBytes(32).toString('base64url')
 
@@ -260,17 +224,6 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
       return
     }
-    let credential
-    try {
-      credential = await store.resolve()
-    } catch (error: unknown) {
-      writeOpenAIError(res, 401, 'not_signed_in', String(error))
-      return
-    }
-    if (credential === undefined) {
-      writeOpenAIError(res, 401, 'not_signed_in', 'no CodeArts token stored; paste a cloud_dragon_token in the plugin settings')
-      return
-    }
 
     const raw = (await readBody(req)).toString('utf8')
     const prepared = prepareChatBody(raw)
@@ -283,39 +236,116 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       if (!res.writableEnded) controller.abort()
     })
 
-    // 一个坑 = 一个上游会话。拿不到就排队等，别放出去撞 400 或静默。
-    const releaseSlot = await acquireSlot(controller.signal)
-    if (releaseSlot === null) {
-      if (!controller.signal.aborted) {
-        writeOpenAIError(
-          res,
-          429,
-          'soft_rate',
-          `codearts 并发会话排队超时（上游免费档只允许 ${UPSTREAM_SLOTS + 1} 个并发会话），请稍后重试`,
-        )
-      }
+    let ids: string[]
+    try {
+      ids = await store.ids()
+    } catch (error: unknown) {
+      writeOpenAIError(res, 401, 'not_signed_in', String(error))
       return
     }
-    try {
-      const result = await openStream(credential, prepared, controller.signal)
-      if (!result.ok) {
-        writeOpenAIError(
-          res,
-          KIND_STATUS[result.kind],
-          result.kind,
-          `codearts upstream ${result.kind} (http ${result.status}): ${result.message.slice(0, 400)}`,
-        )
-        return
-      }
-      if (controller.signal.aborted) {
-        // 断开发生在等上游响应头期间：把上游连接释放掉再走人。
-        await result.stream.cancel().catch(() => {})
-        return
-      }
-      await pipeToResponse(res, result.stream, controller.signal)
-    } finally {
-      releaseSlot()
+    if (ids.length === 0) {
+      writeOpenAIError(res, 401, 'not_signed_in', 'no CodeArts account stored; sign in from the CodeArts settings card')
+      return
     }
+    pool.sync(ids)
+
+    // 先按账号轮换：某个账号的会话槽位被占（要 ~52s 才释放）就换下一个用，
+    // 而不是让用户干等 —— 这正是「打断后重新提问」卡住的根因。
+    const tried = new Set<string>()
+    let cappedAccount: string | undefined
+    let lastKind: UpstreamErrorKind | undefined
+    let lastStatus = 0
+    let lastMessage = ''
+
+    for (let attempt = 0; attempt < MAX_ROTATE; attempt += 1) {
+      const id = pool.pick(tried)
+      if (id === undefined) break
+      tried.add(id)
+      if (!pool.acquire(id)) continue
+      try {
+        const credential = await store.resolve(id)
+        if (credential === undefined) {
+          pool.disable(id, 'no credential')
+          continue
+        }
+        const result = await chatStream(credential, prepared, controller.signal)
+        if (result.ok) {
+          pool.noteSuccess(id)
+          if (controller.signal.aborted) {
+            // 断开发生在等上游响应头期间：把上游连接释放掉再走人。
+            await result.stream.cancel().catch(() => {})
+            return
+          }
+          await pipeToResponse(res, result.stream, controller.signal)
+          return
+        }
+        lastKind = result.kind
+        lastStatus = result.status
+        lastMessage = result.message
+
+        if (isConcurrencyCap(result)) {
+          // 账号没坏，只是槽位暂时满了：记一个「优先避开」的提示，换下一个号。
+          // 明确**不**冷却 —— 冷却会让它在接下来一分钟彻底不可用，误伤后续请求。
+          pool.noteConcurrencyCap(id)
+          cappedAccount = id
+          continue
+        }
+        if (result.kind === 'session_dead') {
+          // 凭据失效，这个号得重新登录了，换下一个。
+          pool.disable(id, result.message)
+          continue
+        }
+        if (result.kind === 'server' || result.kind === 'soft_rate') {
+          pool.cooldown(id, SERVER_COOLDOWN_MS, result.message)
+          break
+        }
+        // 其余（400/404 等）：换号只会拿到同样的错，直接报。
+        pool.noteError(id, ERROR_THRESHOLD, ERROR_COOLDOWN_MS, result.message)
+        break
+      } finally {
+        pool.release(id)
+      }
+    }
+
+    if (controller.signal.aborted) return
+
+    // 所有账号都撞在上限上：回到单账号时代的做法 —— 挑一个号原地排队等槽位释放。
+    // 多账号时走不到这里；单账号时这是唯一的兜底。
+    if (cappedAccount !== undefined) {
+      if (pool.acquire(cappedAccount)) {
+        try {
+          const credential = await store.resolve(cappedAccount)
+          if (credential !== undefined) {
+            const result = await openStream(credential, prepared, controller.signal)
+            if (result.ok) {
+              pool.noteSuccess(cappedAccount)
+              if (controller.signal.aborted) {
+                await result.stream.cancel().catch(() => {})
+                return
+              }
+              await pipeToResponse(res, result.stream, controller.signal)
+              return
+            }
+            lastKind = result.kind
+            lastStatus = result.status
+            lastMessage = result.message
+          }
+        } finally {
+          pool.release(cappedAccount)
+        }
+      }
+    }
+
+    if (lastKind === undefined) {
+      writeOpenAIError(res, 429, 'soft_rate', 'codearts 当前没有可用账号（全部被禁用或冷却中），请稍后重试')
+      return
+    }
+    writeOpenAIError(
+      res,
+      KIND_STATUS[lastKind],
+      lastKind,
+      `codearts upstream ${lastKind} (http ${lastStatus}): ${lastMessage.slice(0, 400)}`,
+    )
   }
 
   /** 把上游 SSE 按事件边界转发给 DSH，直到流结束或被中止。 */

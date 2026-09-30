@@ -16,6 +16,12 @@ export interface CodeArtsSettingsKey {
   labelPlaceholder: string
   saveToken: string
   expiredHint: string
+  accountsTitle: string
+  accountRemove: string
+  addAccount: string
+  accountsRotateHint: string
+  accountNeedsSignIn: string
+  accountNoKey: string
   modelsTitle: string
   optionalModelsHint: string
   optionalModelsAllHint: string
@@ -52,6 +58,12 @@ export const zh: CodeArtsSettingsKey = {
   labelPlaceholder: '例如账号昵称，便于区分',
   saveToken: '保存 token',
   expiredHint: '凭证已过期，请重新登录以继续使用；已勾选的模型设置会保留。',
+  accountsTitle: '账号',
+  accountRemove: '删除',
+  addAccount: '添加账号',
+  accountsRotateHint: '已存多个账号：请求会自动轮转，某个账号忙时改用下一个，不用干等。',
+  accountNeedsSignIn: '需重新登录',
+  accountNoKey: '无 AK/SK',
   modelsTitle: '可选模型',
   optionalModelsHint: '仅勾选的模型会出现在模型选择器里。',
   optionalModelsAllHint: '所有模型默认都出现在选择器里；取消勾选不想用的即可。',
@@ -87,6 +99,12 @@ export const en: CodeArtsSettingsKey = {
   labelPlaceholder: 'e.g. account nickname',
   saveToken: 'Save token',
   expiredHint: 'Your credential has expired. Sign in again to continue; your model selection is kept.',
+  accountsTitle: 'Accounts',
+  accountRemove: 'Remove',
+  addAccount: 'Add account',
+  accountsRotateHint: 'Multiple accounts stored: requests rotate automatically, so a busy account hands over to the next one instead of making you wait.',
+  accountNeedsSignIn: 'Needs sign-in',
+  accountNoKey: 'No AK/SK',
   modelsTitle: 'Models',
   optionalModelsHint: 'Only checked models appear in the model picker.',
   optionalModelsAllHint: 'All models show in the picker by default; uncheck the ones you don’t want.',
