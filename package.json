@@ -1,9 +1,9 @@
 {
   "name": "dsh-codearts",
   "displayName": "DSH CodeArts Connect",
-  "description": "把华为云 CodeArts 的登录态接入 DeepSeek Harness —— 粘贴 cloud_dragon_token 即可在 DSH 对话窗口使用 CodeArts 模型。",
+  "description": "把华为云 CodeArts 接入 DeepSeek Harness —— 内置 OAuth2 登录（PKCE + DPoP），登录后即可在 DSH 对话窗口使用 CodeArts 的模型。",
   "version": "0.1.0",
-  "author": "you",
+  "author": "elegant01",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
@@ -48,10 +48,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/you/dsh-codearts.git"
+    "url": "git+https://github.com/elegant01/dsh-codearts.git"
   },
-  "homepage": "https://github.com/you/dsh-codearts#readme",
-  "bugs": "https://github.com/you/dsh-codearts/issues",
+  "homepage": "https://github.com/elegant01/dsh-codearts#readme",
+  "bugs": "https://github.com/elegant01/dsh-codearts/issues",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

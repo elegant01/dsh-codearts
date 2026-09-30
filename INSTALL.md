@@ -2,31 +2,31 @@
 
 把华为云 CodeArts 接入 DeepSeek Harness 桌面版（DSH）的插件。
 
-## 一、已完成的自动安装（本机）
+## 一、安装到 desktop profile
 
-本机 DSH 桌面端安装目录：`E:\DeepSeek Harness`
-本机用户目录：`C:\Users\4399\.dsh`
+把插件复制并登记进 DSH 的 desktop profile，共三步：
 
-安装脚本已经把本插件复制并登记到你的 desktop profile：
-
-- 包本体：`C:\Users\4399\.dsh\profiles\desktop\node_modules\dsh-codearts\`
+- 包本体放到 `<用户目录>\.dsh\profiles\desktop\node_modules\dsh-codearts\`
   （含 `lib/`、`cordis.patch.yml`、`package.json`、`README.md`、`LICENSE`）
-- 已在 `profiles/desktop/package.json` 的 `dependencies` 声明 `dsh-codearts`
-- 已在 `node_modules/.package-map.json` 与 `node_modules/.modules.yaml` 登记
-  （与已正常工作的 `dsh-codebuddy-cli`、`@local/agent-acta-probe` 完全相同的方式）
+- 在 `profiles/desktop/package.json` 的 `dependencies` 声明 `dsh-codearts`
+- 在 `node_modules/.package-map.json` 与 `node_modules/.modules.yaml` 登记
 
-> 备份：所有被改动的 profile 文件都留了 `*.bak-codearts-*` / `*.bak-*` 备份，
-> 如需回滚直接还原即可。
+`scripts/deploy.mjs` 会自动完成这三步（并只在需要时写入 profiles 下的 manifest）：
 
-## 二、在 DSH 桌面端验证（需要你点一下）
+```sh
+node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh/profiles/desktop
+```
+
+> 备份：脚本改动的 profile 文件会留下 `*.bak-codearts-*` 备份，回滚直接还原即可。
+
+## 二、在 DSH 桌面端验证
 
 1. **完全退出** DeepSeek Harness（托盘退出，确保进程不在）。
-2. 重新打开 `E:\DeepSeek Harness\DeepSeek Harness.exe`。
+2. 重新打开 DSH。
 3. 进入 **设置 → 插件/Providers**，应当能看到 `dsh-codearts`（CodeArts Connect）已注册。
 4. 进入 **设置 → CodeArts 卡片**（或 Providers 里的 codearts）：
    - 点「使用华为云账号登录」→ 浏览器打开授权页 → 华为云账号登录；
-   - 登录成功会自动跳回本机回调，凭证写入
-     `C:\Users\4399\.dsh\.codearts-auth.json`（这份凭证之前已通过独立探针验证可用）。
+   - 登录成功会自动跳回本机回调，凭证写入 `<用户目录>\.dsh\.codearts-auth.json`。
 5. 新建对话，provider 选 **codearts**，模型选 `GLM-5.2`（或 `deepseek-v4-flash` 等），
    发送消息即可。
 

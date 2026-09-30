@@ -6,9 +6,10 @@ name: Publish Package
 # 触发：GitHub Release 发布（打 tag 发布 release 即触发）或手动 workflow_dispatch。
 #
 # 前置（一次性）：
-#   1. 把下面 NPM_SCOPE 换成你的 GitHub 用户名（GitHub npm 注册表不接受无 scope 包名）。
-#   2. 在 npmjs.com 的包设置页配置 Trusted Publisher：
-#      GitHub Actions / <owner> / dsh-codearts / release.yml
+#   1. 在 npmjs.com 的包设置页配置 Trusted Publisher：
+#      GitHub Actions / elegant01 / dsh-codearts / release.yml
+#      （GitHub Packages 不接受无 scope 包名，所以那一路上传时会临时改名成
+#       @elegant01/dsh-codearts，仓库源码里的包名保持不变。）
 on:
   release:
     types: [published]
@@ -16,7 +17,7 @@ on:
 
 env:
   # 必须与 GitHub 用户名一致；仅用于 GitHub Packages 那一路上传时的临时改名。
-  NPM_SCOPE: '@your-github-username'
+  NPM_SCOPE: '@elegant01'
 
 jobs:
   verify:

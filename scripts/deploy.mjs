@@ -7,12 +7,13 @@
  * 本脚本全部走 fs（二进制复制 / writeFileSync 无 BOM），写完用 BOM 校验兜底。
  *
  * 用法：node scripts/deploy.mjs [profileDir]
- *   profileDir 默认 C:\Users\4399\.dsh\profiles\desktop
+ *   profileDir 默认 <用户目录>/.dsh/profiles/desktop
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync, statSync, rmSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 
-const HOME = process.env.USERPROFILE ?? process.env.HOME ?? 'C:\\Users\\4399'
+const HOME = process.env.USERPROFILE ?? process.env.HOME ?? homedir()
 const DEFAULT_PROFILE = join(HOME, '.dsh', 'profiles', 'desktop')
 const PROFILE = process.argv[2] ?? DEFAULT_PROFILE
 const SRC = dirname(dirname(new URL(import.meta.url).pathname)).replace(/^\/([A-Za-z]):/, '$1:')
