@@ -50,7 +50,12 @@ function moduleSource(css, exports, packageName, file) {
 }
 
 function declarationSource(exports) {
-  const entries = Object.entries(exports ?? {}).map(([local]) => `  readonly ${JSON.stringify(local)}: string`)
+  // 按类名排序再输出：lightningcss 返回的键序不稳定，不排的话每次构建都会把
+  // 这个生成文件改一遍（内容其实一模一样），把 diff 搞得全是噪声。
+  const entries = Object.entries(exports ?? {})
+    .map(([local]) => local)
+    .sort()
+    .map(local => `  readonly ${JSON.stringify(local)}: string`)
   return [
     '// 由 dsh-css 在构建时生成，别手改。',
     'declare const styles: {',
