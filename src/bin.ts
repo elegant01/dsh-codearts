@@ -8,6 +8,8 @@
  *   dsh plugin --profile web exec dsh-codearts models --json # machine-readable
  *   dsh plugin --profile web exec dsh-codearts usage         # local token accounting
  *   dsh plugin --profile web exec dsh-codearts usage --json  # machine-readable
+ *   dsh plugin --profile web exec dsh-codearts identity      # stable upstream user ids per account
+ *   dsh plugin --profile web exec dsh-codearts identity --fix # merge duplicate entries onto them
  *   dsh plugin --profile web exec dsh-codearts doctor        # secret-free diagnostics
  *   dsh plugin --profile web exec dsh-codearts logout        # drop the plugin's credential
  *
@@ -17,6 +19,11 @@
  *
  * `usage` reads the plugin's own ledger of requests this machine sent. CodeArts has
  * no quota API, so it is not an account balance.
+ *
+ * `identity` asks the gateway which account each stored credential belongs to. The
+ * login response carries no user id, so credentials used to be keyed by their DPoP
+ * key — which made a re-login of the same account look like a new one. This is the
+ * command that reports and (with --fix) merges those duplicates.
  *
  * `doctor` never prints token material — only paths, booleans and versions —
  * so its output is safe to paste into a bug report. `logout` removes only this
@@ -29,13 +36,14 @@ import { existsSync, statSync } from 'node:fs'
 import { codeartsAccountsPath, CodeArtsAccountStore, type CodeArtsAccountSummary } from './auth.ts'
 import { FALLBACK_CODEARTS_MODELS, isBenefitModel } from './catalog.ts'
 import { discoverModels } from './discovery.ts'
+import { fetchCallerIdentity } from './upstream.ts'
 import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CODEARTS_VERSION } from './version.ts'
 
-/** Bumped when a `--json` document changes shape (4: local usage accounting). */
-const JSON_SCHEMA_VERSION = 4
+/** Bumped when a `--json` document changes shape (5: identity backfill). */
+const JSON_SCHEMA_VERSION = 5
 
-type Action = 'doctor' | 'logout' | 'models' | 'status' | 'usage'
+type Action = 'doctor' | 'identity' | 'logout' | 'models' | 'status' | 'usage'
 
 interface StatusOut {
   schemaVersion: number
@@ -246,6 +254,98 @@ async function usage(jsonOutput: boolean): Promise<number> {
   return 0
 }
 
+/**
+ * 身份回填与重复账号清理。
+ *
+ * 背景：上游登录响应里的 `user_id` 是空串，插件原先只能拿 DPoP 公钥当账号键，
+ * 于是「对同一个账号重新登录」会多出一条记录（旧的那条之后因凭据失效而停用）。
+ * `/snap-manager/v1/current/user` 能给出稳定 user_id，所以：
+ *   - 新登录会自动带上身份（见 web-status 的登录流程）；
+ *   - 历史遗留的条目用 `identity --fix` 合并到稳定键上。
+ */
+async function identity(jsonOutput: boolean, fix: boolean): Promise<number> {
+  const accounts = await store()
+  const ids = await accounts.ids()
+  if (ids.length === 0) {
+    if (jsonOutput) {
+      process.stdout.write(JSON.stringify({
+        schemaVersion: JSON_SCHEMA_VERSION,
+        fixed: fix,
+        duplicateIdentities: 0,
+        accounts: [],
+      }, null, 2) + '\n')
+    } else {
+      process.stdout.write('not signed in — nothing to inspect\n')
+    }
+    return 1
+  }
+
+  const rows: {
+    id: string
+    userId?: string
+    userName?: string
+    ok: boolean
+    error?: string
+    action?: 'merged' | 'moved' | 'noop'
+  }[] = []
+
+  for (const id of ids) {
+    const resolved = await accounts.resolve(id)
+    if (resolved === undefined) {
+      rows.push({ id, ok: false, error: 'credential unavailable (sign in again)' })
+      continue
+    }
+    try {
+      const found = await fetchCallerIdentity(resolved)
+      const action = fix ? await accounts.adoptIdentity(id, found) : undefined
+      rows.push({
+        id,
+        userId: found.userId,
+        ...found.userName === '' ? {} : { userName: found.userName },
+        ok: true,
+        ...action === undefined ? {} : { action },
+      })
+    } catch (error) {
+      rows.push({ id, ok: false, error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  // 同一个 user_id 出现在多行 = 需要合并的重复账号。
+  const byUser = new Map<string, number>()
+  for (const row of rows) {
+    if (row.userId !== undefined) byUser.set(row.userId, (byUser.get(row.userId) ?? 0) + 1)
+  }
+  const duplicates = [...byUser.entries()].filter(([, count]) => count > 1).length
+
+  if (jsonOutput) {
+    process.stdout.write(JSON.stringify({
+      schemaVersion: JSON_SCHEMA_VERSION,
+      fixed: fix,
+      duplicateIdentities: duplicates,
+      accounts: rows,
+    }, null, 2) + '\n')
+    return 0
+  }
+
+  for (const row of rows) {
+    if (!row.ok) {
+      process.stdout.write(`  - ${row.id.slice(0, 12)}…  identity probe failed: ${row.error}\n`)
+      continue
+    }
+    const label = row.userName === undefined ? '' : ` (${row.userName})`
+    const acted = row.action === undefined ? '' : `  [${row.action}]`
+    process.stdout.write(`  - ${row.id.slice(0, 12)}…  -> ${row.userId}${label}${acted}\n`)
+  }
+  if (fix) {
+    process.stdout.write('identity backfilled; duplicate entries were merged into the stable user id\n')
+  } else if (duplicates > 0) {
+    process.stdout.write(`found ${duplicates} user id(s) stored more than once; re-run with --fix to merge them\n`)
+  } else {
+    process.stdout.write('no duplicate accounts found\n')
+  }
+  return 0
+}
+
 async function doctor(jsonOutput: boolean): Promise<number> {
   const accountsPath = codeartsAccountsPath()
   const exists = existsSync(accountsPath)
@@ -316,30 +416,33 @@ async function logout(jsonOutput: boolean): Promise<number> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
   const jsonOutput = args.includes('--json')
+  const fix = args.includes('--fix')
   const positional = args.filter(arg => !arg.startsWith('--'))
-  const unknown = args.filter(arg => arg.startsWith('--') && arg !== '--json')
+  const unknown = args.filter(arg => arg.startsWith('--') && arg !== '--json' && arg !== '--fix')
 
   const raw = positional[0] ?? 'status'
-  const actions: readonly Action[] = ['doctor', 'logout', 'models', 'status', 'usage']
+  const actions: readonly Action[] = ['doctor', 'identity', 'logout', 'models', 'status', 'usage']
   if (!actions.includes(raw as Action)) {
-    process.stderr.write(`dsh-codearts: expected doctor, logout, models, status, or usage; got ${JSON.stringify(raw)}\n`)
+    process.stderr.write(`dsh-codearts: expected doctor, identity, logout, models, status, or usage; got ${JSON.stringify(raw)}\n`)
     process.exit(2)
   }
   if (unknown.length > 0) {
-    process.stderr.write(`dsh-codearts: unknown flag ${JSON.stringify(unknown[0])} (only --json is supported)\n`)
+    process.stderr.write(`dsh-codearts: unknown flag ${JSON.stringify(unknown[0])} (only --json and --fix are supported)\n`)
     process.exit(2)
   }
 
   const action = raw as Action
   const code = action === 'doctor'
     ? await doctor(jsonOutput)
-    : action === 'logout'
-      ? await logout(jsonOutput)
-      : action === 'models'
-        ? await models(jsonOutput)
-        : action === 'usage'
-          ? await usage(jsonOutput)
-          : await status(jsonOutput)
+    : action === 'identity'
+      ? await identity(jsonOutput, fix)
+      : action === 'logout'
+        ? await logout(jsonOutput)
+        : action === 'models'
+          ? await models(jsonOutput)
+          : action === 'usage'
+            ? await usage(jsonOutput)
+            : await status(jsonOutput)
   process.exit(code)
 }
 

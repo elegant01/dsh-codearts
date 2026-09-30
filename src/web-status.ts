@@ -18,7 +18,11 @@ import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
 import type { UsageSnapshot, UsageTotals } from './usage.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { filterEnabledModels, isBenefitModel } from './catalog.ts'
-import { startLogin, type LoginSession } from './oauth.ts'
+import { fetchCallerIdentity, type CallerIdentity } from './upstream.ts'
+import { startLogin, type LoginSession, type OAuthToken } from './oauth.ts'
+
+/** 登录后问身份的超时：它是「顺手做对」，不能拖住登录落库。 */
+const IDENTITY_TIMEOUT_MS = 8_000
 
 /** Route paths (same-origin under the DSH web origin). */
 export const CODEARTS_STATUS_PATH = '/api/codearts/status'
@@ -165,9 +169,33 @@ function readBody(req: IncomingMessage, limit = 1 << 20): Promise<string> {
 }
 
 /** Build the status document (no token material crosses to the browser). */
+/**
+ * 登录后立刻问一次身份（有超时，失败返回 null）。
+ *
+ * 这一步是「尽量做对」而不是必须：拿不到身份也要能把账号存下来，只是会退回
+ * 「每次登录各自成一条」的旧行为。
+ */
+async function probeIdentity(token: OAuthToken): Promise<CallerIdentity | null> {
+  const credential = {
+    token: token.securityToken,
+    accessKeyId: token.accessKeyId,
+    secretAccessKey: token.secretAccessKey,
+    securityToken: token.securityToken,
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), IDENTITY_TIMEOUT_MS)
+  timer.unref?.()
+  try {
+    return await fetchCallerIdentity(credential, controller.signal)
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** 账号还能用吗（没被标 stale、也没过期）。 */
-function accountUsable(summary: CodeArtsAccountSummary): boolean {
-  if (summary.stale) return false
+function accountUsable(summary: CodeArtsAccountSummary): boolean {  if (summary.stale) return false
   if (typeof summary.expiration !== 'string') return true
   const at = Date.parse(summary.expiration)
   return !Number.isFinite(at) || at > Date.now()
@@ -513,7 +541,14 @@ function loginStartHandler(
         async token => {
           active.delete(session.url)
           try {
-            await deps.store.upsertFromOAuth(token)
+            // 登录响应不带 user_id，所以立刻问一次上游身份：拿到就能让「同一账号
+            // 重新登录」命中同一条记录，拿不到就退回旧行为（DPoP 公钥当键）。
+            const identity = await probeIdentity(token)
+            const id = await deps.store.upsertFromOAuth(token, undefined, identity ?? undefined)
+            // 身份已有、但这次是用老键（DPoP）新建的条目：并入稳定键，避免重复账号。
+            if (identity !== null && id !== identity.userId) {
+              await deps.store.adoptIdentity(id, identity)
+            }
             recordLoginOutcome(recent, session.url, 'done')
           } catch {
             recordLoginOutcome(recent, session.url, 'error')

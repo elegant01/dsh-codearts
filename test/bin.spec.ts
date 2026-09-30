@@ -85,7 +85,7 @@ describe('status', () => {
     const doc = JSON.parse(res.stdout) as { signedIn: boolean; signable: boolean; schemaVersion: number; models: unknown[] }
     expect(doc.signedIn).toBe(true)
     expect(doc.signable).toBe(true)
-    expect(doc.schemaVersion).toBe(4)
+    expect(doc.schemaVersion).toBe(5)
     expect(doc.models.length).toBeGreaterThan(0)
   })
 
@@ -164,7 +164,7 @@ describe('argument handling', () => {
   it('rejects an unknown action', async () => {
     const res = await cli(home, ['frobnicate'])
     expect(res.code).toBe(2)
-    expect(res.stderr).toContain('expected doctor, logout, models, status, or usage')
+    expect(res.stderr).toContain('expected doctor, identity, logout, models, status, or usage')
   })
 
   it('rejects an unknown flag', async () => {
@@ -190,7 +190,7 @@ describe('models', () => {
     const doc = JSON.parse(res.stdout) as { discovered: boolean; reason: string; models: unknown[]; schemaVersion: number }
     expect(doc.discovered).toBe(false)
     expect(doc.reason).toBe('not signed in')
-    expect(doc.schemaVersion).toBe(4)
+    expect(doc.schemaVersion).toBe(5)
     expect(doc.models.length).toBeGreaterThan(0)
   })
 })
@@ -215,6 +215,23 @@ describe('usage', () => {
     expect(doc.today.requests).toBe(0)
     expect(doc.allTime.requests).toBe(0)
     expect(doc.days).toBe(0)
-    expect(doc.schemaVersion).toBe(4)
+    expect(doc.schemaVersion).toBe(5)
+  })
+})
+
+// 已登录的 identity 会去问上游（也用来合并重复账号），所以这里只覆盖离线分支；
+// 身份解析与合并语义由 test/identity.spec.ts 覆盖。
+describe('identity', () => {
+  it('reports nothing to inspect when signed out', async () => {
+    const res = await cli(home, ['identity'])
+    expect(res.code).toBe(1)
+    expect(res.stdout).toContain('nothing to inspect')
+  })
+
+  it('accepts --fix as a flag', async () => {
+    const res = await cli(home, ['identity', '--fix', '--json'])
+    const doc = JSON.parse(res.stdout) as { accounts: unknown[]; fixed: boolean }
+    expect(doc.fixed).toBe(true)
+    expect(doc.accounts).toEqual([])
   })
 })

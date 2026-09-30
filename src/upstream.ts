@@ -30,6 +30,13 @@ const EP_MODEL_BUILTIN = '/v1/model/builtin'
 const EP_BENEFIT_CONFIG = '/api/v1/gateway/config'
 const EP_AGENT_LIST = '/v1/agent-center/agents/useragents'
 const EP_AGENT_DETAIL = '/v1/agent-center/agents/detail'
+/**
+ * 当前登录身份。**必须带 `/snap-manager` 前缀**：2026-09-30 实测
+ * `/v1/current/user` 是 APIG.0101（未发布），`/snap-manager/v1/current/user`
+ * 才返回 `{user_id, user_name, domain_id}`。codearts2api 的 const.go 里少了这段前缀
+ * （它另有 STS 的 `/v5/caller-identity`，但那条对 STS 临时凭证返回 401）。
+ */
+const EP_CURRENT_USER = '/snap-manager/v1/current/user'
 
 export type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client'
 
@@ -455,6 +462,38 @@ export async function chatStream(
   })
 
   return { ok: true, stream }
+}
+
+/** 登录身份（上游对同一账号恒定，可用来当账号的自然键）。 */
+export interface CallerIdentity {
+  userId: string
+  userName: string
+  domainId: string
+}
+
+/**
+ * 查当前凭证对应的账号身份。
+ *
+ * 为什么需要它：登录响应里 `user_id` / `user_name` 都是空串（实测），所以插件原先
+ * 只能拿 DPoP 公钥当账号标识 —— 代价是**对同一个账号重新登录会被当成新账号**。
+ * 这个端点给出上游的稳定 `user_id`，重新登录就能命中同一条账号记录。
+ *
+ * 失败不应阻断登录：调用方按「拿不到身份就退回旧行为」处理。
+ */
+export async function fetchCallerIdentity(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<CallerIdentity> {
+  const resp = await signedGet(`${SNAP_HOST}${EP_CURRENT_USER}`, credential, undefined, signal)
+  if (!resp.ok) throw new Error(`identity HTTP ${resp.status} ${resp.message}`)
+  const body = asRecord(parseJson(resp.text))
+  const userId = firstString(body.user_id)
+  if (userId === '') throw new Error('identity response carries no user_id')
+  return {
+    userId,
+    userName: firstString(body.user_name),
+    domainId: firstString(body.domain_id),
+  }
 }
 
 /** 模型清单的三路来源。任一路失败都不阻断，只有三路全失败才算失败。 */

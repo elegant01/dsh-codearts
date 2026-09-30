@@ -43,6 +43,7 @@ node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh
 dsh plugin --profile <profile> exec dsh-codearts status [--json]   # 登录状态与种子模型清单
 dsh plugin --profile <profile> exec dsh-codearts models [--json]   # 向上游发现当前账号的真实模型
 dsh plugin --profile <profile> exec dsh-codearts usage [--json]    # 本机用量账本（非账号额度）
+dsh plugin --profile <profile> exec dsh-codearts identity [--fix]  # 查/回填账号稳定身份，合并重复条目
 dsh plugin --profile <profile> exec dsh-codearts doctor            # 不涉及密钥的环境诊断
 dsh plugin --profile <profile> exec dsh-codearts logout            # 清除本插件保存的凭证
 ```
@@ -53,6 +54,9 @@ dsh plugin --profile <profile> exec dsh-codearts logout            # 清除本�
 `usage` 读的是插件自己的账本（`$DSH_HOME/.codearts-usage.json`，按天保留 60 天）——
 **不是账号额度**：CodeArts 没有额度接口，官方明细在
 `codearts.huaweicloud.com/portal/settings/personal-usage`，卡片上也有这个链接。
+
+`identity` 打印每个已存账号在上游的稳定 `user_id`（同一个 id 出现两次就是重复条目）；
+加 `--fix` 会把它们合并到稳定键上，顺带补上 `user_name` / `domain_id`。
 
 `doctor` 只输出路径、状态与版本，不会打印任何令牌内容，输出可以直接贴进问题反馈；`logout`
 只删除本插件自己的凭证副本，不影响账号本身。
@@ -83,9 +87,11 @@ shim 只监听回环地址，并校验 Host、Origin 与本进程随机密钥，
   的账号上。
 - 只有一个账号时，刚停止过一次生成就立刻重新提问，仍可能要等约半分钟。插件会自动排队重试，
   不需要手动重发，但等待期间界面上不会有新内容。
-- 上游的登录响应不返回用户标识（实测 `user_id` / `user_name` 都是空串），插件改用 DPoP 公钥
-  作为账号标识。副作用：**对同一个账号重新登录会被当成一个新账号**，旧条目会因凭据失效而
-  自行停用，可在卡片上删掉。
+- 上游的登录响应不返回用户标识（实测 `user_id` / `user_name` 都是空串），所以插件在登录完成后
+  会**再问一次** `/snap-manager/v1/current/user` 拿稳定的 `user_id` 作为账号的自然键：
+  同一个账号重新登录会更新原条目，不再变成新账号。这一步失败（网络/接口变动）时退回旧行为
+  —— 用 DPoP 公钥当键，此时**同一账号重新登录会被当成新账号**，旧条目会因凭据失效而自行停用。
+  历史遗留的重复条目可以用 `dsh-codearts identity --fix` 合并到稳定键上（先不带 `--fix` 跑一次是只读的）。
 - **模型动态发现**：启动时与每小时各向上游拉一次真实模型清单（内置 / 限时福利 /
   agent-center 三路合并），拉不到就退回内置种子清单，不会因为上游抖动把模型选择器清空。
   某个模型没出现时，用 `dsh-codearts models` 看上游到底返回了什么。

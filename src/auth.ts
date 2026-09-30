@@ -14,13 +14,20 @@ import { mkdir, readFile, writeFile, chmod, rename, unlink } from 'node:fs/promi
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { refreshToken, defaultLoginConfig, type OAuthToken } from './oauth.ts'
+import type { CallerIdentity } from './upstream.ts'
 
 /** 福利领取的上限；失败无所谓，卡住登录才是问题。 */
 const CLAIM_TIMEOUT_MS = 15_000
 
+/** 两条凭证里较新的一条（`storedAt` 缺失视为最旧）。 */
+function newerCredential(a: CodeArtsCredential, b: CodeArtsCredential): CodeArtsCredential {
+  const at = typeof a.storedAt === 'number' ? a.storedAt : 0
+  const bt = typeof b.storedAt === 'number' ? b.storedAt : 0
+  return bt > at ? b : a
+}
+
 /** 持久化的完整凭证。 */
-export interface CodeArtsCredential {
-  /** STS security_token（聊天鉴权 + AK/SK 签名时的 X-Security-Token）。 */
+export interface CodeArtsCredential {  /** STS security_token（聊天鉴权 + AK/SK 签名时的 X-Security-Token）。 */
   token: string
   /** 临时 AK/SK（HMAC 签名用）。手动粘贴场景可能为空。 */
   accessKeyId?: string
@@ -36,6 +43,8 @@ export interface CodeArtsCredential {
   /** 用户标识。 */
   userId?: string
   userName?: string
+  /** 华为云账号的 domain（`/snap-manager/v1/current/user` 会返回）。 */
+  domainId?: string
   /** 可选标注。 */
   label?: string
   /** 存盘时间（epoch ms）。 */
@@ -56,6 +65,7 @@ export function credentialFromOAuth(t: OAuthToken, label?: string): CodeArtsCred
     expiration: t.expiration,
     userId: t.userId,
     userName: t.userName,
+    domainId: t.domainId,
     label: label ?? t.userName ?? t.userId,
     storedAt: Date.now(),
   }
@@ -601,11 +611,67 @@ export class CodeArtsAccountStore {
   /**
    * 从一次 OAuth 登录结果新增/更新账号。
    *
-   * 「再登录一次」天然就是「添加账号」：同一账号（userId 相同）是更新，
-   * 别的账号就是新增 —— 所以登录路由本身不需要改。
+   * 「再登录一次」天然就是「添加账号」：同一账号是更新，别的账号就是新增。
+   *
+   * 传了 `identity`（来自 `fetchCallerIdentity` 的稳定 user_id）就用它当账号键 ——
+   * 这正是「对同一个账号重新登录会被当成新账号」的解药；拿不到身份时退回旧行为
+   * （DPoP 公钥当键），也就是每次登录各自成一条。
    */
-  async upsertFromOAuth(t: OAuthToken, label?: string): Promise<string> {
-    return this.upsert(credentialFromOAuth(t, label))
+  async upsertFromOAuth(t: OAuthToken, label?: string, identity?: CallerIdentity): Promise<string> {
+    const cred = credentialFromOAuth(t, label)
+    if (identity !== undefined) {
+      cred.userId = identity.userId
+      if (identity.userName !== '') cred.userName = identity.userName
+      if (identity.domainId !== '') cred.domainId = identity.domainId
+    }
+    return this.upsert(cred)
+  }
+
+  /**
+   * 把一条已有账号迁移到它的稳定身份键上（同键则合并）。
+   *
+   * 用在两处：登录后回填身份（老条目已经存在时合并掉），以及 `dsh-codearts identity --fix`
+   * 清理历史遗留的重复条目。合并时保留 `storedAt` 较新的一份凭证，位置沿用目标键原有的顺序。
+   *
+   * @returns 迁移结果：`merged` 表示并入了已存在的那条，`moved` 表示只换了键，`noop` 表示键没变
+   */
+  async adoptIdentity(id: string, identity: CallerIdentity): Promise<'merged' | 'moved' | 'noop'> {
+    await this.loaded()
+    const doc = this._doc as CodeArtsAccountDocument
+    const existing = doc.accounts[id]
+    if (existing === undefined) return 'noop'
+    const targetKey = identity.userId
+    if (targetKey === '' || targetKey === id) {
+      // 键没变，但身份字段值得补上（老条目可能只有 DPoP 键）。
+      doc.accounts[id] = {
+        ...existing,
+        userId: identity.userId === '' ? existing.userId : identity.userId,
+        ...identity.userName === '' ? {} : { userName: identity.userName },
+        ...identity.domainId === '' ? {} : { domainId: identity.domainId },
+      }
+      this._slots.get(id)?.invalidate()
+      this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id)))
+      await this.persistDoc()
+      return 'noop'
+    }
+
+    const target = doc.accounts[targetKey]
+    const keep = target === undefined ? existing : newerCredential(target, existing)
+    doc.accounts[targetKey] = {
+      ...keep,
+      userId: identity.userId,
+      ...identity.userName === '' ? {} : { userName: identity.userName },
+      ...identity.domainId === '' ? {} : { domainId: identity.domainId },
+    }
+    delete doc.accounts[id]
+    doc.order = doc.order.filter(existingId => existingId !== id)
+    if (!doc.order.includes(targetKey)) doc.order.push(targetKey)
+    this._slots.get(id)?.invalidate()
+    this._slots.delete(id)
+    this._slots.get(targetKey)?.invalidate()
+    this._slots.set(targetKey, new AccountSlot(doc.accounts[targetKey], this.persisterFor(targetKey)))
+    await this.persistDoc()
+    return target === undefined ? 'moved' : 'merged'
   }
 
   /** 手工粘贴 security_token（降级态，无 AK/SK）——固定覆盖同一个「手工」账号。 */
