@@ -1,0 +1,16 @@
+node_modules/
+lib/
+coverage/
+*.log
+.DS_Store
+
+# Plugin-owned credentials — never commit these.
+.codearts-auth.json
+.codearts-auth.json.*
+*.bak-codearts-*
+*.bak-bomfix-*
+*.bak-*
+
+# Local debug strays.
+.tmp-*
+*.tgz

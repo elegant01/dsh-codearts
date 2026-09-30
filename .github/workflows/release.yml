@@ -1,0 +1,81 @@
+name: Publish Package
+
+# 发布 npm 包：
+#   - GitHub Packages：用 GITHUB_TOKEN 发布 @<owner>/dsh-codearts（打 tag 发布 release 时触发）
+#   - npmjs：用 npm Trusted Publisher（OIDC）发布 dsh-codearts，免 token、免 OTP
+# 触发：GitHub Release 发布（打 tag 发布 release 即触发）或手动 workflow_dispatch。
+#
+# 前置（一次性）：
+#   1. 把下面 NPM_SCOPE 换成你的 GitHub 用户名（GitHub npm 注册表不接受无 scope 包名）。
+#   2. 在 npmjs.com 的包设置页配置 Trusted Publisher：
+#      GitHub Actions / <owner> / dsh-codearts / release.yml
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  # 必须与 GitHub 用户名一致；仅用于 GitHub Packages 那一路上传时的临时改名。
+  NPM_SCOPE: '@your-github-username'
+
+jobs:
+  verify:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check
+
+  publish-github-packages:
+    name: Publish to GitHub Packages
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: ${{ env.NPM_SCOPE }}
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: Retag as scoped package for GitHub Packages
+        # 只在 CI 里临时把包名改成 @<owner>/dsh-codearts，
+        # 不动仓库源码里 npmjs 用的无 scope 包名 dsh-codearts
+        run: npm pkg set name="$NPM_SCOPE/dsh-codearts"
+      - name: Publish
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npmjs:
+    name: Publish to npmjs (OIDC)
+    needs: verify
+    # npm Trusted Publisher（OIDC）：workflow 必须有 id-token: write，
+    # npm CLI 自动检测 OIDC 环境并换取一次性发布凭证，无需任何 npm token。
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC 必需
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 注意：不设 registry-url —— OIDC 握手由 npm CLI 自动完成，
+          # 显式 .npmrc 认证反而会干扰 trusted publisher 流程。
+          node-version: '24' # 内置 npm >= 11，满足 OIDC/trusted publishing 要求
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: Publish with provenance
+        run: npm publish --provenance --access public

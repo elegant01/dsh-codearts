@@ -1,0 +1,6 @@
+# Register the CodeArts provider without changing the profile's current
+# default model. The plugin uses the embedded Huawei Cloud OAuth2 login
+# (PKCE + DPoP) or a pasted token; no separate CLI is required.
+- insert:
+    - id: llm-codearts
+      name: dsh-codearts

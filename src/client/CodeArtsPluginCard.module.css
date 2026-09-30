@@ -1,0 +1,229 @@
+/*
+ * CodeArts 卡片的布局层。控件（按钮 / 勾选 / 标签 / 状态点 / 输入框）一律走
+ * @deepseek-ai/dsh-client-ui-primitives，由宿主在运行时提供，所以这里只写宿主
+ * 没有覆盖的部分：卡片外壳、排版和间距。
+ *
+ * 颜色与圆角只用宿主 theme 里真实存在的令牌（settings-card-* / radius-* /
+ * interactive-bg-hover / state-*），不自己造名字 —— 自定义属性写错了不会报错，
+ * 只会静默地没有颜色。
+ */
+
+.card {
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-alias-settings-card-fill);
+  max-width: 720px;
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.headText {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.name {
+  color: var(--dsw-alias-label-primary);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 22px;
+}
+
+.desc {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.statusLine {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+}
+
+.meta {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.body {
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+  margin: 0 16px;
+  padding: 4px 0 16px;
+}
+
+.section {
+  margin-top: 16px;
+}
+
+.sectionHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sectionLabel {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.count {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.hint {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  line-height: 20px;
+  margin: 8px 0 0;
+}
+
+.error {
+  color: var(--dsw-alias-state-error-primary);
+  font-size: 13px;
+  line-height: 20px;
+  margin: 10px 0 0;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+/* Button 没有 danger 变体，破坏性动作用 outline + 错误色文字。 */
+.danger {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.link {
+  appearance: none;
+  border: none;
+  padding: 0;
+  background: none;
+  color: var(--dsw-alias-brand-text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  word-break: break-all;
+  cursor: pointer;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.choices {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.choiceRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 -6px;
+  padding: 5px 6px;
+  border-radius: var(--dsw-radius-sm);
+}
+
+.choiceRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* Checkbox 自己带 <label><input><span>，这里只负责让它在行里撑开并省略号。 */
+.check {
+  flex: 1;
+  min-width: 0;
+}
+
+.check > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.manual {
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  margin-top: 12px;
+  padding: 0 12px;
+}
+
+.manual[open] {
+  padding-bottom: 12px;
+}
+
+.manualSummary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.manualSummary::-webkit-details-marker {
+  display: none;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 10px;
+}
+
+.fieldLabel {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+}
+
+/* 宿主没有 Textarea 原语，所以照 Input.module.css 的写法手工对齐。 */
+.area {
+  box-sizing: border-box;
+  width: 100%;
+  resize: vertical;
+  border: 0.5px solid var(--dsw-alias-border-l4);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+  padding: 6px 8px;
+  color: var(--dsw-alias-label-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.area::placeholder {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.area:focus {
+  outline: none;
+  border-color: var(--dsw-alias-state-business-primary);
+}
