@@ -1,10 +1,49 @@
-# dsh-codearts
+# DSH CodeArts Connect
 
-把华为云 CodeArts 接入 DeepSeek Harness（DSH）桌面版的插件。内置**华为云 OAuth2 登录**（PKCE + DPoP，真零配置），登录后即在 DSH 对话窗口使用 CodeArts 的模型（GLM-5.2、盘古、Qwen、DeepSeek 等）。
+把华为云 CodeArts 接入 DeepSeek Harness（DSH），实现在 DSH 对话窗口里直接使用 CodeArts 提供的模型（GLM-5.2、盘古、Qwen、DeepSeek 等）。
+
+## 功能
+
+- **账号登录**：在设置卡片里点一次「使用华为云账号登录」，浏览器完成授权后凭证自动落盘，无需手工填写密钥。
+- **自动续期**：凭证过期前自动续期；续期失败会在卡片上提示重新登录，不会静默使用失效凭证。
+- **可选模型**：可在设置卡片里勾选要出现在模型选择器中的模型（配置项 `enabledModels`）。未勾选的模型只是不再被推荐，已经选定它的会话仍可继续使用；不勾选等同于提供全部模型。
+- **图片输入**：支持视觉的模型可直接在对话里粘贴或拖入图片。
+- **降级路径**：也可以在卡片里直接粘贴安全令牌，适用于脚本或排查场景。
+- **命令行**：提供 `status` / `doctor` / `logout` 三个子命令，便于在无图形界面时检查登录状态。
+
+## 安装
+
+详见 [INSTALL.md](./INSTALL.md)。核心是把 `package.json` + `lib/` + `cordis.patch.yml` 放进
+`profiles/<profile>/node_modules/dsh-codearts/`，并在 profile 的 `package.json`、
+`node_modules/.package-map.json`、`node_modules/.modules.yaml` 登记。
+
+```sh
+# 从本仓库构建产物
+pnpm install && pnpm run build
+node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh/profiles/desktop
+```
+
+## 使用
+
+1. 打开 DSH 设置 → CodeArts 卡片 → 「使用华为云账号登录」。
+2. 浏览器打开授权页 → 登录华为云账号 → 自动跳回本机回调，凭证写入
+   `$DSH_HOME/.codearts-auth.json`。
+3. 新建对话，provider 选择 `codearts`，再选一个模型即可开始。
+
+## 命令行
+
+```sh
+dsh plugin --profile <profile> exec dsh-codearts status [--json]   # 登录状态与可用模型
+dsh plugin --profile <profile> exec dsh-codearts doctor            # 不涉及密钥的环境诊断
+dsh plugin --profile <profile> exec dsh-codearts logout            # 清除本插件保存的凭证
+```
+
+`doctor` 只输出路径、状态与版本，不会打印任何令牌内容，输出可以直接贴进问题反馈；`logout`
+只删除本插件自己的凭证副本，不影响账号本身。
 
 ## 架构
 
-沿用 `dsh-codebuddy-cli` 的标准做法：本地 loopback shim + pi-ai adapter。
+沿用 `dsh-codebuddy-cli` 的结构：本地 loopback shim + pi-ai adapter。
 
 ```
 DSH 对话窗口
@@ -14,60 +53,34 @@ dsh-codearts shim  (127.0.0.1:随机端口)
    │  注入 x-auth-token: <华为云 STS security_token>
    │  + 华为云 AK/SK SDK-HMAC-SHA256 签名
    ▼
-CodeArts /api/v2/chat/completions  (snap-access.cn-north-4.myhuaweicloud.com)
+CodeArts /api/v2/chat/completions
 ```
 
-- `oauth.ts`：华为云 CodeArts OAuth2（PKCE + 本地回调）→ STS 换临时 AK/SK + security_token；刷新走 `/v1/oauth2/tokens`。
-- `signer.ts`：华为云 AK/SK HMAC-SHA256 签名（SDK-HMAC-SHA256）。
-- `dpop.ts`：DPoP ES256/P-256 证明 JWT，refresh_token 与其绑定。
-- `upstream.ts`：`/api/v2/chat/completions` OpenAI 兼容 SSE，含请求翻译与流转换。
-- `auth.ts`：凭证存储（`$DSH_HOME/.codearts-auth.json`），自动续期。
-
-## 安装（桌面版 DSH）
-
-详见 [INSTALL.md](./INSTALL.md)。核心：把 `package.json` + `lib/` + `cordis.patch.yml` 放进
-`profiles/<profile>/node_modules/dsh-codearts/`，并在 profile 的 `package.json`、
-`node_modules/.package-map.json`、`node_modules/.modules.yaml` 登记（与 `dsh-codebuddy-cli` 同方式）。
-
-## 使用
-
-1. 打开 DSH 设置 → CodeArts 卡片 → 「使用华为云账号登录」。
-2. 浏览器打开授权页 → 华为云账号登录 → 自动跳回本机回调，凭证落盘。
-3. 模型选择器切到 `codearts`，选 `GLM-5.2`（或 `deepseek-v4-flash` 等）即可对话。
-
-也可走降级路径：直接在卡片里粘贴 `security_token`（需同时有 AK/SK 才能用 AK/SK 签名）。
-
-## 独立探针（调试用）
-
-```sh
-node --experimental-strip-types scripts/probe-login.ts   # 走完整 OAuth 登录并落盘
-node --experimental-strip-types scripts/probe-chat.ts "你的问题" [模型]  # 测真实聊天
-```
-
-## 目录结构
-
-```
-src/
-  index.ts         插件入口：装配 shim / adapter / OAuth 路由 / 设置卡片
-  shim.ts          loopback OpenAI 兼容代理
-  adapter.ts       注册 codearts provider 进 DSH llm 缝
-  auth.ts          OAuth 凭证存储 + 自动续期
-  upstream.ts      CodeArts chat 调用 + 请求翻译 + SSE 转换
-  signer.ts        华为云 AK/SK HMAC-SHA256 签名
-  dpop.ts          DPoP ES256/P-256 证明 JWT
-  oauth.ts         华为云 CodeArts OAuth2（PKCE + 本地回调 + STS 换 token）
-  catalog.ts       静态种子模型清单
-  web-status.ts    登录/状态/模型路由（供卡片调用）
-  client/          Web 设置卡片（OAuth 登录 + 降级粘贴 token）
-  bin.ts           status 命令行
-```
+shim 只监听回环地址，并校验 Host、Origin 与本进程随机密钥，其他本机进程无法冒用。
 
 ## 已知限制
 
-- 免费/福利模型（`deepseek-v4-flash-0731`、`glm-5.3-flash` 等）需要 `maas_type: benefit`
-  头，并在聊天前先 `POST /api/v1/benefit/claim` 领取（幂等）；插件已自动处理，可零成本使用。
-  商业模型（GLM-5.2 等）同样正常。
-- 凭证有效期约 24 小时，过期后插件用 refresh_token 续期（refresh_token 与 DPoP 公钥绑定）；
-  刷新失败会标记为「已过期」，卡片提示重新登录，不会静默使用过期凭证。
-- 模型清单为静态种子，未做动态发现。其中 4 个福利模型 ID 经真实账号 `GET /v2/models`
-  核对过；商业模型的 `contextWindow` / `maxTokens` / `supportsImages` 为占位值，未核对。
+- 凭证有效期约 24 小时，过期后自动续期（刷新令牌与 DPoP 密钥绑定）。
+- 上游对并发会话数有限制。短时间内连续发起多次请求（多个会话、或多轮快速追问）可能被暂时
+  拒绝，稍候即可恢复。
+- 模型清单为内置清单，暂未做服务端动态发现；上下文长度等参数以服务端实际行为为准。
+- 目前只提供中文文档。
+
+## 免责声明
+
+- 本项目**仅供个人学习和研究使用**，仅驱动使用者自己的账号在本机调用，请勿用于商业用途或
+  超出个人合理使用的场景。
+- 使用者需遵守华为云及 CodeArts 的服务条款；因使用本项目产生的任何后果（包括但不限于账号
+  被限制、服务中断），由使用者自行承担。
+- 本项目作者不对任何因使用或滥用本项目产生的直接或间接损失负责。
+- 本项目与华为、DeepSeek 均无关联，未获其授权或认可；文中出现的名称仅用于描述兼容关系，
+  其商标权利归各自所有。
+
+## 致谢
+
+- [dsh-codebuddy-cli](https://github.com/fu827707013/dsh-codebuddy-cli)（MIT）— 本插件的
+  DSH 插件结构、loopback shim 与 provider 注册方式均以其为参照。
+
+## 许可证
+
+[MIT](./LICENSE)
