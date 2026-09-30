@@ -19,7 +19,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable } from 'node:stream'
 import type { CodeArtsCredentialStore } from './auth.ts'
 import type { CodeArtsCatalog } from './catalog.ts'
-import { prepareChatBody, chatStream, type UpstreamErrorKind } from './upstream.ts'
+import {
+  prepareChatBody,
+  chatStream,
+  isConcurrencyCap,
+  type ChatResult,
+  type CodeArtsResolved,
+  type UpstreamErrorKind,
+} from './upstream.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 
 export interface ShimLogger {
@@ -82,6 +89,90 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('end', () => resolve(Buffer.concat(chunks)))
     req.on('error', reject)
   })
+}
+
+/**
+ * 上游免费档只允许 3 个并发会话（实测 TM.00001041）。闸门设 2：给 CodeArts 网页端
+ * 留一个坑，别让我们把账号占满。
+ */
+const UPSTREAM_SLOTS = 2
+/**
+ * 撞上限后在本地排队重发的上限。
+ *
+ * 2026-09-30 实测：一个上游会话要 ~52s 才被释放，而且**中途打断并不减免** —— 只跑了
+ * 98ms 就中止的请求，同样占满一个名额 52s。所以用户「打断 → 马上重问」时，等的
+ * 就是这个 52s。预算必须盖过它，否则用户看到的不是「稍等一下」，而是直接失败。
+ *
+ * 上限受 pi-ai 的 90s idle 超时约束：等待期间我们发不出任何内容，超过 90s 用户
+ * 看到的就是超时。75s 给 52s 留了余量，也还在 90s 之内。
+ */
+const CAP_WAIT_LIMIT = 75_000
+const CAP_RETRY_GAP = 3_000
+/** 排队等坑的上限。超过就明确失败，不能让请求无界堆在队列里。 */
+const SLOT_WAIT_LIMIT = 60_000
+
+let slotsInUse = 0
+const slotQueue: Array<() => void> = []
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+/**
+ * 占一个上游会话坑；满了就排队。排队超时或客户端已走则返回 null ——
+ * 闸门自己不能变成新的死锁源。成功时返回幂等的释放函数。
+ */
+function acquireSlot(signal: AbortSignal): Promise<(() => void) | null> {
+  return new Promise(resolve => {
+    let settled = false
+    const cleanup = (): void => {
+      const at = slotQueue.indexOf(grant)
+      if (at >= 0) slotQueue.splice(at, 1)
+      clearTimeout(timer)
+      signal.removeEventListener('abort', giveUp)
+    }
+    const grant = (): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      slotsInUse += 1
+      let released = false
+      resolve(() => {
+        if (released) return
+        released = true
+        slotsInUse -= 1
+        slotQueue.shift()?.()
+      })
+    }
+    const giveUp = (): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(null)
+    }
+    const timer = setTimeout(giveUp, SLOT_WAIT_LIMIT)
+    signal.addEventListener('abort', giveUp, { once: true })
+    if (slotsInUse < UPSTREAM_SLOTS) grant()
+    else slotQueue.push(grant)
+  })
+}
+
+/**
+ * 打开上游流。命中并发上限时不把它甩给 pi-ai —— 429 会被重试 5 次，每次再去要
+ * 一个会话，越试越满 —— 而是在本地排队重发；等不到才原样返回错误。
+ * 客户端中途离开就不再空等。
+ */
+async function openStream(
+  credential: CodeArtsResolved,
+  prepared: { url: string; body: string; model: string },
+  signal: AbortSignal,
+): Promise<ChatResult> {
+  const until = Date.now() + CAP_WAIT_LIMIT
+  for (;;) {
+    const result = await chatStream(credential, prepared, signal)
+    if (result.ok) return result
+    const worthWaiting = isConcurrencyCap(result) && !signal.aborted && Date.now() + CAP_RETRY_GAP <= until
+    if (!worthWaiting) return result
+    await sleep(CAP_RETRY_GAP)
+  }
 }
 
 export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
@@ -192,30 +283,54 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       if (!res.writableEnded) controller.abort()
     })
 
-    const result = await chatStream(credential, prepared, controller.signal)
-    if (!result.ok) {
-      writeOpenAIError(
-        res,
-        KIND_STATUS[result.kind],
-        result.kind,
-        `codearts upstream ${result.kind} (http ${result.status}): ${result.message.slice(0, 400)}`,
-      )
+    // 一个坑 = 一个上游会话。拿不到就排队等，别放出去撞 400 或静默。
+    const releaseSlot = await acquireSlot(controller.signal)
+    if (releaseSlot === null) {
+      if (!controller.signal.aborted) {
+        writeOpenAIError(
+          res,
+          429,
+          'soft_rate',
+          `codearts 并发会话排队超时（上游免费档只允许 ${UPSTREAM_SLOTS + 1} 个并发会话），请稍后重试`,
+        )
+      }
       return
     }
-    if (controller.signal.aborted) {
-      // 断开发生在等上游响应头期间：把上游连接释放掉再走人。
-      await result.stream.cancel().catch(() => {})
-      return
+    try {
+      const result = await openStream(credential, prepared, controller.signal)
+      if (!result.ok) {
+        writeOpenAIError(
+          res,
+          KIND_STATUS[result.kind],
+          result.kind,
+          `codearts upstream ${result.kind} (http ${result.status}): ${result.message.slice(0, 400)}`,
+        )
+        return
+      }
+      if (controller.signal.aborted) {
+        // 断开发生在等上游响应头期间：把上游连接释放掉再走人。
+        await result.stream.cancel().catch(() => {})
+        return
+      }
+      await pipeToResponse(res, result.stream, controller.signal)
+    } finally {
+      releaseSlot()
     }
+  }
 
+  /** 把上游 SSE 按事件边界转发给 DSH，直到流结束或被中止。 */
+  async function pipeToResponse(
+    res: ServerResponse,
+    stream: ReadableStream<Uint8Array>,
+    signal: AbortSignal,
+  ): Promise<void> {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     })
-    const upstream = result.stream
-    const reader = upstream.getReader()
+    const reader = stream.getReader()
     const decoder = new TextDecoder()
     let buf = ''
     // 上游流里可能已经带了终止帧（openAIDone）。收尾时只在没写过的情况下补，
@@ -225,34 +340,31 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       if (!res.writable || res.writableEnded) return
       res.end(sawDone ? undefined : 'data: [DONE]\n\n')
     }
-    const pump = async (): Promise<void> => {
-      try {
-        for (;;) {
-          const { done, value } = await reader.read()
-          if (done) {
-            finish()
-            return
-          }
-          buf += decoder.decode(value, { stream: true })
-          // 按 SSE 事件边界（空行）切分
-          let idx: number
-          while ((idx = buf.indexOf('\n\n')) >= 0) {
-            const frame = buf.slice(0, idx)
-            buf = buf.slice(idx + 2)
-            if (!frame) continue
-            if (frame.trim() === 'data: [DONE]') sawDone = true
-            if (res.writable) res.write(frame + '\n\n')
-          }
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) {
+          finish()
+          return
         }
-      } catch (error: unknown) {
-        // 用户点「停止生成」也会走到这里，那不是故障，别刷日志。
-        if (!controller.signal.aborted) {
-          logger?.warn('dsh-codearts: upstream stream failed mid-flight', error)
+        buf += decoder.decode(value, { stream: true })
+        // 按 SSE 事件边界（空行）切分
+        let idx: number
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          if (!frame) continue
+          if (frame.trim() === 'data: [DONE]') sawDone = true
+          if (res.writable) res.write(frame + '\n\n')
         }
-        finish()
       }
+    } catch (error: unknown) {
+      // 用户点「停止生成」也会走到这里，那不是故障，别刷日志。
+      if (!signal.aborted) {
+        logger?.warn('dsh-codearts: upstream stream failed mid-flight', error)
+      }
+      finish()
     }
-    void pump()
   }
 
   return {

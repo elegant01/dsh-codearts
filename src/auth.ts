@@ -15,6 +15,9 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { refreshToken, defaultLoginConfig, type OAuthToken } from './oauth.ts'
 
+/** 福利领取的上限；失败无所谓，卡住登录才是问题。 */
+const CLAIM_TIMEOUT_MS = 15_000
+
 /** 持久化的完整凭证。 */
 export interface CodeArtsCredential {
   /** STS security_token（聊天鉴权 + AK/SK 签名时的 X-Security-Token）。 */
@@ -106,15 +109,36 @@ export interface ResolvedCredential {
   securityToken: string
 }
 
+/** 续期必需的三样；ensureFresh 已确认齐全才会走到 refresh。 */
+interface RefreshMaterials {
+  refreshToken: string
+  dpopPrivateKey: NonNullable<CodeArtsCredential['dpopPrivateKey']>
+  clientId: string
+}
+
 export class CodeArtsCredentialStore {
   private _current: CodeArtsCredential | undefined
   private _path: string
+  /** 正在进行的刷新。并发请求必须共用它，不能各刷一次。 */
+  private _inflight: Promise<CodeArtsCredential> | undefined
+  /**
+   * 凭证代际。重登/清除会推进它，让还在飞的刷新发现自己过期，
+   * 从而不把刷新结果写回去覆盖掉刚拿到的新凭证。
+   */
+  private _gen = 0
+
+  /** 作废在飞的刷新；任何直接写凭证的路径都要先调它。 */
+  private invalidateInflight(): void {
+    this._gen += 1
+    this._inflight = undefined
+  }
 
   constructor(path: string) {
     this._path = path
   }
 
   setPath(path: string): void {
+    this.invalidateInflight()
     this._current = undefined
     this._path = path
   }
@@ -137,6 +161,8 @@ export class CodeArtsCredentialStore {
 
   /** 从 OAuth 登录结果落库。 */
   async setFromOAuth(t: OAuthToken, label?: string): Promise<void> {
+    // 重登拿到的新凭证优先级最高：先作废在飞的刷新，别让旧刷新回头覆盖它。
+    this.invalidateInflight()
     const cred = credentialFromOAuth(t, label)
     await saveCredential(this._path, cred)
     this._current = cred
@@ -155,6 +181,10 @@ export class CodeArtsCredentialStore {
           secretAccessKey: cred.secretAccessKey,
           securityToken: cred.token,
         },
+        // 领取失败不该拖住登录/续期。之前没传 signal，claimBenefit 的 fetch 就没有
+        // 任何超时——福利接口一旦不响应，ensureFresh() 永远不返回，跟着卡死的是
+        // 整个聊天请求。
+        AbortSignal.timeout(CLAIM_TIMEOUT_MS),
       )
     } catch {
       // 领取失败不阻断登录（接口宽松，幂等）。
@@ -163,6 +193,7 @@ export class CodeArtsCredentialStore {
 
   /** 手动粘贴 security_token（降级态，无 AK/SK）。 */
   async set(token: string, label?: string): Promise<void> {
+    this.invalidateInflight()
     const cred: CodeArtsCredential = {
       token: token.trim(),
       label,
@@ -173,6 +204,7 @@ export class CodeArtsCredentialStore {
   }
 
   async clear(): Promise<void> {
+    this.invalidateInflight()
     this._current = undefined
     await clearCredential(this._path)
   }
@@ -186,13 +218,39 @@ export class CodeArtsCredentialStore {
    * 返回当前（可能已刷新）凭证。
    */
   async ensureFresh(): Promise<CodeArtsCredential | undefined> {
-    let cred = this._current ?? (await loadCredential(this._path))
+    const gen = this._gen
+    const cred = this._current ?? (await loadCredential(this._path))
+    // 读盘是异步的，用户可能正好在这个窗口里重登或登出。此时**以内存为准**：
+    // 既不重新读盘（clear 的删除也是异步的，可能还没落盘，读回来的是已作废的
+    // 那份，会把已登出的凭证复活），也不去刷新（结果会盖掉刚拿到的新凭证）。
+    if (this._gen !== gen) return this._current
     this._current = cred
     if (!cred) return undefined
     if (!cred.refreshToken || !cred.dpopPrivateKey || !cred.clientId) return cred
     const exp = cred.expiration ? Date.parse(cred.expiration) : NaN
     const soon = Number.isNaN(exp) ? false : exp - Date.now() < 5 * 60 * 1000
     if (!soon) return cred
+    // 并发请求不能各刷一次：refresh_token 会轮换，后一次刷新会作废前一次刚拿到
+    // 的 AK/SK。实测症状就是一串 "Incorrect IAM authentication" + 凭证被写脏。
+    const inflight = this._inflight ??= this.refresh(cred, {
+      refreshToken: cred.refreshToken,
+      dpopPrivateKey: cred.dpopPrivateKey,
+      clientId: cred.clientId,
+    }).finally(() => {
+      this._inflight = undefined
+    })
+    return inflight
+  }
+
+  /** 真正去刷一次；失败则把凭证标成 stale 落库，让卡片提示重新登录。 */
+  private async refresh(cred: CodeArtsCredential, mat: RefreshMaterials): Promise<CodeArtsCredential> {
+    const gen = this._gen
+    /**
+     * 这次刷新的结果还能不能往回写。光看代际号不够：重登是异步落库的，可能在
+     * 本次刷新启动**之后**才把 _current 换掉，那时代际号已经来不及拦。所以还要
+     * 确认「当前凭证仍然是这次刷新的那一份」。
+     */
+    const stillCurrent = (): boolean => this._gen === gen && this._current === cred
     try {
       const refreshed = await refreshToken(
         defaultLoginConfig(),
@@ -204,12 +262,13 @@ export class CodeArtsCredentialStore {
           accessKeyId: cred.accessKeyId ?? '',
           secretAccessKey: cred.secretAccessKey ?? '',
           expiration: cred.expiration ?? '',
-          refreshToken: cred.refreshToken,
-          clientId: cred.clientId,
-          dpopPrivateKey: cred.dpopPrivateKey,
+          refreshToken: mat.refreshToken,
+          clientId: mat.clientId,
+          dpopPrivateKey: mat.dpopPrivateKey,
         },
       )
       const next = credentialFromOAuth(refreshed, cred.label)
+      if (!stillCurrent()) return next
       await saveCredential(this._path, next)
       this._current = next
       await this.claimIfPossible(next)
@@ -217,6 +276,7 @@ export class CodeArtsCredentialStore {
     } catch {
       // 刷新失败：标记 stale 并落库，让卡片提示用户重新登录，而不是静默用过期凭证。
       cred.stale = true
+      if (!stillCurrent()) return cred
       this._current = cred
       try {
         await saveCredential(this._path, cred)

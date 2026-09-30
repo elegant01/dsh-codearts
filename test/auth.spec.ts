@@ -10,6 +10,14 @@ vi.mock('../src/oauth.ts', async importOriginal => {
   return { ...actual, refreshToken: refreshTokenMock }
 })
 
+// auth.ts claims the free-tier benefit after every sign-in/refresh. That call
+// takes no abort signal and no timeout, so leaving it real makes these tests
+// hang on the network instead of asserting anything.
+vi.mock('../src/upstream.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/upstream.ts')>()
+  return { ...actual, claimBenefit: vi.fn(async () => {}) }
+})
+
 import {
   CodeArtsCredentialStore,
   clearCredential,
@@ -158,6 +166,78 @@ describe('CodeArtsCredentialStore', () => {
 
     expect((await store.ensureFresh())?.stale).toBe(true)
     expect((await loadCredential(authPath))?.stale).toBe(true)
+  })
+})
+
+// The refresh token is single-use: the upstream rotates it and rejects a second
+// use with STS5.1806 "the refresh token has been used". So two concurrent
+// refreshes are not merely wasteful — the loser's failure path writes `stale`
+// back over the winner's fresh credential, permanently bricking the sign-in.
+// That is exactly how the credential on this machine was lost once.
+describe('concurrent refresh', () => {
+  const almostExpired = (): unknown => oauthToken({ expiration: new Date(Date.now() + 60_000).toISOString() })
+  /**
+   * A refresh result with no AK/SK. Persisting it skips claimIfPossible, which
+   * would otherwise reach the real benefit endpoint. These tests are about the
+   * refresh race, not about the claim.
+   */
+  const refreshResult = (token: string): unknown => oauthToken({
+    securityToken: token,
+    accessKeyId: '',
+    secretAccessKey: '',
+  })
+
+  /**
+   * Resolve the refresh after a short delay, so work done immediately after
+   * ensureFresh() still lands while the refresh is in flight.
+   */
+  function slowRefresh(result: unknown): void {
+    refreshTokenMock.mockImplementation(() => new Promise(resolve => {
+      setTimeout(() => resolve(result), 30)
+    }))
+  }
+
+  it('refreshes once when several requests meet an expiring credential at the same time', async () => {
+    slowRefresh(refreshResult('sts-token-2'))
+    const store = new CodeArtsCredentialStore(authPath)
+    await saveCredential(authPath, credentialFromOAuth(almostExpired() as never))
+
+    const results = await Promise.all([
+      store.ensureFresh(),
+      store.ensureFresh(),
+      store.ensureFresh(),
+    ])
+
+    expect(refreshTokenMock).toHaveBeenCalledTimes(1)
+    expect(results.map(r => r?.token)).toEqual(['sts-token-2', 'sts-token-2', 'sts-token-2'])
+  })
+
+  // Signing in again mid-refresh must win: the stale refresh result describes a
+  // credential the user has already replaced.
+  it('does not let an in-flight refresh overwrite a newer sign-in', async () => {
+    slowRefresh(refreshResult('stale-refresh-result'))
+    const store = new CodeArtsCredentialStore(authPath)
+    await saveCredential(authPath, credentialFromOAuth(almostExpired() as never))
+
+    const pending = store.ensureFresh()
+    await store.setFromOAuth(refreshResult('brand-new') as never)
+    await pending
+
+    expect((await store.current())?.token).toBe('brand-new')
+    expect((await loadCredential(authPath))?.token).toBe('brand-new')
+  })
+
+  it('clears an in-flight refresh on sign-out so it cannot revive a credential', async () => {
+    slowRefresh(refreshResult('stale-refresh-result'))
+    const store = new CodeArtsCredentialStore(authPath)
+    await saveCredential(authPath, credentialFromOAuth(almostExpired() as never))
+
+    const pending = store.ensureFresh()
+    await store.clear()
+    await pending
+
+    expect(await loadCredential(authPath)).toBeUndefined()
+    expect(await store.hasCredential()).toBe(false)
   })
 })
 

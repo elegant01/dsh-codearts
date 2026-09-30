@@ -144,3 +144,67 @@ describe('prepareChatBody', () => {
     expect(JSON.parse(atLimit).max_tokens).toBe(MAX_TOKENS_CEILING)
   })
 })
+
+describe('conversation-scoped chat_id', () => {
+  const bodyWith = (messages: unknown[], extra: Record<string, unknown> = {}): Record<string, unknown> =>
+    JSON.parse(prepareChatBody(JSON.stringify({ model: 'GLM-5.2', messages, ...extra })).body)
+  const chatIdOf = (messages: unknown[], extra?: Record<string, unknown>): string =>
+    bodyWith(messages, extra).chat_id as string
+
+  it('is 32 lowercase hex, as the upstream requires', () => {
+    expect(chatIdOf([{ role: 'user', content: 'hi' }])).toMatch(/^[0-9a-f]{32}$/)
+  })
+
+  // The point of the whole scheme. A conversation's later turns carry more
+  // history, but the first user message is unchanged — so they must land on the
+  // same chat_id. Minting a fresh id per request opens a new upstream session
+  // every turn, and the concurrency cap is reached after a few turns.
+  it('stays the same as the conversation history grows', () => {
+    const first = [{ role: 'user', content: '写一个快排' }]
+    const later = [
+      ...first,
+      { role: 'assistant', content: '好的' },
+      { role: 'user', content: '改成降序' },
+      { role: 'assistant', content: '改好了' },
+      { role: 'user', content: '再加个测试' },
+    ]
+    expect(chatIdOf(later)).toBe(chatIdOf(first))
+  })
+
+  it('differs between conversations that open differently', () => {
+    expect(chatIdOf([{ role: 'user', content: '问题 A' }]))
+      .not.toBe(chatIdOf([{ role: 'user', content: '问题 B' }]))
+  })
+
+  it('anchors on the first user message, ignoring a leading system message', () => {
+    const withSystem = [
+      { role: 'system', content: '你是助手' },
+      { role: 'user', content: '同一个开场' },
+    ]
+    expect(chatIdOf(withSystem)).toBe(chatIdOf([{ role: 'user', content: '同一个开场' }]))
+  })
+
+  // Session-title generation and the real agent request can carry the same
+  // opening user message; without this they collide on one upstream session.
+  it('separates a tool-carrying request from the same one without tools', () => {
+    const messages = [{ role: 'user', content: '同一个开场' }]
+    const tools = [{ type: 'function', function: { name: 'read', parameters: { type: 'object' } } }]
+    expect(chatIdOf(messages, { tools })).not.toBe(chatIdOf(messages))
+  })
+
+  it('honours an explicit conversation_id from the client', () => {
+    const explicit = 'a'.repeat(32)
+    expect(chatIdOf([{ role: 'user', content: 'hi' }], { conversation_id: explicit })).toBe(explicit)
+  })
+
+  it('falls back to a fresh id when there is no user message', () => {
+    const only = [{ role: 'system', content: 'x' }]
+    expect(chatIdOf(only)).toMatch(/^[0-9a-f]{32}$/)
+    expect(chatIdOf(only)).not.toBe(chatIdOf(only))
+  })
+
+  it('keeps prompt_cache_key equal to chat_id', () => {
+    const parsed = bodyWith([{ role: 'user', content: 'hi' }])
+    expect(parsed.prompt_cache_key).toBe(parsed.chat_id)
+  })
+})

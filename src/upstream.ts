@@ -11,7 +11,7 @@
  * @module dsh-codearts/upstream
  */
 
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { signRequest, type SignCredential } from './signer.ts'
 import { isBenefitModel } from './catalog.ts'
 
@@ -81,6 +81,48 @@ interface OpenAIMessage {
 /** 上游对 max_tokens 的服务端硬上限（2026-09-30 直连二分实测）。 */
 export const MAX_TOKENS_CEILING = 65_536
 
+/** 上游要求 chat_id 为 32 位小写十六进制。 */
+const CHAT_ID_RE = /^[0-9a-f]{32}$/
+
+/** 稳定地把消息内容序列化成锚点文本（字符串原样，多模态数组走 JSON）。 */
+function canonicalContent(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (content === undefined || content === null) return ''
+  try {
+    return JSON.stringify(content)
+  } catch {
+    return String(content)
+  }
+}
+
+/**
+ * 为一次对话派生稳定的 chat_id。
+ *
+ * 上游按 chat_id 计会话，而并发会话数有上限且回收很慢。若每个请求都新开一个
+ * chat_id，多轮对话几轮之后就会撞上「并发会话数已达上限」——历史在增长，但
+ * **首条 user 消息始终不变**，所以拿它当会话锚点：同一次对话的每一轮共用同一个
+ * chat_id，只占一个会话。
+ *
+ * 客户端若显式给了 conversation_id（32 位 hex）则优先用它。
+ */
+function conversationChatId(parsed: Record<string, unknown>): string {
+  const explicit = typeof parsed.conversation_id === 'string' ? parsed.conversation_id.trim().toLowerCase() : ''
+  if (CHAT_ID_RE.test(explicit)) return explicit
+
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+  for (const raw of messages) {
+    const message = raw as OpenAIMessage
+    if (message?.role !== 'user') continue
+    let anchor = `${message.role}\u0000${canonicalContent(message.content)}`
+    // 同一句话可能先被用来生成会话标题（不带 tools），再发起真正的 Agent 请求。
+    // 两者必须算作不同会话，否则标题请求会和 Agent 抢同一个会话。
+    if (Array.isArray(parsed.tools) && parsed.tools.length > 0) anchor += '\u0000tools'
+    return createHash('sha256').update(anchor).digest('hex').slice(0, 32)
+  }
+  // 没有 user 消息（少见）：退回随机 id，行为与从前一致。
+  return hex32()
+}
+
 /**
  * 把 OpenAI 风格 chat body 适配给 CodeArts /api/v2/chat/completions。
  * 该端点虽是 OpenAI 兼容，但网关按自己的 schema 严格校验参数。所以这里
@@ -92,7 +134,8 @@ export const MAX_TOKENS_CEILING = 65_536
  *  3. 丢弃非白名单字段（stream_options / store / logprobs 等虽实测可容忍，
  *     但按 codearts2api 观察到的真实流量收窄，避免网关后续收紧）
  *  4. tools[].function 去掉 strict（OpenAI 专有）
- *  5. 注入 CodeArts 特有字段（chat_id 32hex、prompt_cache_key、tool_stream）
+ *  5. 注入 CodeArts 特有字段：chat_id（按对话派生，见 conversationChatId）、
+ *     prompt_cache_key、tool_stream
  */
 export function prepareChatBody(rawJson: string): { url: string; body: string; model: string } {
   let parsed: Record<string, unknown> = {}
@@ -103,7 +146,7 @@ export function prepareChatBody(rawJson: string): { url: string; body: string; m
     return { url: `${SNAP_HOST}${EP_CHAT}`, body: rawJson, model: '' }
   }
   const model = typeof parsed.model === 'string' ? canonicalModel(parsed.model) : ''
-  const chatId = hex32()
+  const chatId = conversationChatId(parsed)
 
   // 上游网关接受的顶层字段白名单（对齐 codearts2api 观察到的真实流量）。
   // stream_options 实测可被网关接受，且 include_usage: true 会让上游在流末尾
@@ -144,6 +187,17 @@ export function prepareChatBody(rawJson: string): { url: string; body: string; m
   body.prompt_cache_key = chatId
   body.tool_stream = true
   return { url: `${SNAP_HOST}${EP_CHAT}`, body: JSON.stringify(body), model }
+}
+
+/**
+ * 免费档的「并发会话数已达上限」。实测 HTTP 400 + 这个错误码，上限是 3 个会话，
+ * 而且被掐断/挂起的流要约 2 分钟才被网关回收。它不是请求错误，重发就有机会，
+ * 所以 shim 要在本地排队重等，而不是把它变成 pi-ai 的重试风暴。
+ */
+export const CONCURRENCY_CAP_CODE = 'TM.00001041'
+
+export function isConcurrencyCap(result: ChatResult): boolean {
+  return !result.ok && result.message.includes(CONCURRENCY_CAP_CODE)
 }
 
 function classify(status: number, message: string): UpstreamErrorKind {
