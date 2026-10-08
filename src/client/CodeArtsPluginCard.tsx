@@ -347,6 +347,22 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const accounts = status?.accounts ?? []
   const accountName = (account: { label?: string; userName?: string; id: string }): string =>
     account.label?.trim() || account.userName?.trim() || account.id
+  /**
+   * 每个账号的「获取时间 + 过期状态」。同一账号重复登录可能留下多条记录（上游不给
+   * 稳定身份时的妥协），把时间摆出来用户才能一眼认出哪条是旧的、放心删。
+   */
+  const accountMeta = (account: { storedAt?: number; expiration?: string }): string => {
+    const parts: string[] = []
+    const stored = formatStored(account.storedAt)
+    if (stored !== '') parts.push(t('accountStored', { time: stored }))
+    const exp = typeof account.expiration === 'string' ? Date.parse(account.expiration) : NaN
+    if (Number.isFinite(exp)) {
+      parts.push(exp <= Date.now()
+        ? t('accountExpired', { time: formatStored(exp) })
+        : t('accountExpires', { time: formatStored(exp) }))
+    }
+    return parts.join(' · ')
+  }
   const dotState: StateDotState = signedIn ? 'done' : expired ? 'warning' : 'idle'
   const statusText = signedIn ? t('statusSignedIn') : expired ? t('statusExpired') : t('statusSignedOut')
   const storedTime = formatStored(status?.storedAt)
@@ -382,11 +398,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
               <span className={styles.count}>{accounts.length}</span>
             </div>
             {accounts.length > 1 && <p className={styles.hint}>{t('accountsRotateHint')}</p>}
-            {accounts.map(account => (
-              <div key={account.id} className={styles.choiceRow}>
-                <span className={styles.name}>{accountName(account)}</span>
-                {account.stale && <Tag>{t('accountNeedsSignIn')}</Tag>}
-                {!account.signable && <Tag>{t('accountNoKey')}</Tag>}
+            {accounts.map(account => {
+              const meta = accountMeta(account)
+              return (
+                <div key={account.id} className={styles.choiceRow}>
+                  <span className={styles.name}>{accountName(account)}</span>
+                  {meta !== '' && <span className={styles.meta}>{meta}</span>}
+                  {account.stale && <Tag>{t('accountNeedsSignIn')}</Tag>}
+                  {!account.signable && <Tag>{t('accountNoKey')}</Tag>}
                 <Button
                   variant="outline"
                   size="sm"
@@ -396,8 +415,9 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 >
                   {t('accountRemove')}
                 </Button>
-              </div>
-            ))}
+                </div>
+              )
+            })}
             <div className={styles.actions}>
               <Button variant="primary" size="sm" disabled={busy || loginPending} onClick={() => void startOAuthLogin()}>
                 {loginPending ? t('signingIn') : t('addAccount')}

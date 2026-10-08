@@ -22,6 +22,9 @@ export interface CodeArtsSettingsKey {
   accountsRotateHint: string
   accountNeedsSignIn: string
   accountNoKey: string
+  accountStored: string
+  accountExpires: string
+  accountExpired: string
   modelsTitle: string
   optionalModelsHint: string
   optionalModelsAllHint: string
@@ -77,6 +80,9 @@ export const zh: CodeArtsSettingsKey = {
   accountsRotateHint: '已存多个账号：请求会自动轮转，某个账号忙时改用下一个，不用干等。',
   accountNeedsSignIn: '需重新登录',
   accountNoKey: '无 AK/SK',
+  accountStored: '获取于 {time}',
+  accountExpires: '{time} 过期',
+  accountExpired: '已于 {time} 过期',
   modelsTitle: '可选模型',
   optionalModelsHint: '仅勾选的模型会出现在模型选择器里。',
   optionalModelsAllHint: '所有模型默认都出现在选择器里；取消勾选不想用的即可。',
@@ -131,6 +137,9 @@ export const en: CodeArtsSettingsKey = {
   accountsRotateHint: 'Multiple accounts stored: requests rotate automatically, so a busy account hands over to the next one instead of making you wait.',
   accountNeedsSignIn: 'Needs sign-in',
   accountNoKey: 'No AK/SK',
+  accountStored: 'stored {time}',
+  accountExpires: 'expires {time}',
+  accountExpired: 'expired {time}',
   modelsTitle: 'Models',
   optionalModelsHint: 'Only checked models appear in the model picker.',
   optionalModelsAllHint: 'All models show in the picker by default; uncheck the ones you don’t want.',
