@@ -40,6 +40,35 @@ pnpm run hmr:off       # 关掉，回到 base 默认（只监听 profile 配置�
 
 改完这个 patch 通常不用重启：profile 的 patch 文件本身也在 HMR 的监听范围内（profile 里 `patchReload: live`），条目会重新加载。若发现没生效，重启一次 DSH 即可，之后就一直有效。
 
+> ⚠️ **开了模块监听就别用插件管理器/npm 升级本插件。** 宿主为热重载监视着
+> `node_modules/dsh-codearts`，目录被占用后 pnpm 替换版本时会失败：
+>
+> ```
+> [ERR_PNPM_EPERM] [importPackage ...\node_modules\dsh-codearts]
+> EPERM: operation not permitted, rename
+>   '...\dsh-codearts_tmp_20976_1' -> '...\dsh-codearts'
+> ```
+>
+> 更麻烦的是失败后**插件管理器会回滚**：把 `dsh-codearts` 从 profile 的
+> `dependencies` 和 `bundles` 里一起删掉，表现为「插件列表里它没了」。升级前的正确顺序是
+> `pnpm run hmr:off` → 升级 → （要接着开发再）`pnpm run hmr:on`。
+>
+> 这条只影响**跑过 `hmr:on` 的开发机**：该覆盖行写在 profile 的
+> `cordis.patch.yml` 里，插件包自带的 patch 只有 `insert: llm-codearts`，
+> 普通用户从 dshmarket 直接升级不会碰到。DSH base 的 desktop bundle 里默认是
+> **不监视模块**的（原文，`app.asar` 内 base 的 patch）：
+>
+> ```yaml
+>     # Profile configuration reloads by default; module roots are opt-in.
+>     - id: hmr
+>       name: '@deepseek-ai/dsh-hmr'
+>       disabled: !!js "!ctx.get('profileContext')"
+>       config:
+>         root: []
+> ```
+>
+> 即 `root` 默认空表 —— 没人去开它，就没有句柄占用 `node_modules/dsh-codearts`。
+
 ## 日常循环
 
 ```sh
