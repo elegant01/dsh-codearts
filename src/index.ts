@@ -32,6 +32,7 @@ import { CodeArtsAccountPool } from './account-pool.ts'
 import { CodeArtsCatalog, filterEnabledModels } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
 import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
+import { CodeArtsCreditCache, type CodeArtsCreditState } from './credits.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { createCodeArtsShim } from './shim.ts'
 import { registerCodeArtsStatusRoute } from './web-status.ts'
@@ -54,6 +55,18 @@ export {
   type CodeArtsCredential,
 } from './auth.ts'
 export { CodeArtsAccountPool, type AccountRuntime } from './account-pool.ts'
+export {
+  BENEFIT_GATEWAY_HOST,
+  CodeArtsCreditCache,
+  fetchCredits,
+  parseCreditStatistics,
+  parseTokenBalance,
+  type CodeArtsCreditCategory,
+  type CodeArtsCredits,
+  type CodeArtsCreditSnapshot,
+  type CodeArtsCreditState,
+  type CodeArtsTokenQuota,
+} from './credits.ts'
 export {
   CodeArtsUsageTracker,
   codeartsUsagePath,
@@ -120,8 +133,43 @@ export function apply(ctx: Context, rawConfig: Config): void {
   const store = new CodeArtsAccountStore(accountsPath)
   const pool = new CodeArtsAccountPool([])
   const catalog = new CodeArtsCatalog()
-  // 用量账本：CodeArts 没有额度 API，只能记本机经插件发出的请求（见 usage.ts）。
+  // 用量账本：记本机经插件发出的请求（账号总额度见 credits.ts，这里只记本机）。
   const usage = new CodeArtsUsageTracker({ path: codeartsUsagePath() })
+  // 积分：CodeArts **有**积分接口（2026-10 从官方 Agent 客户端挖出，见 credits.ts）。
+  const credits = new CodeArtsCreditCache()
+
+  /** /status 是卡片与对话底部都会轮询的接口，积分慢请求不能把它拖成转圈。 */
+  const CREDIT_TIMEOUT_MS = 8_000
+
+  /**
+   * 拉一次积分。
+   *
+   * 积分是**账号级**属性，不随请求轮转：这里挑第一个没用坏的账号，够覆盖正常用法
+   * （多账号下的积分差异不在本插件关心范围内）。
+   */
+  const loadCredits = async (signal?: AbortSignal): Promise<CodeArtsCreditState> => {
+    const ids = await store.ids()
+    if (ids.length === 0) return { phase: 'error', message: 'not signed in', at: Date.now() }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), CREDIT_TIMEOUT_MS)
+    timer.unref?.()
+    signal?.addEventListener('abort', () => controller.abort(), { once: true })
+    try {
+      let last: CodeArtsCreditState | undefined
+      for (const id of ids) {
+        const stored = await store.credential(id)
+        if (stored === undefined || stored.stale === true) continue
+        const resolved = await store.resolve(id)
+        if (resolved === undefined) continue
+        const state = await credits.get(resolved, controller.signal)
+        if (state.phase === 'ok') return state
+        last = state
+      }
+      return last ?? { phase: 'error', message: 'no usable credential', at: Date.now() }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 
   let current = (): Config => config
   const enabledModels = (): readonly string[] | undefined => current().enabledModels
@@ -142,6 +190,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     setEnabledModels,
     pool: () => pool.list(),
     usage: () => usage.snapshot(),
+    credits: signal => loadCredits(signal),
   }))
 
   // The settings section keeps the enabled-model allowlist live. On hosts with

@@ -1,14 +1,15 @@
 /**
  * 用量账本：把聊天流里的 usage 帧累计成「今天用了多少」。
  *
- * 为什么只能自己记：**CodeArts 没有额度/积分 API**（codearts2api 的 pool 里
- * `credits` 字段恒为 0，注释写着「CodeArts 无积分字段」；本插件也没有任何余额接口
- * 可用）。能拿到的真实数据只有两样：
+ * 为什么还要自己记：账号总额度有积分接口了（见 credits.ts，2026-10 从官方 Agent
+ * 客户端挖出并实测通过），但**本机经插件发出的请求**仍需自己累计 —— 上游不按
+ * 「这台机器」维度给统计。能拿到的真实数据有三样：
  *   1. 每个请求的 token `usage`（上游在流末尾回一帧 `{choices:[],usage:{...}}`）；
- *   2. 插件自己知道的账号会话槽位占用（见 account-pool：每账号 3 个并发会话）。
+ *   2. 插件自己知道的账号会话槽位占用（见 account-pool：每账号 3 个并发会话）；
+ *   3. 账号积分/额度（见 credits.ts）。
  *
- * 所以这里累计的是**本机经插件发出的请求**，不是账号总额度 —— 卡片上的文案必须
- * 照实说，官方额度明细在 `codearts.huaweicloud.com/portal/settings/personal-usage`。
+ * 所以这里累计的是**本机经插件发出的请求**，与卡片上的积分区块互补 —— 一个是本机
+ * 级、一个是账号级。官方额度明细在 `codearts.huaweicloud.com/portal/settings/personal-usage`。
  *
  * 落盘在 `$DSH_HOME/.codearts-usage.json`，按天存，保留最近 `RETENTION_DAYS` 天。
  *

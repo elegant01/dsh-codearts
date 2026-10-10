@@ -98,14 +98,21 @@ interface OpenAIMessage {
 /** 上游对 max_tokens 的服务端硬上限（2026-09-30 直连二分实测）。 */
 export const MAX_TOKENS_CEILING = 65_536
 
+/** token 估算的余量：混排误差 + 上游自己注入的会话头，宁可少给也别整轮失败。 */
+const PROMPT_ESTIMATE_MARGIN = 2_048
+/** 短于此的生成长度就没有实际意义了，此时直接报具体错误而不是硬挤。 */
+const MIN_USEFUL_OUTPUT_TOKENS = 1_024
+
 /**
  * 实测过的、**按模型**的 max_tokens 上限（小写 id → 上限）。
  *
  * 这个上限是模型相关的，不能用一个全局值：
  *  - 免费（限时福利）DeepSeek 系列：> 65536 会被流内 InferHub.001001005.400
  *    "The request param is invalid" 拒掉，而福利网关标称的是 393216 / 384000；
- *  - GLM-5.2：实测 131072 可用（2026-09-30 逐值直连验证：8000/65536/131072 均正常，
- *    再往上会先撞上并发上限而测不出来）。
+ *  - GLM-5.2：2026-09-30 逐值直连验证过 8000/65536/131072 均正常，但
+ *    **2026-10-10 复测 131072 已经被拒**（同一个 InferHub.001001005.400），
+ *    65536 仍然正常。也就是说这条上限由服务端控制、会漂，目录里留着的旧实测值
+ *    不会报错，只会让该模型的每一轮在流的第一帧就失败 —— 所以复测要按日期记。
  *
  * 没测过的模型一律退回 `MAX_TOKENS_CEILING`（保守但可用），而不是照抄标称值 ——
  * DSH 会把 catalog 的 maxTokens 原样当 max_tokens 发出去，照抄标称值等于让请求失败。
@@ -117,12 +124,79 @@ const MEASURED_MAX_TOKENS: Readonly<Record<string, number>> = {
   'deepseek-v4-pro-0813': 65_536,
   'deepseek-v4.1-flash': 65_536,
   'glm-5.3-flash': 65_536,
-  'glm-5.2': 131_072,
+  'glm-5.2': 65_536,
 }
 
-/** 该模型可用的 max_tokens 上限（没实测过的退回全局保守值）。 */
+/** 该模型可用的 max_tokens 上限（实测值与会话内学到的更低值取小）。 */
 export function maxTokensCeilingFor(id: string): number {
-  return MEASURED_MAX_TOKENS[id.trim().toLowerCase()] ?? MAX_TOKENS_CEILING
+  const measured = measuredCeilingFor(id)
+  const learned = learnedMaxTokens.get(ceilingKey(id))
+  return learned === undefined ? measured : Math.min(measured, learned)
+}
+
+/**
+ * 上游的「参数非法」错误码。它是**流内**帧（HTTP 仍是 200），所以既不走
+ * classify()，也不会告诉我们是哪个参数错、更不区分「max_tokens 太大」和
+ * 「prompt 装不下」—— 一切得我们自己判。
+ */
+export const PARAM_INVALID_CODE = 'InferHub.001001005.400'
+
+/** 一帧（chatStream 已把上游 error_code 转成 OpenAI error 帧）是不是那条「参数非法」。 */
+export function isParamInvalidFrame(text: string): boolean {
+  return text.includes(PARAM_INVALID_CODE) || text.includes('The request param is invalid')
+}
+
+/**
+ * 本次进程内学到的上限（小写 id → 上限）。
+ *
+ * 上游会把「实测过」的值悄悄调低（GLM-5.2 的 131072 于 2026-10-10 被收），
+ * 手工表必然滞后。所以撞到「参数非法」时就地折半降档重试，并把结果记在这里，
+ * 免得该模型后面每一轮都先白撞一次。
+ */
+const learnedMaxTokens = new Map<string, number>()
+/** 降档下限：再低就没有可用的生成长度了，此时宁可把具体错误报给用户。 */
+const MAX_TOKENS_FLOOR = 8_192
+
+function ceilingKey(id: string): string {
+  return id.trim().toLowerCase()
+}
+
+function measuredCeilingFor(id: string): number {
+  return MEASURED_MAX_TOKENS[ceilingKey(id)] ?? MAX_TOKENS_CEILING
+}
+
+/**
+ * 把该模型的上限折半降一档（收到「参数非法」后重发之前调用）。
+ * @returns 新的上限；已经降到底则返回 0，表示别再试了。
+ */
+export function degradeTokenCeiling(id: string): number {
+  const next = Math.floor(maxTokensCeilingFor(id) / 2)
+  if (next < MAX_TOKENS_FLOOR) return 0
+  learnedMaxTokens.set(ceilingKey(id), next)
+  return next
+}
+
+/** 清空降档记忆。进程内状态，测试之间必须能重置。 */
+export function resetTokenCeilings(): void {
+  learnedMaxTokens.clear()
+}
+
+/**
+ * 粗估一段文本占多少 token：CJK 每字约 1，其余每 4 字符约 1。
+ *
+ * 只要保守就够用 —— 它的用途是「在我们这边就把装不下的情况判掉」，
+ * 而不是精确计费（上游不会告诉我们超没超，只会回一句参数非法）。
+ */
+export function estimateTokens(text: string): number {
+  let cjk = 0
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i)
+    // 假名到汉字（含扩展 A）/ 谚文与 CJK 兼容符号 / 全宽标点
+    if ((code >= 0x3040 && code <= 0x9fff) || (code >= 0xac00 && code <= 0xfbff) || (code >= 0xff00 && code <= 0xff60)) {
+      cjk += 1
+    }
+  }
+  return Math.ceil(cjk + (text.length - cjk) / 4)
 }
 
 /** 上游要求 chat_id 为 32 位小写十六进制。 */
@@ -175,21 +249,38 @@ function sessionIdFor(chatId: string): string {
   return createHash('sha256').update(`codearts-session:${chatId}`).digest('hex').slice(0, 32)
 }
 
+export interface PreparedChatBody {
+  url: string
+  body: string
+  model: string
+  chatId: string
+  /**
+   * 不用发出去就能判定的失败（目前是「上下文放不下」）。非空时调用方必须直接把它
+   * 回给 DSH —— 上游遇到同类问题只会给一句 "The request param is invalid"，
+   * 那句话里没有模型、没有 token 数，用户无从下手。
+   */
+  error?: string
+}
+
 /**
  * 把 OpenAI 风格 chat body 适配给 CodeArts /api/v2/chat/completions。
  * 该端点虽是 OpenAI 兼容，但网关按自己的 schema 严格校验参数。所以这里
  * 不做原样透传，而是：
  *  1. model 走 canonicalModel（大小写敏感）
- *  2. max_completion_tokens → max_tokens（华为只认后者），并钳制到
- *     MAX_TOKENS_CEILING（超限会流内报 InferHub.001001005.400
- *     "The request param is invalid, Please check it"）
+ *  2. max_completion_tokens → max_tokens（华为只认后者），并钳到该模型的上限；
+ *     再按 contextWindow 扣掉 prompt 估算，保证 prompt + max_tokens 装得下
+ *     （两者任一超限，上游都只会流内回 InferHub.001001005.400
+ *     "The request param is invalid, Please check it"，不告诉我们是哪一个）
  *  3. 丢弃非白名单字段（stream_options / store / logprobs 等虽实测可容忍，
  *     但按 codearts2api 观察到的真实流量收窄，避免网关后续收紧）
  *  4. tools[].function 去掉 strict（OpenAI 专有）
  *  5. 注入 CodeArts 特有字段：chat_id（按对话派生，见 conversationChatId）、
  *     prompt_cache_key、tool_stream
+ *
+ * @param contextWindow 该模型的上下文窗口（来自 catalog）。传 0 表示不知道，
+ *   此时只做上限钳制、不做「装不下」判断。
  */
-export function prepareChatBody(rawJson: string): { url: string; body: string; model: string; chatId: string } {
+export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedChatBody {
   let parsed: Record<string, unknown> = {}
   try {
     parsed = JSON.parse(rawJson) as Record<string, unknown>
@@ -217,11 +308,30 @@ export function prepareChatBody(rawJson: string): { url: string; body: string; m
   if (body.max_tokens === undefined && typeof parsed.max_completion_tokens === 'number') {
     body.max_tokens = parsed.max_completion_tokens
   }
-  // max_tokens 超过该模型的上限会被流内拒绝（InferHub.001001005.400），
-  // 钳到实测上限，保证生成不被截断的前提下请求能过。
+  // 上游遇到任何一种参数超限都只回同一句话，所以「max_tokens 太大」和
+  // 「prompt 装不下」必须在我们这边分开判：
+  //  1. 超过该模型上限 → 钳住（上限由服务端控制、会漂，真撞了还有 degradeTokenCeiling 兜底）
+  //  2. prompt + max_tokens 超过 contextWindow → 把 max_tokens 压到装得下；
+  //     连最短回答都放不下时，回一条**具体**错误，而不是让上游给一句黑话。
   const ceiling = maxTokensCeilingFor(model)
-  if (typeof body.max_tokens === 'number' && body.max_tokens > ceiling) {
-    body.max_tokens = ceiling
+  if (typeof body.max_tokens === 'number') {
+    let maxTokens = Math.min(body.max_tokens, ceiling)
+    if (contextWindow > 0) {
+      const promptTokens = estimateTokens(`${JSON.stringify(body.messages ?? '')}${JSON.stringify(body.tools ?? '')}`)
+      const room = contextWindow - promptTokens - PROMPT_ESTIMATE_MARGIN
+      if (room < MIN_USEFUL_OUTPUT_TOKENS) {
+        body.max_tokens = maxTokens
+        return {
+          url: `${SNAP_HOST}${EP_CHAT}`,
+          body: JSON.stringify(body),
+          model,
+          chatId,
+          error: `上下文放不下：${model} 的窗口是 ${contextWindow} tokens，本次请求（含 ${Array.isArray(body.messages) ? body.messages.length : 0} 条消息与工具定义）估算约 ${promptTokens} tokens，剩余不足 ${MIN_USEFUL_OUTPUT_TOKENS} tokens 的生成余量。请新建会话或改用上下文更大的模型。`,
+        }
+      }
+      maxTokens = Math.min(maxTokens, room)
+    }
+    body.max_tokens = maxTokens
   }
   // strict 是 OpenAI 专有，华为 schema 不认识。
   if (Array.isArray(body.tools)) {
@@ -515,7 +625,7 @@ const UNKNOWN_CONTEXT_WINDOW = 32_768
 const UNKNOWN_MAX_TOKENS = 8_000
 
 /** 带 AK/SK 签名的 GET；body 为空（签名按空载荷算）。 */
-async function signedGet(
+export async function signedGet(
   url: string,
   credential: CodeArtsResolved,
   agentType: 'AgentCenter' | 'PromptCenter' | undefined,

@@ -1,6 +1,20 @@
-import { describe, expect, it } from 'vitest'
-import { BENEFIT_MODELS, filterEnabledModels, isBenefitModel, FALLBACK_CODEARTS_MODELS } from '../src/catalog.ts'
-import { canonicalModel, prepareChatBody, SNAP_HOST, MAX_TOKENS_CEILING } from '../src/upstream.ts'
+import { afterEach, describe, expect, it } from 'vitest'
+import {
+  BENEFIT_MODELS,
+  filterEnabledModels,
+  isBenefitModel,
+  FALLBACK_CODEARTS_MODELS,
+} from '../src/catalog.ts'
+import {
+  canonicalModel,
+  degradeTokenCeiling,
+  estimateTokens,
+  maxTokensCeilingFor,
+  prepareChatBody,
+  resetTokenCeilings,
+  SNAP_HOST,
+  MAX_TOKENS_CEILING,
+} from '../src/upstream.ts'
 
 describe('canonicalModel', () => {
   it('maps the friendly alias to the upstream-registered spelling', () => {
@@ -143,6 +157,18 @@ describe('prepareChatBody', () => {
     }))
     expect(JSON.parse(atLimit).max_tokens).toBe(MAX_TOKENS_CEILING)
   })
+
+  // 上游的 max_tokens 上限由服务端控制、会漂：GLM-5.2 在 2026-09-30 实测 131072 可用，
+  // 2026-10-10 复测同一个值已被流内 InferHub.001001005.400 拒掉。目录里留着过期的
+  // 实测值不会有任何报错，只会让该模型每一轮都失败，所以这条钉死在当前可用值上。
+  it('clamps GLM-5.2 below the ceiling the gateway retired', () => {
+    const { body } = prepareChatBody(JSON.stringify({
+      model: 'GLM-5.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 131_072,
+    }))
+    expect(JSON.parse(body).max_tokens).toBe(65_536)
+  })
 })
 
 describe('conversation-scoped chat_id', () => {
@@ -206,5 +232,37 @@ describe('conversation-scoped chat_id', () => {
   it('keeps prompt_cache_key equal to chat_id', () => {
     const parsed = bodyWith([{ role: 'user', content: 'hi' }])
     expect(parsed.prompt_cache_key).toBe(parsed.chat_id)
+  })
+})
+
+describe('estimateTokens', () => {
+  it('counts CJK as one token per char and the rest at four chars', () => {
+    expect(estimateTokens('')).toBe(0)
+    expect(estimateTokens('abcd')).toBe(1)
+    expect(estimateTokens('你好世界')).toBe(4)
+    // 同样 10 个字符：中文按每字 1、ASCII 按每 4 字符 1 —— 窗口预算必须按重的算。
+    expect(estimateTokens('a'.repeat(10))).toBe(3)
+    expect(estimateTokens('你好'.repeat(5))).toBe(10)
+  })
+})
+
+describe('degradeTokenCeiling', () => {
+  afterEach(() => {
+    resetTokenCeilings()
+  })
+
+  it('halves the ceiling and remembers it for the rest of the process', () => {
+    expect(maxTokensCeilingFor('GLM-5.2')).toBe(65_536)
+    expect(degradeTokenCeiling('GLM-5.2')).toBe(32_768)
+    expect(maxTokensCeilingFor('glm-5.2')).toBe(32_768)
+    resetTokenCeilings()
+    expect(maxTokensCeilingFor('GLM-5.2')).toBe(65_536)
+  })
+
+  // 降档是为了绕开「上游把上限调低」，不是为了让生成长度趋近 0。
+  it('stops at the floor instead of squeezing generation to nothing', () => {
+    expect([degradeTokenCeiling('GLM-5.2'), degradeTokenCeiling('GLM-5.2'), degradeTokenCeiling('GLM-5.2')])
+      .toEqual([32_768, 16_384, 8_192])
+    expect(degradeTokenCeiling('GLM-5.2')).toBe(0)
   })
 })

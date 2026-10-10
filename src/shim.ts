@@ -21,11 +21,16 @@ import type { CodeArtsAccountStore } from './auth.ts'
 import { CodeArtsAccountPool, ERROR_THRESHOLD } from './account-pool.ts'
 import type { CodeArtsCatalog } from './catalog.ts'
 import {
-  prepareChatBody,
+  canonicalModel,
   chatStream,
+  degradeTokenCeiling,
   isConcurrencyCap,
+  isParamInvalidFrame,
+  maxTokensCeilingFor,
+  prepareChatBody,
   type ChatResult,
   type CodeArtsResolved,
+  type PreparedChatBody,
   type UpstreamErrorKind,
 } from './upstream.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
@@ -99,6 +104,8 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 /** 一次请求最多试几个账号（与 Go 参考的 MaxRotate 一致）。 */
 const MAX_ROTATE = 3
+/** 一次请求最多把 max_tokens 降几档（65536 → 32768 → 16384 → 8192）。 */
+const MAX_CEILING_HEALS = 3
 /**
  * 所有账号都撞上并发上限时，回落到「在同一账号上原地重发」的预算。
  *
@@ -223,6 +230,63 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     }
   }
 
+  /** 该模型的上下文窗口（catalog 里查，大小写不敏感）；查不到返回 0 = 不做超长预判。 */
+  function contextWindowFor(id: string): number {
+    const lower = id.trim().toLowerCase()
+    for (const model of catalog.current()) {
+      if (model.id.toLowerCase() === lower) return model.contextWindow
+    }
+    return 0
+  }
+
+  /**
+   * 打开上游流；撞到「参数非法」就把该模型的 max_tokens 上限折半降一档再开一次。
+   *
+   * 上游的 max_tokens 上限由服务端控制、会漂（GLM-5.2 标称 131072，2026-10-10 起
+   * 直接被拒），手工实测表必然滞后。而这类错误是**流内**帧（HTTP 仍 200），只能在
+   * 第一帧判 —— 此时还没有任何内容产出，重发是安全的。降档结果记在 upstream 的
+   * 进程内表里，该模型后续请求直接从新上限起步，不必每轮再白撞一次。
+   */
+  async function openWithCeilingHeal(
+    credential: CodeArtsResolved,
+    raw: string,
+    contextWindow: number,
+    signal: AbortSignal,
+  ): Promise<{ prepared: PreparedChatBody; result: ChatResult; head?: Uint8Array }> {
+    for (let heal = 0; ; heal += 1) {
+      const prepared = prepareChatBody(raw, contextWindow)
+      if (prepared.error !== undefined) {
+        return { prepared, result: { ok: false, kind: 'client', status: 400, message: prepared.error } }
+      }
+      const result = await chatStream(credential, prepared, signal)
+      if (!result.ok) return { prepared, result }
+      const reader = result.stream.getReader()
+      const first = await reader.read()
+      const head = first.done ? undefined : first.value
+      const shouldHeal = heal < MAX_CEILING_HEALS && head !== undefined && isParamInvalidFrame(new TextDecoder().decode(head))
+      reader.releaseLock()
+      if (!shouldHeal) return { prepared, result, head }
+      await result.stream.cancel().catch(() => {})
+      if (degradeTokenCeiling(prepared.model) === 0) {
+        return { prepared, result: { ok: false, kind: 'client', status: 400, message: `${prepared.model}: max_tokens 已降到下限仍被判参数非法` } }
+      }
+      logger?.warn(`dsh-codearts: ${prepared.model} 被判参数非法，max_tokens 降档到 ${maxTokensCeilingFor(prepared.model)} 后重发`)
+    }
+  }
+
+  /** 先交回降档判定读过的那一帧（它是流的开头，丢了就少一段），再接着读剩下的。 */
+  async function* drainFrames(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    head?: Uint8Array,
+  ): AsyncGenerator<Uint8Array> {
+    if (head !== undefined) yield head
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return
+      if (value !== undefined) yield value
+    }
+  }
+
   async function chatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!isJsonContentType(req)) {
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
@@ -230,7 +294,21 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     }
 
     const raw = (await readBody(req)).toString('utf8')
-    const prepared = prepareChatBody(raw)
+    // 上游对「max_tokens 太大」和「prompt 装不下」只会回同一句 "The request param is
+    // invalid"。所以出口处先按该模型的 contextWindow 自己判：能压小 max_tokens 就压小，
+    // 压不动了就把带数字的具体错误直接回给 DSH，别让一轮请求去换一句黑话。
+    let contextWindow = 0
+    try {
+      const inbound = JSON.parse(raw) as { model?: unknown }
+      if (typeof inbound.model === 'string') contextWindow = contextWindowFor(canonicalModel(inbound.model))
+    } catch {
+      // 解析不了就交给 prepareChatBody 自己的兜底路径
+    }
+    const checked = prepareChatBody(raw, contextWindow)
+    if (checked.error !== undefined) {
+      writeOpenAIError(res, 400, 'context_overflow', checked.error)
+      return
+    }
     const controller = new AbortController()
     // ⚠ 必须挂 res，不能挂 req：请求体读完的那一刻 req 就已经 close 过了（实测），
     // 在它之后才挂的 handler 永远不触发 —— 所以「停止生成」以前从来没中止过上游，
@@ -272,7 +350,8 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           pool.disable(id, 'no credential')
           continue
         }
-        const result = await chatStream(credential, prepared, controller.signal)
+        const opened = await openWithCeilingHeal(credential, raw, contextWindow, controller.signal)
+        const { prepared, result } = opened
         // 用户点「停止生成」时这次上游调用会以 AbortError 失败。那**不是账号故障**，
         // 必须在这里就返回：放它落到下面的分类里，每打断一次就会把这个账号冷却 30 秒，
         // 几次之后 pick() 选不出账号，表现就是「打断之后再也问不动了」。
@@ -282,7 +361,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         }
         if (result.ok) {
           pool.noteSuccess(id)
-          await pipeToResponse(res, result.stream, controller.signal, { accountId: id, model: prepared.model })
+          await pipeToResponse(res, result.stream, controller.signal, { accountId: id, model: prepared.model }, opened.head)
           return
         }
         lastKind = result.kind
@@ -319,6 +398,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     // 多账号时走不到这里；单账号时这是唯一的兜底。
     if (cappedAccount !== undefined) {
       if (pool.acquire(cappedAccount)) {
+        // 上限降档在主循环里已经跑过（learned 表是进程内共享的），这里不再重跑，
+        // 只沿用排队等槽位的兜底。
+        const prepared = prepareChatBody(raw, contextWindow)
         try {
           const credential = await store.resolve(cappedAccount)
           if (credential !== undefined) {
@@ -355,12 +437,30 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     )
   }
 
+  /**
+   * 记下一帧里的上游流内错误。判据宽松（帧文本含 "error" 才解析），解析不出来就忽略 ——
+   * 诊断不能影响转发。
+   */
+  function logInStreamError(frame: string, model: string): void {
+    try {
+      const payload = frame.startsWith('data:') ? frame.slice(5).trim() : frame
+      const ev = JSON.parse(payload) as { error?: { code?: unknown; message?: unknown } }
+      if (ev.error === undefined) return
+      const code = String(ev.error.code ?? '')
+      const message = String(ev.error.message ?? '').slice(0, 200)
+      logger?.error(`dsh-codearts: 上游流内报错 model=${model} code=${code} msg=${message}`)
+    } catch {
+      // 帧被切断或不是 JSON：忽略
+    }
+  }
+
   /** 把上游 SSE 按事件边界转发给 DSH，直到流结束或被中止。 */
   async function pipeToResponse(
     res: ServerResponse,
     stream: ReadableStream<Uint8Array>,
     signal: AbortSignal,
     attribution?: { accountId: string; model: string },
+    head?: Uint8Array,
   ): Promise<void> {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -383,12 +483,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       res.end(sawDone ? undefined : 'data: [DONE]\n\n')
     }
     try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) {
-          finish()
-          return
-        }
+      for await (const value of drainFrames(reader, head)) {
         buf += decoder.decode(value, { stream: true })
         // 按 SSE 事件边界（空行）切分
         let idx: number
@@ -397,6 +492,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           buf = buf.slice(idx + 2)
           if (!frame) continue
           if (frame.trim() === 'data: [DONE]') sawDone = true
+          // 参数类错误上游是放在**流内** error_code 帧里回的（HTTP 仍 200），它绕过了
+          // chatStream 的错误分类，在插件侧本来完全不可见 —— 用户只看到 PI_AI_ERROR。
+          if (frame.includes('"error"')) logInStreamError(frame, attribution?.model ?? '')
           // usage 帧形如 {"choices":[],"usage":{...}}，只在记账时解析，别影响转发。
           if (usage !== undefined && attribution !== undefined && frame.includes('"usage"')) {
             recordFrameUsage(frame, attribution)
@@ -404,6 +502,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           if (res.writable) res.write(frame + '\n\n')
         }
       }
+      finish()
     } catch (error: unknown) {
       // 用户点「停止生成」也会走到这里，那不是故障，别刷日志。
       if (!signal.aborted) {

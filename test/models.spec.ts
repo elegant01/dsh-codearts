@@ -88,7 +88,8 @@ describe('isBenefitModel', () => {
 describe('maxTokensCeilingFor', () => {
   it('keeps the measured per-model ceiling instead of the advertised one', () => {
     expect(maxTokensCeilingFor('deepseek-v4-flash-0731')).toBe(65_536)
-    expect(maxTokensCeilingFor('GLM-5.2')).toBe(131_072)
+    // 2026-09-30 实测 131072 可用，2026-10-10 复测已被网关拒（InferHub.001001005.400）。
+    expect(maxTokensCeilingFor('GLM-5.2')).toBe(65_536)
   })
 
   it('falls back to the conservative global ceiling for unmeasured models', () => {
@@ -186,8 +187,8 @@ describe('fetchModels', () => {
     const byId = new Map(result.models.map(m => [m.id, m]))
     // 福利网关标称 393216，实测上限 65536：必须钳住，否则每个请求都 400。
     expect(byId.get('deepseek-v4-flash-0731')?.maxTokens).toBe(65_536)
-    // GLM-5.2 实测可用 131072，不该被全局 65536 砍掉。
-    expect(byId.get('GLM-5.2')?.maxTokens).toBe(131_072)
+    // GLM-5.2 的实测上限同样要钳住：上游 2026-10-10 起拒 131072。
+    expect(byId.get('GLM-5.2')?.maxTokens).toBe(65_536)
     expect(byId.get('GLM-5.2')?.contextWindow).toBe(202_752)
     // 显示名不等于注册名时，注册名当 id（否则会多出一个选不得的假模型）。
     expect(byId.has('glm-5.2-sft-harmony')).toBe(true)

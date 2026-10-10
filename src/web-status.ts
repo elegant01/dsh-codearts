@@ -15,7 +15,11 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { CodeArtsAccountStore, CodeArtsAccountSummary } from './auth.ts'
 import type { AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
+import type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import type { UsageSnapshot, UsageTotals } from './usage.ts'
+// 卡片只认 web-status 这一份状态契约，所以契约里用到的积分类型要跟着转出去 ——
+// 否则 client 侧只能越过本模块去直引 credits.ts。
+export type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { filterEnabledModels, isBenefitModel } from './catalog.ts'
 import { fetchCallerIdentity, type CallerIdentity } from './upstream.ts'
@@ -80,8 +84,15 @@ export interface CodeArtsWebStatus {
   models: readonly CodeArtsWebModelBadge[]
   /** 已存账号。多个账号时会自动轮转，某个号忙就换下一个。 */
   accounts: readonly CodeArtsAccountSummary[]
-  /** 本机经插件发出的请求统计（CodeArts 没有额度 API，只能自己记）。 */
+  /** 本机经插件发出的请求统计（账号总额度见 credits 字段，这里只记本机）。 */
   usage: CodeArtsWebUsage
+  /**
+   * 账号积分/额度（CodeArts 自己的积分接口，2026-10 实测可用）。
+   * 省略表示插件没接这条链路或还没拉到。
+   */
+  credits?: CodeArtsCreditSnapshot
+  /** 积分拿不到时的原因 —— 有值就说明 credits 缺席，且要让用户看见为什么。 */
+  creditsError?: string
 }
 
 /**
@@ -129,6 +140,11 @@ export interface CodeArtsStatusRouteOptions {
   pool?: () => readonly AccountRuntime[]
   /** 用量账本快照。省略则卡片不显示用量区块。 */
   usage?: () => UsageSnapshot
+  /**
+   * 拉一次账号积分（内部应带缓存，别每次刷新都打上游）。
+   * 省略则卡片不显示积分区块。
+   */
+  credits?: (signal?: AbortSignal) => Promise<CodeArtsCreditState>
   /**
    * Persist a new allowlist. Resolves false when no settings provider is
    * attached, which the card renders as a read-only selection.
@@ -244,6 +260,22 @@ function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
   }
 }
 
+/**
+ * 积分区块。
+ *
+ * 积分是「锦上添花」：拉不到也绝不能把状态接口本身拖垮，所以失败一律降级成
+ * `creditsError` 交给卡片显示原因（超时由注入方在自己的闭包里保证）。
+ */
+async function creditsOf(deps: CodeArtsStatusRouteOptions): Promise<Partial<CodeArtsWebStatus>> {
+  if (deps.credits === undefined) return {}
+  try {
+    const state = await deps.credits()
+    return state.phase === 'ok' ? { credits: state.value } : { creditsError: state.message }
+  } catch (error: unknown) {
+    return { creditsError: safeMessage(error) }
+  }
+}
+
 async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWebStatus> {
   const models = deps.models().map(m => ({ id: m.id, name: m.name }))
   const accounts = await deps.store.list()
@@ -255,14 +287,16 @@ async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWe
   }
   // 只要还有**任意一个**账号能用就算登录中 —— 别的号过期了不影响轮转。
   const usable = accounts.some(accountUsable)
-  return {
-    status: usable ? 'signed-in' : 'expired',
+  const identity = {
     ...cred.label === undefined ? {} : { label: cred.label },
     ...cred.storedAt === undefined ? {} : { storedAt: cred.storedAt },
     models,
     accounts,
     usage,
   }
+  // 没有可用账号时不问积分：凭证都过期了，问了也是白跑一趟（还得等超时）。
+  if (!usable) return { status: 'expired', ...identity }
+  return { status: 'signed-in', ...identity, ...await creditsOf(deps) }
 }
 
 /** GET /api/codearts/status */

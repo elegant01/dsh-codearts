@@ -1,6 +1,7 @@
 import { request as httpRequest } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createCodeArtsShim, type CodeArtsShim } from '../src/shim.ts'
+import { resetTokenCeilings } from '../src/upstream.ts'
 
 /**
  * End-to-end over the real HTTP surface: a stubbed upstream emits CodeArts SSE,
@@ -96,14 +97,25 @@ let shim: CodeArtsShim
 let port: number
 let bearer: string
 
-async function startShim(chunks: readonly string[]): Promise<void> {
-  vi.stubGlobal('fetch', vi.fn(async () => sseResponse(chunks)))
+/** 上游回应可以是固定一串帧，也可以按请求体决定回什么（降档重发要用后者）。 */
+type Responder = readonly string[] | ((body: string) => readonly string[])
+
+async function startShim(
+  chunks: Responder,
+  catalogModels: readonly { id: string; contextWindow: number; maxTokens: number }[] = [],
+): Promise<void> {
+  vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
+    // chatStream 是 fetch(new Request(url, {body}), {signal}) —— 请求体挂在 Request 上，
+    // 不在第二个参数里，所以这里必须从 input 取。
+    const body = input instanceof Request ? await input.text() : ''
+    return sseResponse(typeof chunks === 'function' ? chunks(body) : chunks)
+  }))
   shim = createCodeArtsShim({
     store: {
       ids: async () => ['acct'],
       resolve: async () => ({ token: 'sts', accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }),
     } as never,
-    catalog: { current: () => [] } as never,
+    catalog: { current: () => catalogModels } as never,
   })
   await shim.ready
   port = Number(new URL(shim.baseUrl()).port)
@@ -114,6 +126,8 @@ const ASK = { model: 'GLM-5.2', messages: [{ role: 'user', content: 'hi' }], str
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  // 降档记忆是进程内的，不重置的话上一个用例学到的低上限会串到下一个用例里。
+  resetTokenCeilings()
 })
 
 afterEach(async () => {
@@ -249,6 +263,7 @@ describe('end-to-end: legacy cumulative-snapshot protocol', () => {
     expect(deltaText(res.text)).toBe('abc')
   })
 
+  // 同一条「参数非法」会被降档重试 3 次；上游一直这么回，最后才原样交给 DSH。
   it('surfaces an upstream error_code frame and terminates', async () => {
     await startShim([
       'data: {"error_code":"InferHub.001001005.400","error_msg":"max_tokens too large"}\n\n',
@@ -256,5 +271,57 @@ describe('end-to-end: legacy cumulative-snapshot protocol', () => {
     const res = await postSse(port, bearer, ASK)
     expect(res.text).toContain('InferHub.001001005.400')
     expect(doneCount(res.text)).toBe(1)
+  })
+})
+
+describe('max_tokens 上限降档自愈', () => {
+  const PARAM_INVALID = 'data: {"error_code":"InferHub.001001005.400","error_msg":"The request param is invalid, Please check it"}\n\n'
+  const ASK_WITH_MAX = { model: 'GLM-5.2', messages: [{ role: 'user', content: 'hi' }], stream: true, max_tokens: 65_536 }
+
+  // 上游会悄悄调低已经实测过的上限，而它回的是一句不带参数的话。
+  // 模拟「第一档被拒、第二档放行」：客户端最终必须看到正常内容，而不是那次失败。
+  it('降一档重发，客户端只看到正常流', async () => {
+    const sent: number[] = []
+    await startShim(body => {
+      sent.push((JSON.parse(body) as { max_tokens?: number }).max_tokens ?? 0)
+      return sent.length === 1 ? [PARAM_INVALID] : OPENAI_CHUNKS
+    })
+    const res = await postSse(port, bearer, ASK_WITH_MAX)
+    expect(sent).toEqual([65_536, 32_768])
+    expect(deltaText(res.text)).toBe('你好，世界')
+    expect(res.text).not.toContain('InferHub.001001005.400')
+  })
+
+  it('装得下但余量不足时，把 max_tokens 压进窗口再发', async () => {
+    let sentMax = 0
+    await startShim(
+      body => {
+        sentMax = (JSON.parse(body) as { max_tokens?: number }).max_tokens ?? 0
+        return OPENAI_CHUNKS
+      },
+      [{ id: 'GLM-5.2', contextWindow: 20_000, maxTokens: 65_536 }],
+    )
+    await postSse(port, bearer, { ...ASK_WITH_MAX, messages: [{ role: 'user', content: 'x'.repeat(40_000) }] })
+    // prompt ≈ 10000 tokens，窗口 20000，再扣 2048 估算余量 → 只剩不到 8000
+    expect(sentMax).toBeGreaterThan(1_024)
+    expect(sentMax).toBeLessThan(8_000)
+  })
+
+  // 这一条是需求本身：放不下时要说清楚是哪个模型、窗口多大、估算多少，
+  // 而不是让用户去猜上游那句 "The request param is invalid"。
+  it('根本放不下时直接回具体错误，一次上游都不发', async () => {
+    let askedUpstream = false
+    await startShim(
+      body => {
+        askedUpstream = true
+        return OPENAI_CHUNKS
+      },
+      [{ id: 'GLM-5.2', contextWindow: 4_000, maxTokens: 65_536 }],
+    )
+    const res = await postSse(port, bearer, { ...ASK_WITH_MAX, messages: [{ role: 'user', content: 'x'.repeat(40_000) }] })
+    expect(askedUpstream).toBe(false)
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('上下文放不下')
+    expect(res.text).toContain('4000')
   })
 })

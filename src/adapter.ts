@@ -7,7 +7,7 @@
  * models and points pi-ai at the shim's OpenAI-compatible endpoint.
  *
  * MVP simplifications vs dsh-codebuddy-cli:
- *   - no billing rate in the model name (CodeArts has no balance API)
+ *   - no billing rate in the model name (per-request cost not exposed by the API)
  *   - no per-model reasoning ladder (models are surfaced as plain chat models)
  *
  * @module dsh-codearts/adapter

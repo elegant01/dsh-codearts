@@ -5,8 +5,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { CodeArtsPluginCard } from './CodeArtsPluginCard.tsx'
 import type { CodeArtsPluginCardInjected } from './CodeArtsPluginCard.tsx'
+import { CodeArtsCreditDock } from './CodeArtsCreditDock.tsx'
 import { en, zh } from './locales.ts'
 import type { CodeArtsSettingsKey } from './locales.ts'
 
@@ -43,6 +45,16 @@ export function apply(ctx: ClientContext): void {
       key: 'dsh-codearts',
       locale: namespace,
     }, () => <CodeArtsPluginCard t={t} />))
+
+    // 对话底部的积分条（conversation.composer.dock）—— 用户原始诉求就是
+    // 「对话底部要显示积分」。只在 codearts provider 下显示一行，别的不抢行。
+    ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+      name: 'conversation.composer.dock',
+      id: 'codearts-credits',
+      order: 20,
+      locale: namespace,
+      inject: () => ({ t }),
+    }, CodeArtsCreditDock))
   } catch (error: unknown) {
     console.error('[dsh-codearts] client card failed to load (host provider unaffected):', error)
   }

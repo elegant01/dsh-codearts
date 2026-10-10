@@ -13,6 +13,7 @@ declare const styles: {
   readonly "error": string
   readonly "field": string
   readonly "fieldLabel": string
+  readonly "headActions": string
   readonly "headText": string
   readonly "header": string
   readonly "hint": string

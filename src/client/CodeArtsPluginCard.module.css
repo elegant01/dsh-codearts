@@ -83,6 +83,14 @@
   font-weight: 500;
 }
 
+/* 账号区块标题行右侧：账号数 + 显示/隐藏切换，两者一起贴右。 */
+.headActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
 .count {
   color: var(--dsw-alias-label-secondary);
   font-size: 12px;

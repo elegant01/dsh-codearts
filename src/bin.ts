@@ -17,8 +17,8 @@
  * benefit and agent-center sources) instead of printing the hand-maintained seed —
  * that is the first thing to run when a model is missing from the picker.
  *
- * `usage` reads the plugin's own ledger of requests this machine sent. CodeArts has
- * no quota API, so it is not an account balance.
+ * `usage` reads the plugin's own ledger of requests this machine sent — not an
+ * account balance (account credits live in the card / `credits` route).
  *
  * `identity` asks the gateway which account each stored credential belongs to. The
  * login response carries no user id, so credentials used to be keyed by their DPoP
@@ -264,7 +264,7 @@ async function usage(jsonOutput: boolean): Promise<number> {
       process.stdout.write(`  - ${id.slice(0, 12)}…  ${totals.requests} req  in ${totals.promptTokens} / out ${totals.completionTokens}\n`)
     }
   }
-  process.stdout.write('note: CodeArts exposes no quota API; this counts requests this machine sent through the plugin\n')
+  process.stdout.write('note: this counts requests this machine sent through the plugin; account credits are in the card\n')
   return 0
 }
 

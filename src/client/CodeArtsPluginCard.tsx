@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Button, Checkbox, Input, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { CodeArtsWebStatus, CodeArtsWebUsage } from '../web-status.ts'
+import type { CodeArtsWebStatus, CodeArtsWebUsage, CodeArtsCreditSnapshot } from '../web-status.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
 export interface CodeArtsPluginCardInjected {
@@ -45,8 +45,16 @@ function modelName(choice: ModelChoice): string {
   return choice.free === true ? choice.name.replace(TRAILING_FREE, '') : choice.name
 }
 
-/** 官方用量明细页（CodeArts 没有额度接口，只能给链接）。 */
+/** 官方用量明细页。 */
 const OFFICIAL_USAGE_URL = 'https://codearts.huaweicloud.com/portal/settings/personal-usage'
+
+/**
+ * 账号身份默认遮蔽后的占位符。
+ *
+ * 卡片经常被截图贴进问题反馈，账号名（label / userName / id）与获取、过期时间
+ * 没有出现在截图里的必要，所以默认遮住，点一下才展开。
+ */
+const ACCOUNT_MASK = '*******'
 
 /** token 数按人类习惯缩写：12345 -> 12.3k。 */
 function formatTokens(value: number): string {
@@ -60,13 +68,76 @@ function formatCount(value: number): string {
   return Number.isFinite(value) ? String(Math.round(value)) : '0'
 }
 
+/** 积分/token 千分位格式化（2000 → "2,000"）。 */
+function formatCredits(value: number): string {
+  return Number.isFinite(value) ? new Intl.NumberFormat().format(Math.round(value)) : '0'
+}
+
+/**
+ * 积分区块。
+ *
+ * 2026-10 从官方 CodeArts Agent 客户端挖出积分接口并实测通过（见 src/credits.ts），
+ * 所以这里能直接显示账号总额度 —— 与下面的「本机用量」互补：一个是账号级、一个是
+ * 本机级。拉不到时显示原因（creditsError），不静默吞掉。
+ */
+function CreditsSection({
+  credits,
+  error,
+  t,
+}: {
+  credits?: CodeArtsCreditSnapshot
+  error?: string
+  t: CodeArtsPluginCardInjected['t']
+}): React.ReactElement | null {
+  if (credits === undefined && error === undefined) return null
+  const c = credits?.credits
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionHead}>
+        <span className={styles.sectionLabel}>{t('creditsTitle')}</span>
+        {c !== undefined && (
+          <span className={styles.count}>
+            {t('creditsRemaining', { remain: formatCredits(c.total.remain), total: formatCredits(c.total.total) })}
+          </span>
+        )}
+      </div>
+      {error !== undefined && <p className={styles.hint}>{t('creditsUnavailable', { message: error })}</p>}
+      {c !== undefined && (
+        <>
+          <div className={styles.choiceRow}>
+            <span className={styles.name}>{c.planName}</span>
+            <span className={styles.meta}>{t('creditsUsed', { used: formatCredits(c.total.used) })}</span>
+          </div>
+          {c.periodEnd !== undefined && (
+            <div className={styles.choiceRow}>
+              <span className={styles.name}>{t('creditsReset', { date: c.periodEnd })}</span>
+              {c.total.expiring > 0 && (
+                <span className={styles.meta}>
+                  {t('creditsExpiring', { expiring: formatCredits(c.total.expiring), date: c.periodEnd })}
+                </span>
+              )}
+            </div>
+          )}
+          {credits?.tokens !== undefined && (
+            <div className={styles.choiceRow}>
+              <span className={styles.name}>
+                {t('creditsTokensToday', { used: formatCredits(credits.tokens.dailyUsed), limit: formatCredits(credits.tokens.dailyLimit) })}
+              </span>
+              <span className={styles.meta}>{t('creditsTokensBalance', { balance: formatCredits(credits.tokens.balance) })}</span>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
 /**
  * 用量区块。
  *
- * 只展示**本机经插件发出**的请求：上游没有额度/积分接口（README 与 codearts2api
- * 都是这个结论），所以这里明确写出这一点并给出官方明细页链接，别让用户误以为
- * 这是账号总额度。会话槽位是真事实 —— 每账号 3 个并发会话、被占时要等约 52 秒
- * 才释放，这也正是「打断后重新提问要等」的原因。
+ * 只展示**本机经插件发出**的请求（不等于账号总额度 —— 账号额度见上方积分区块）；
+ * 会话槽位是真事实 —— 每账号 3 个并发会话、被占时要等约 52 秒才释放，这也正是
+ * 「打断后重新提问要等」的原因。
  */
 function UsageSection({
   usage,
@@ -173,6 +244,8 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [savingModels, setSavingModels] = useState(false)
   const [savedModels, setSavedModels] = useState(false)
   const [modelError, setModelError] = useState<string | null>(null)
+  /** 账号身份是否展开：默认遮蔽（false = 显示 *******）。 */
+  const [accountsRevealed, setAccountsRevealed] = useState(false)
 
   async function refresh(): Promise<void> {
     try {
@@ -347,6 +420,8 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const accounts = status?.accounts ?? []
   const accountName = (account: { label?: string; userName?: string; id: string }): string =>
     account.label?.trim() || account.userName?.trim() || account.id
+  /** 遮蔽态下账号身份一律换成占位符：原值连 DOM 都不进。 */
+  const reveal = (value: string): string => (accountsRevealed ? value : ACCOUNT_MASK)
   /**
    * 每个账号的「获取时间 + 过期状态」。同一账号重复登录可能留下多条记录（上游不给
    * 稳定身份时的妥协），把时间摆出来用户才能一眼认出哪条是旧的、放心删。
@@ -367,9 +442,10 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const statusText = signedIn ? t('statusSignedIn') : expired ? t('statusExpired') : t('statusSignedOut')
   const storedTime = formatStored(status?.storedAt)
   const storedLabel = status?.label?.trim() ?? ''
+  // 头部摘要里的 label 同样是账号身份，所以遮蔽态退回「存于 <时间>」那一句。
   const meta = !signedIn || storedTime === ''
     ? ''
-    : storedLabel === ''
+    : storedLabel === '' || !accountsRevealed
       ? t('storedMetaNoLabel', { time: storedTime })
       : t('storedMeta', { label: storedLabel, time: storedTime })
 
@@ -395,15 +471,25 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
           <div className={styles.section}>
             <div className={styles.sectionHead}>
               <span className={styles.sectionLabel}>{t('accountsTitle')}</span>
-              <span className={styles.count}>{accounts.length}</span>
+              <span className={styles.headActions}>
+                <span className={styles.count}>{accounts.length}</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={accountsRevealed}
+                  onClick={() => setAccountsRevealed(revealed => !revealed)}
+                >
+                  {accountsRevealed ? t('accountsHide') : t('accountsShow')}
+                </Button>
+              </span>
             </div>
             {accounts.length > 1 && <p className={styles.hint}>{t('accountsRotateHint')}</p>}
             {accounts.map(account => {
               const meta = accountMeta(account)
               return (
                 <div key={account.id} className={styles.choiceRow}>
-                  <span className={styles.name}>{accountName(account)}</span>
-                  {meta !== '' && <span className={styles.meta}>{meta}</span>}
+                  <span className={styles.name}>{reveal(accountName(account))}</span>
+                  <span className={styles.meta}>{reveal(meta)}</span>
                   {account.stale && <Tag>{t('accountNeedsSignIn')}</Tag>}
                   {!account.signable && <Tag>{t('accountNoKey')}</Tag>}
                 <Button
@@ -532,6 +618,9 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
           <p className={styles.hint}>{t('modelsLoading')}</p>
         )}
 
+        {signedIn && (status?.credits !== undefined || status?.creditsError !== undefined) && (
+          <CreditsSection credits={status?.credits} error={status?.creditsError} t={t} />
+        )}
         {status?.usage !== undefined && <UsageSection usage={status.usage} t={t} />}
       </div>
     </div>

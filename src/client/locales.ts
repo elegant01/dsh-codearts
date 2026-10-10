@@ -17,6 +17,8 @@ export interface CodeArtsSettingsKey {
   saveToken: string
   expiredHint: string
   accountsTitle: string
+  accountsShow: string
+  accountsHide: string
   accountRemove: string
   addAccount: string
   accountsRotateHint: string
@@ -53,6 +55,16 @@ export interface CodeArtsSettingsKey {
   usageStateDisabled: string
   usageNoQuota: string
   usageEmpty: string
+  creditsTitle: string
+  creditsRemaining: string
+  creditsUsed: string
+  creditsExpiring: string
+  creditsReset: string
+  creditsTokensToday: string
+  creditsTokensBalance: string
+  creditsUnavailable: string
+  creditsDock: string
+  creditsDockTitle: string
   [key: string]: string
 }
 
@@ -75,6 +87,8 @@ export const zh: CodeArtsSettingsKey = {
   saveToken: '保存 token',
   expiredHint: '凭证已过期，请重新登录以继续使用；已勾选的模型设置会保留。',
   accountsTitle: '账号',
+  accountsShow: '显示账号',
+  accountsHide: '隐藏账号',
   accountRemove: '删除',
   addAccount: '添加账号',
   accountsRotateHint: '已存多个账号：请求会自动轮转，某个账号忙时改用下一个，不用干等。',
@@ -109,8 +123,18 @@ export const zh: CodeArtsSettingsKey = {
   usageStateCapped: '撞上限，优先避开',
   usageStateCooling: '冷却中',
   usageStateDisabled: '已停用',
-  usageNoQuota: 'CodeArts 没有额度接口，这里统计的是本机经插件发出的请求；官方用量明细见',
+  usageNoQuota: '这里是本机经插件发出的请求统计（不等于账号总额度）；官方用量明细见',
   usageEmpty: '还没有记录：发一条消息就会开始累计。',
+  creditsTitle: '积分',
+  creditsRemaining: '剩余 {remain} / {total}',
+  creditsUsed: '已用 {used}',
+  creditsExpiring: '其中 {expiring} 将在 {date} 重置时作废',
+  creditsReset: '额度重置 {date}',
+  creditsTokensToday: '今日 token {used} / {limit}',
+  creditsTokensBalance: '余额 {balance}',
+  creditsUnavailable: '积分不可用：{message}',
+  creditsDock: '积分 {remain}',
+  creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
 }
 
 export const en: CodeArtsSettingsKey = {
@@ -132,6 +156,8 @@ export const en: CodeArtsSettingsKey = {
   saveToken: 'Save token',
   expiredHint: 'Your credential has expired. Sign in again to continue; your model selection is kept.',
   accountsTitle: 'Accounts',
+  accountsShow: 'Show accounts',
+  accountsHide: 'Hide accounts',
   accountRemove: 'Remove',
   addAccount: 'Add account',
   accountsRotateHint: 'Multiple accounts stored: requests rotate automatically, so a busy account hands over to the next one instead of making you wait.',
@@ -166,6 +192,16 @@ export const en: CodeArtsSettingsKey = {
   usageStateCapped: 'Cap hit, avoiding',
   usageStateCooling: 'Cooling down',
   usageStateDisabled: 'Disabled',
-  usageNoQuota: 'CodeArts exposes no quota API — this counts the requests this machine sent through the plugin. Official usage:',
+  usageNoQuota: 'Counts the requests this machine sent through the plugin (not the account balance). Official usage:',
   usageEmpty: 'Nothing recorded yet: send a message to start counting.',
+  creditsTitle: 'Credits',
+  creditsRemaining: '{remain} of {total} left',
+  creditsUsed: '{used} used',
+  creditsExpiring: '{expiring} of them expire at the next reset on {date}',
+  creditsReset: 'Quota resets {date}',
+  creditsTokensToday: 'Today {used} / {limit} tokens',
+  creditsTokensBalance: '{balance} left',
+  creditsUnavailable: 'Credits unavailable: {message}',
+  creditsDock: 'Credits {remain}',
+  creditsDockTitle: 'CodeArts credits left {remain} / {total}',
 }
