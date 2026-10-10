@@ -19,6 +19,12 @@
  *   node scripts/hmr.mjs off     [profileDir]   # 关掉，回到 base 默认（只监听配置）
  *   node scripts/hmr.mjs status  [profileDir]   # 看当前状态
  *
+ * ⚠️ 开启期间**不要**用插件管理器/npm 升级本插件：宿主为热重载监视着
+ * `node_modules/dsh-codearts`，目录被占用后 pnpm 替换版本时会报
+ * `ERR_PNPM_EPERM ... rename 'dsh-codearts_tmp_*' -> 'dsh-codearts'`，
+ * 安装失败后插件管理器还会把依赖条目一起回滚掉（表现为「插件被移除」）。
+ * 升级前先 `hmr.mjs off`，装完再按需开回来。
+ *
  * 写盘一律走 fs.writeFileSync（无 BOM）。profile 里任何 manifest/YAML 沾上 BOM
  * 都会让宿主裸 JSON.parse 崩在启动阶段，所以本脚本写完会复查前 3 字节。
  */
