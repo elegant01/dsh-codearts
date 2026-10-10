@@ -108,7 +108,9 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  await rm(dir, { recursive: true, force: true })
+  // Windows 上原子写落盘的句柄可能还没释放，直接 rmdir 会以 EBUSY 偶发失败 ——
+  // 断言其实已经过了，挂掉的是收尾。让它自己重试。
+  await rm(dir, { recursive: true, force: true, maxRetries: 10, maxRetryTime: 2_000 })
 })
 
 /** 一次假登录：startLogin 返回一个由测试手动控制的会话。 */
