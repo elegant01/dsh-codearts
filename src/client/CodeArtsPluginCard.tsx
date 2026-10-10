@@ -84,24 +84,75 @@ function CreditsSection({
   credits,
   error,
   t,
+  onClaimed,
 }: {
   credits?: CodeArtsCreditSnapshot
   error?: string
   t: CodeArtsPluginCardInjected['t']
+  onClaimed?: () => void
 }): React.ReactElement | null {
+  // 签到是每天一次：今天领过了就显示「已领取」并置灰，刷新页面也保持。
+  const [claimState, setClaimState] = useState<'idle' | 'loading' | 'success' | 'error'>(() => {
+    try {
+      const today = new Date().toISOString().slice(0, 10)
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('codearts-claim-date') === today) {
+        return 'success'
+      }
+    } catch { /* localStorage 不可用时退化为不记忆 */ }
+    return 'idle'
+  })
+  const [claimMessage, setClaimMessage] = useState('')
   if (credits === undefined && error === undefined) return null
+  const handleClaim = async (): Promise<void> => {
+    setClaimState('loading')
+    try {
+      const res = await fetch('/api/codearts/claim', {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+      })
+      const data = (await res.json().catch(() => undefined)) as { ok?: boolean; message?: string } | undefined
+      if (res.ok && data?.ok === true) {
+        setClaimState('success')
+        try {
+          const today = new Date().toISOString().slice(0, 10)
+          if (typeof localStorage !== 'undefined') localStorage.setItem('codearts-claim-date', today)
+        } catch { /* 记不住就算了，不影响领取本身 */ }
+        onClaimed?.()
+      } else {
+        setClaimState('error')
+        setClaimMessage(data?.message ?? `HTTP ${res.status}`)
+      }
+    } catch (err: unknown) {
+      setClaimState('error')
+      setClaimMessage(err instanceof Error ? err.message : String(err))
+    }
+  }
   const c = credits?.credits
   return (
     <div className={styles.section}>
       <div className={styles.sectionHead}>
         <span className={styles.sectionLabel}>{t('creditsTitle')}</span>
-        {c !== undefined && (
-          <span className={styles.count}>
-            {t('creditsRemaining', { remain: formatCredits(c.total.remain), total: formatCredits(c.total.total) })}
-          </span>
-        )}
+        <span className={styles.headActions}>
+          {c !== undefined && (
+            <span className={styles.count}>
+              {t('creditsRemaining', { remain: formatCredits(c.total.remain), total: formatCredits(c.total.total) })}
+            </span>
+          )}
+          {onClaimed !== undefined && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={claimState === 'loading' || claimState === 'success'}
+              onClick={() => void handleClaim()}
+            >
+              {claimState === 'loading' ? t('claiming') : claimState === 'success' ? t('claimSuccess') : t('claimButton')}
+            </Button>
+          )}
+        </span>
       </div>
       {error !== undefined && <p className={styles.hint}>{t('creditsUnavailable', { message: error })}</p>}
+      {claimState === 'error' && <p className={styles.hint}>{t('claimFailed', { message: claimMessage })}</p>}
       {c !== undefined && (
         <>
           <div className={styles.choiceRow}>
@@ -619,7 +670,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         )}
 
         {signedIn && (status?.credits !== undefined || status?.creditsError !== undefined) && (
-          <CreditsSection credits={status?.credits} error={status?.creditsError} t={t} />
+          <CreditsSection credits={status?.credits} error={status?.creditsError} t={t} onClaimed={() => void refresh()} />
         )}
         {status?.usage !== undefined && <UsageSection usage={status.usage} t={t} />}
       </div>

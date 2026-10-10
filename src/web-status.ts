@@ -37,6 +37,8 @@ export const CODEARTS_LOGIN_PATH = '/api/codearts/login'
 export const CODEARTS_LOGIN_STATUS_PATH = '/api/codearts/login/status'
 /** 删除某个账号：DELETE /api/codearts/accounts?id=<accountId> */
 export const CODEARTS_ACCOUNTS_PATH = '/api/codearts/accounts'
+/** POST /api/codearts/claim — 手动领取限时福利（签到领积分，幂等）。 */
+export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
 
 /** 勾选 UI 的一个选项。 */
 export interface CodeArtsModelChoice {
@@ -76,6 +78,11 @@ export function selectionOf(
   }))
   return { choices, restricted, writable }
 }
+
+/** 领取积分的结果：成功给 ok，失败给原因。 */
+export type CodeArtsClaimResult =
+  | { ok: true }
+  | { ok: false; message: string }
 
 export interface CodeArtsWebStatus {
   status: 'signed-in' | 'signed-out' | 'expired'
@@ -145,6 +152,11 @@ export interface CodeArtsStatusRouteOptions {
    * 省略则卡片不显示积分区块。
    */
   credits?: (signal?: AbortSignal) => Promise<CodeArtsCreditState>
+  /**
+   * 手动领取限时福利（签到领积分，幂等）。省略则卡片不显示领取按钮。
+   * 成功后调用方应使积分缓存失效，让下一次 /status 拉到新数字。
+   */
+  claim?: () => Promise<CodeArtsClaimResult>
   /**
    * Persist a new allowlist. Resolves false when no settings provider is
    * attached, which the card renders as a read-only selection.
@@ -471,6 +483,35 @@ function accountsHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/** POST /api/codearts/claim — 手动领取限时福利（签到领积分，幂等）。 */
+function claimHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (deps.claim === undefined) {
+      json(res, 404, { error: 'claim not available' })
+      return
+    }
+    // 与其他 mutating route 一致：挡 DNS-rebinding。
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    try {
+      const result = await deps.claim()
+      if (result.ok) {
+        json(res, 200, { ok: true })
+      } else {
+        json(res, 500, { ok: false, message: result.message })
+      }
+    } catch (error: unknown) {
+      json(res, 500, { ok: false, message: safeMessage(error) })
+    }
+  }
+}
+
 /** Mount the status / models / token routes. */
 export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRouteOptions): void {
   ctx.effect(() => {
@@ -515,6 +556,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_ACCOUNTS_PATH,
       handler: accountsHandler(deps),
     })
+    const disposeClaim = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_CLAIM_PATH,
+      handler: claimHandler(deps),
+    })
     return () => {
       disposeStatus()
       disposeModels()
@@ -523,6 +569,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeLoginStart()
       disposeLoginStatus()
       disposeAccounts()
+      disposeClaim()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()
     }

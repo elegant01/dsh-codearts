@@ -73,6 +73,7 @@ export {
   type UsageSnapshot,
   type UsageTotals,
 } from './usage.ts'
+import { claimBenefit } from './upstream.ts'
 export { discoverModels, refreshCatalog, type DiscoveryOutcome } from './discovery.ts'
 export {
   SNAP_HOST,
@@ -191,6 +192,24 @@ export function apply(ctx: Context, rawConfig: Config): void {
     pool: () => pool.list(),
     usage: () => usage.snapshot(),
     credits: signal => loadCredits(signal),
+    claim: async () => {
+      try {
+        const ids = await store.ids()
+        for (const id of ids) {
+          const stored = await store.credential(id)
+          if (stored === undefined || stored.stale === true) continue
+          const resolved = await store.resolve(id)
+          if (resolved === undefined) continue
+          await claimBenefit(resolved, AbortSignal.timeout(10_000))
+          // 领取成功后丢掉积分缓存，让下一次 /status 拉到新数字。
+          credits.invalidate()
+          return { ok: true as const }
+        }
+        return { ok: false as const, message: 'no usable credential' }
+      } catch (error: unknown) {
+        return { ok: false as const, message: error instanceof Error ? error.message : String(error) }
+      }
+    },
   }))
 
   // The settings section keeps the enabled-model allowlist live. On hosts with

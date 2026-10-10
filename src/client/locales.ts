@@ -65,6 +65,10 @@ export interface CodeArtsSettingsKey {
   creditsUnavailable: string
   creditsDock: string
   creditsDockTitle: string
+  claimButton: string
+  claiming: string
+  claimSuccess: string
+  claimFailed: string
   [key: string]: string
 }
 
@@ -135,6 +139,10 @@ export const zh: CodeArtsSettingsKey = {
   creditsUnavailable: '积分不可用：{message}',
   creditsDock: '积分 {remain}',
   creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
+  claimButton: '领取积分',
+  claiming: '领取中…',
+  claimSuccess: '已领取',
+  claimFailed: '领取失败：{message}',
 }
 
 export const en: CodeArtsSettingsKey = {
@@ -204,4 +212,8 @@ export const en: CodeArtsSettingsKey = {
   creditsUnavailable: 'Credits unavailable: {message}',
   creditsDock: 'Credits {remain}',
   creditsDockTitle: 'CodeArts credits left {remain} / {total}',
+  claimButton: 'Claim credits',
+  claiming: 'Claiming…',
+  claimSuccess: 'Claimed',
+  claimFailed: 'Claim failed: {message}',
 }
