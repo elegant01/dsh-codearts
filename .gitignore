@@ -17,3 +17,13 @@ coverage/
 
 # Local pnpm store stray.
 .pnpm-store/
+
+# Reverse-engineering / probe scratch — local investigation junk, not shipped.
+.acct-check.mjs
+.gh-*
+.hunt-*
+.credit-grab-*
+.probe/
+scripts/*-probe.*
+scripts/credit-*.mjs
+客服SOP*.md
