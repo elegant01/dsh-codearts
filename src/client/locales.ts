@@ -65,10 +65,8 @@ export interface CodeArtsSettingsKey {
   creditsUnavailable: string
   creditsDock: string
   creditsDockTitle: string
-  claimButton: string
-  claiming: string
-  claimSuccess: string
-  claimFailed: string
+  signInButton: string
+  signInHint: string
   [key: string]: string
 }
 
@@ -139,10 +137,8 @@ export const zh: CodeArtsSettingsKey = {
   creditsUnavailable: '积分不可用：{message}',
   creditsDock: '积分 {remain}',
   creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
-  claimButton: '领取积分',
-  claiming: '领取中…',
-  claimSuccess: '已领取',
-  claimFailed: '领取失败：{message}',
+  signInButton: '去签到领积分',
+  signInHint: '积分由 CodeArts 官网活动页发放，签到要在官网页面完成（和官方客户端同一入口）。',
 }
 
 export const en: CodeArtsSettingsKey = {
@@ -212,8 +208,6 @@ export const en: CodeArtsSettingsKey = {
   creditsUnavailable: 'Credits unavailable: {message}',
   creditsDock: 'Credits {remain}',
   creditsDockTitle: 'CodeArts credits left {remain} / {total}',
-  claimButton: 'Claim credits',
-  claiming: 'Claiming…',
-  claimSuccess: 'Claimed',
-  claimFailed: 'Claim failed: {message}',
+  signInButton: 'Check in for credits',
+  signInHint: 'Credits are issued on the CodeArts portal; check-in happens on that page (same entry as the official client).',
 }

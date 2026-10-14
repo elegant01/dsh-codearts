@@ -37,7 +37,7 @@ export const CODEARTS_LOGIN_PATH = '/api/codearts/login'
 export const CODEARTS_LOGIN_STATUS_PATH = '/api/codearts/login/status'
 /** 删除某个账号：DELETE /api/codearts/accounts?id=<accountId> */
 export const CODEARTS_ACCOUNTS_PATH = '/api/codearts/accounts'
-/** POST /api/codearts/claim — 手动领取限时福利（签到领积分，幂等）。 */
+/** POST /api/codearts/claim — 开通「限时福利」免费模型渠道（幂等）；**不发积分**。 */
 export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
 
 /** 勾选 UI 的一个选项。 */
@@ -79,7 +79,7 @@ export function selectionOf(
   return { choices, restricted, writable }
 }
 
-/** 领取积分的结果：成功给 ok，失败给原因。 */
+/** 开通限时福利的结果：成功给 ok，失败给原因。 */
 export type CodeArtsClaimResult =
   | { ok: true }
   | { ok: false; message: string }
@@ -153,8 +153,10 @@ export interface CodeArtsStatusRouteOptions {
    */
   credits?: (signal?: AbortSignal) => Promise<CodeArtsCreditState>
   /**
-   * 手动领取限时福利（签到领积分，幂等）。省略则卡片不显示领取按钮。
-   * 成功后调用方应使积分缓存失效，让下一次 /status 拉到新数字。
+   * 开通「限时福利」免费模型渠道（幂等）。
+   *
+   * **它不发积分**：积分只能在 CodeArts 官网的签到页领（官方客户端也是跳那一页）。
+   * 卡片已经不再拿它当「领取积分」用，这个路由留给需要手动补开通福利的场景。
    */
   claim?: () => Promise<CodeArtsClaimResult>
   /**
@@ -483,7 +485,7 @@ function accountsHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
-/** POST /api/codearts/claim — 手动领取限时福利（签到领积分，幂等）。 */
+/** POST /api/codearts/claim — 开通「限时福利」免费模型渠道（幂等）；**不发积分**。 */
 function claimHandler(deps: CodeArtsStatusRouteOptions) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method !== 'POST') {

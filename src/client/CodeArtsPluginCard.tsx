@@ -74,6 +74,26 @@ function formatCredits(value: number): string {
 }
 
 /**
+ * 签到领积分的入口页。
+ *
+ * 官方 CodeArts Agent 客户端里，用户菜单的「活动福利（签到领 1000 积分）」点击后
+ * **不发任何接口请求**，只是用系统浏览器打开这个页面（SnapChat 的 isActivity 分支 →
+ * `jumpToBrowser(INIT_CONFIG.personalUsageSettings, isOutSideOpen: true)`，URL 来自
+ * `vscode-codebot/product.json`）。也就是说积分的签到动作只在那一页上完成，AK/SK
+ * 网关那套（benefit/claim、statistics/plugin）里没有任何发积分的接口 —— 详见
+ * src/upstream.ts 的 claimBenefit：它开通的是「限时福利免费模型」渠道，不是积分。
+ */
+export const CODEARTS_SIGN_IN_URL = 'https://codearts.huaweicloud.com/portal/settings/personal-usage'
+
+/** 打开签到页；带 locale 参数，与官方客户端的拼法一致。 */
+function openSignInPage(): void {
+  if (typeof window === 'undefined') return
+  const lang = typeof navigator === 'undefined' ? '' : navigator.language ?? ''
+  const locale = lang.toLowerCase().startsWith('en') ? 'en-us' : 'zh-cn'
+  window.open(`${CODEARTS_SIGN_IN_URL}?locale=${locale}`, '_blank', 'noopener')
+}
+
+/**
  * 积分区块。
  *
  * 2026-10 从官方 CodeArts Agent 客户端挖出积分接口并实测通过（见 src/credits.ts），
@@ -84,50 +104,12 @@ function CreditsSection({
   credits,
   error,
   t,
-  onClaimed,
 }: {
   credits?: CodeArtsCreditSnapshot
   error?: string
   t: CodeArtsPluginCardInjected['t']
-  onClaimed?: () => void
 }): React.ReactElement | null {
-  // 签到是每天一次：今天领过了就显示「已领取」并置灰，刷新页面也保持。
-  const [claimState, setClaimState] = useState<'idle' | 'loading' | 'success' | 'error'>(() => {
-    try {
-      const today = new Date().toISOString().slice(0, 10)
-      if (typeof localStorage !== 'undefined' && localStorage.getItem('codearts-claim-date') === today) {
-        return 'success'
-      }
-    } catch { /* localStorage 不可用时退化为不记忆 */ }
-    return 'idle'
-  })
-  const [claimMessage, setClaimMessage] = useState('')
   if (credits === undefined && error === undefined) return null
-  const handleClaim = async (): Promise<void> => {
-    setClaimState('loading')
-    try {
-      const res = await fetch('/api/codearts/claim', {
-        method: 'POST',
-        headers: { Accept: 'application/json' },
-        credentials: 'same-origin',
-      })
-      const data = (await res.json().catch(() => undefined)) as { ok?: boolean; message?: string } | undefined
-      if (res.ok && data?.ok === true) {
-        setClaimState('success')
-        try {
-          const today = new Date().toISOString().slice(0, 10)
-          if (typeof localStorage !== 'undefined') localStorage.setItem('codearts-claim-date', today)
-        } catch { /* 记不住就算了，不影响领取本身 */ }
-        onClaimed?.()
-      } else {
-        setClaimState('error')
-        setClaimMessage(data?.message ?? `HTTP ${res.status}`)
-      }
-    } catch (err: unknown) {
-      setClaimState('error')
-      setClaimMessage(err instanceof Error ? err.message : String(err))
-    }
-  }
   const c = credits?.credits
   return (
     <div className={styles.section}>
@@ -139,20 +121,15 @@ function CreditsSection({
               {t('creditsRemaining', { remain: formatCredits(c.total.remain), total: formatCredits(c.total.total) })}
             </span>
           )}
-          {onClaimed !== undefined && (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={claimState === 'loading' || claimState === 'success'}
-              onClick={() => void handleClaim()}
-            >
-              {claimState === 'loading' ? t('claiming') : claimState === 'success' ? t('claimSuccess') : t('claimButton')}
-            </Button>
-          )}
+          {/* 积分只能去官网签到页领（官方客户端就是这么做的），所以这里不做请求，
+              也不记「今天已领取」——签没签到只有那一页知道。 */}
+          <Button variant="outline" size="sm" onClick={() => openSignInPage()}>
+            {t('signInButton')}
+          </Button>
         </span>
       </div>
       {error !== undefined && <p className={styles.hint}>{t('creditsUnavailable', { message: error })}</p>}
-      {claimState === 'error' && <p className={styles.hint}>{t('claimFailed', { message: claimMessage })}</p>}
+      <p className={styles.hint}>{t('signInHint')}</p>
       {c !== undefined && (
         <>
           <div className={styles.choiceRow}>
@@ -670,7 +647,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         )}
 
         {signedIn && (status?.credits !== undefined || status?.creditsError !== undefined) && (
-          <CreditsSection credits={status?.credits} error={status?.creditsError} t={t} onClaimed={() => void refresh()} />
+          <CreditsSection credits={status?.credits} error={status?.creditsError} t={t} />
         )}
         {status?.usage !== undefined && <UsageSection usage={status.usage} t={t} />}
       </div>

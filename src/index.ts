@@ -200,9 +200,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
           if (stored === undefined || stored.stale === true) continue
           const resolved = await store.resolve(id)
           if (resolved === undefined) continue
+          // 只开通限时福利渠道：它不改变积分，所以这里不碰积分缓存（积分看签到页）。
           await claimBenefit(resolved, AbortSignal.timeout(10_000))
-          // 领取成功后丢掉积分缓存，让下一次 /status 拉到新数字。
-          credits.invalidate()
           return { ok: true as const }
         }
         return { ok: false as const, message: 'no usable credential' }

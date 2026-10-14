@@ -885,11 +885,17 @@ export async function fetchModels(
 }
 
 /**
- * 领取限时福利（幂等：已领取返回成功）。官方客户端打开模型菜单即调用。
- * 不领取时福利模型调用必报 InferHub.4004.200 benefit not found。
+ * 开通「限时福利」（免费模型）渠道，幂等：已开通就原样返回。官方客户端打开模型菜单
+ * 即调用（GET），用户点「领取」时也调（POST）——两种方法实测都返回 200/0000。
+ * 不开通时福利模型调用必报 InferHub.4004.200 benefit not found。
  * 需要 AK/SK 签名（凭证要带 accessKeyId/secretAccessKey）。
+ *
+ * **它不发积分。** 返回体只是一条渠道开通记录（channel / create_time / update_time，
+ * 幂等所以时间戳是旧的），账号积分由套餐决定（见 credits.ts），领取动作在官网签到页。
+ * 别把它当「领取积分」用 —— 早先卡片这么用，结果就是「点了显示已领取、积分没变」。
  */
 export async function claimBenefit(credential: CodeArtsResolved, abort?: AbortSignal): Promise<void> {
+  // 没有 AK/SK 就签不了名。这不是失败，而是「这个账号没有这条通道」，静默跳过。
   if (!credential.accessKeyId || !credential.secretAccessKey) return
   const url = `${BENEFIT_HOST}${EP_BENEFIT_CLAIM}`
   const bodyBuf = Buffer.from('{}')
@@ -913,14 +919,17 @@ export async function claimBenefit(credential: CodeArtsResolved, abort?: AbortSi
   if (!resp.ok) {
     throw new Error(`claim benefit failed: ${resp.status} ${raw.slice(0, 200)}`)
   }
-  // 接口返回 { error_code: "0000", ... }；非 0000 视为失败，但不阻断（幂等）。
+  // 成功判定对齐官方客户端：`error_code === "0000"` 才算成功。
+  // 非 JSON **不能**当成功 —— APIG 的错误页也会是 200 + 非 JSON，那样会假成功。
+  let json: { error_code?: string; error_msg?: string }
   try {
-    const json = JSON.parse(raw)
-    if (json.error_code && json.error_code !== '0000') {
-      throw new Error(`claim benefit rejected: ${json.error_code} ${json.error_msg ?? ''}`)
-    }
-  } catch (e) {
-    if (e instanceof SyntaxError) return // 非 JSON 也当成功（接口行为宽松）
-    throw e
+    json = JSON.parse(raw) as typeof json
+  } catch {
+    throw new Error(`claim benefit: unexpected non-JSON response: ${raw.slice(0, 200)}`)
+  }
+  if (json.error_code !== '0000') {
+    throw new Error(
+      `claim benefit rejected: ${json.error_code ?? '(no error_code)'} ${json.error_msg ?? ''}`.trim(),
+    )
   }
 }
