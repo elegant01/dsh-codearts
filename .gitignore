@@ -27,3 +27,17 @@ coverage/
 scripts/*-probe.*
 scripts/credit-*.mjs
 客服SOP*.md
+
+.aider*
+
+# Unrelated to this plugin: Dify customer-service workflow demo + design docs.
+dify-code/
+dify-*.md
+通用客服SOP引擎-*.md
+私域SOP-*.md
+
+# Local docs / scratch.
+.chrome-cdp/
+
+# PowerShell redirection strays.
+$null
