@@ -1,10 +1,10 @@
 /**
  * Same-origin status + token routes for the CodeArts card.
  *
- * Minimal surface vs dsh-codebuddy-cli: no credits, no check-in. The browser
- * half calls these to read sign-in state / model list / the account list /
- * local usage, and to add or remove accounts. The route answers loopback
- * browser requests only and never returns token material.
+ * Minimal surface vs dsh-codebuddy-cli. The browser half calls these to read
+ * sign-in state / model list / the account list / local usage / credits, to add
+ * or remove accounts, and to claim the daily check-in credits. The route
+ * answers loopback browser requests only and never returns token material.
  *
  * @module dsh-codearts/web-status
  */
@@ -22,8 +22,10 @@ import type { UsageSnapshot, UsageTotals } from './usage.ts'
 export type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { filterEnabledModels, isBenefitModel } from './catalog.ts'
-import { fetchCallerIdentity, type CallerIdentity } from './upstream.ts'
+import { fetchCallerIdentity, type CallerIdentity, type CodeArtsWelfareState } from './upstream.ts'
 import { startLogin, type LoginSession, type OAuthToken } from './oauth.ts'
+// 领取结果里的 state 也是卡片要认的契约，同上不外露 upstream 模块。
+export type { CodeArtsWelfareState } from './upstream.ts'
 
 /** 登录后问身份的超时：它是「顺手做对」，不能拖住登录落库。 */
 const IDENTITY_TIMEOUT_MS = 8_000
@@ -37,7 +39,7 @@ export const CODEARTS_LOGIN_PATH = '/api/codearts/login'
 export const CODEARTS_LOGIN_STATUS_PATH = '/api/codearts/login/status'
 /** 删除某个账号：DELETE /api/codearts/accounts?id=<accountId> */
 export const CODEARTS_ACCOUNTS_PATH = '/api/codearts/accounts'
-/** POST /api/codearts/claim — 开通「限时福利」免费模型渠道（幂等）；**不发积分**。 */
+/** POST /api/codearts/claim — 领一次福利中心的每日签到积分（幂等由上游按天去重）。 */
 export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
 
 /** 勾选 UI 的一个选项。 */
@@ -79,10 +81,19 @@ export function selectionOf(
   return { choices, restricted, writable }
 }
 
-/** 开通限时福利的结果：成功给 ok，失败给原因。 */
-export type CodeArtsClaimResult =
-  | { ok: true }
-  | { ok: false; message: string }
+/**
+ * 领取福利的结果。
+ *
+ * `ok` 是「这次请求跑通了没有」，`claimed` 才是「积分真的加上了」——
+ * 今天已领 / 账号没有这个活动都算 ok 但没 claimed，UI 不该把它们当报错。
+ */
+export interface CodeArtsClaimResult {
+  ok: boolean
+  claimed: boolean
+  state: CodeArtsWelfareState
+  amount: number
+  message: string
+}
 
 export interface CodeArtsWebStatus {
   status: 'signed-in' | 'signed-out' | 'expired'
@@ -485,7 +496,7 @@ function accountsHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
-/** POST /api/codearts/claim — 开通「限时福利」免费模型渠道（幂等）；**不发积分**。 */
+/** POST /api/codearts/claim — 领一次每日签到积分；未领到也回 200（看 claimed/state）。 */
 function claimHandler(deps: CodeArtsStatusRouteOptions) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method !== 'POST') {
@@ -503,13 +514,15 @@ function claimHandler(deps: CodeArtsStatusRouteOptions) {
     }
     try {
       const result = await deps.claim()
-      if (result.ok) {
-        json(res, 200, { ok: true })
-      } else {
-        json(res, 500, { ok: false, message: result.message })
-      }
+      json(res, result.ok ? 200 : 500, result)
     } catch (error: unknown) {
-      json(res, 500, { ok: false, message: safeMessage(error) })
+      json(res, 500, {
+        ok: false,
+        claimed: false,
+        state: 'failed',
+        amount: 0,
+        message: safeMessage(error),
+      })
     }
   }
 }

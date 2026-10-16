@@ -65,8 +65,14 @@ export interface CodeArtsSettingsKey {
   creditsUnavailable: string
   creditsDock: string
   creditsDockTitle: string
-  signInButton: string
-  signInHint: string
+  claimButton: string
+  claimButtonDone: string
+  claimPending: string
+  claimHint: string
+  claimDone: string
+  claimAlready: string
+  claimUnavailable: string
+  claimFailed: string
   [key: string]: string
 }
 
@@ -137,8 +143,14 @@ export const zh: CodeArtsSettingsKey = {
   creditsUnavailable: '积分不可用：{message}',
   creditsDock: '积分 {remain}',
   creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
-  signInButton: '去签到领积分',
-  signInHint: '积分由 CodeArts 官网活动页发放，签到要在官网页面完成（和官方客户端同一入口）。',
+  claimButton: '签到领积分',
+  claimButtonDone: '今日已领',
+  claimPending: '领取中…',
+  claimHint: '每天领一次 1000 积分，走官方福利中心接口（与客户端里那个「每日签到」同一件事）。',
+  claimDone: '已领取 {amount} 积分',
+  claimAlready: '今日已领，明天再来',
+  claimUnavailable: '这个账号当前没有可领的签到活动',
+  claimFailed: '领取失败：{message}',
 }
 
 export const en: CodeArtsSettingsKey = {
@@ -208,6 +220,12 @@ export const en: CodeArtsSettingsKey = {
   creditsUnavailable: 'Credits unavailable: {message}',
   creditsDock: 'Credits {remain}',
   creditsDockTitle: 'CodeArts credits left {remain} / {total}',
-  signInButton: 'Check in for credits',
-  signInHint: 'Credits are issued on the CodeArts portal; check-in happens on that page (same entry as the official client).',
+  claimButton: 'Claim daily credits',
+  claimButtonDone: 'Claimed today',
+  claimPending: 'Claiming…',
+  claimHint: 'Claim 1,000 credits once a day through CodeArts’ welfare centre — the same check-in the official client does.',
+  claimDone: 'Claimed {amount} credits',
+  claimAlready: 'Already claimed today — come back tomorrow',
+  claimUnavailable: 'No check-in campaign available for this account',
+  claimFailed: 'Claim failed: {message}',
 }

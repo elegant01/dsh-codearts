@@ -22,10 +22,12 @@ vi.mock('../src/oauth.ts', async importOriginal => {
 import { CodeArtsAccountStore, credentialFromOAuth } from '../src/auth.ts'
 import {
   CODEARTS_ACCOUNTS_PATH,
+  CODEARTS_CLAIM_PATH,
   CODEARTS_LOGIN_PATH,
   CODEARTS_LOGIN_STATUS_PATH,
   CODEARTS_STATUS_PATH,
   registerCodeArtsStatusRoute,
+  type CodeArtsClaimResult,
 } from '../src/web-status.ts'
 
 /**
@@ -275,5 +277,47 @@ describe('GET /api/codearts/status', () => {
     await store.upsert({ token: 'pasted', storedAt: Date.now(), expiration: '2000-01-01T00:00:00Z' })
     const res = await call(routes.get(CODEARTS_STATUS_PATH)!, 'GET', CODEARTS_STATUS_PATH)
     expect(res.body?.status).toBe('expired')
+  })
+})
+
+describe('POST /api/codearts/claim', () => {
+  function claimHandler(claim: () => Promise<CodeArtsClaimResult>): Handler {
+    return mountRoutes({ store, models: () => [], claim }).get(CODEARTS_CLAIM_PATH)!
+  }
+
+  it('answers with the outcome so the card can tell 领到了 from 今日已领', async () => {
+    const res = await call(
+      claimHandler(async () => ({ ok: true, claimed: true, state: 'claimed', amount: 1000, message: 'ok' })),
+      POST,
+      CODEARTS_CLAIM_PATH,
+    )
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ claimed: true, state: 'claimed', amount: 1000 })
+  })
+
+  // 「今天已经领了」不是错误：把它发成 500 会让卡片显示「领取失败」，用户以为没签到。
+  it('does not turn already-claimed into an HTTP error', async () => {
+    const res = await call(
+      claimHandler(async () => ({ ok: true, claimed: false, state: 'already', amount: 0, message: '' })),
+      POST,
+      CODEARTS_CLAIM_PATH,
+    )
+    expect(res.status).toBe(200)
+    expect(res.body?.claimed).toBe(false)
+  })
+
+  it('reports a failed claim as 500 with the upstream reason', async () => {
+    const res = await call(
+      claimHandler(async () => ({ ok: false, claimed: false, state: 'failed', amount: 0, message: 'decrypt token fail' })),
+      POST,
+      CODEARTS_CLAIM_PATH,
+    )
+    expect(res.status).toBe(500)
+    expect(res.body?.message).toBe('decrypt token fail')
+  })
+
+  it('404s when no claim handler is attached', async () => {
+    const res = await call(routes.get(CODEARTS_CLAIM_PATH)!, POST, CODEARTS_CLAIM_PATH)
+    expect(res.status).toBe(404)
   })
 })

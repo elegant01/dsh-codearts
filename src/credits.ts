@@ -20,7 +20,14 @@
  * @module dsh-codearts/credits
  */
 
-import { SNAP_HOST, signedGet, type CodeArtsResolved } from './upstream.ts'
+import {
+  SNAP_HOST,
+  fetchWelfareCampaigns,
+  isWelfareClaimedStatus,
+  pickDailyWelfareCampaign,
+  signedGet,
+  type CodeArtsResolved,
+} from './upstream.ts'
 
 /** 福利网关：token 余额接口在这里（与 benefit/claim、gateway/config 同一个 host）。 */
 export const BENEFIT_GATEWAY_HOST = 'https://opengw.developer.huaweicloud.com'
@@ -78,10 +85,25 @@ export interface CodeArtsTokenQuota {
   quota: number
 }
 
+/** 每日签到活动当前状态（来自福利中心 `/v1/ops/delivery`）。 */
+export interface CodeArtsDailyWelfare {
+  /** 上游说这条活动现在点得动吗。 */
+  claimable: boolean
+  /**
+   * 「今天已经领过了」。单独判出来给卡片改按钮文案用 —— 不可领的原因有好几种
+   * （已领 / 要先去官网登录 / 账号没资格），只有这一种该把按钮变成「今日已领」。
+   */
+  claimedToday: boolean
+  /** 领一次给多少积分。 */
+  amount: number
+}
+
 export interface CodeArtsCreditSnapshot {
   credits: CodeArtsCredits
   /** 拿不到（接口失败/不支持）时为 undefined，不影响积分本身。 */
   tokens?: CodeArtsTokenQuota
+  /** 没有这个活动（或账号是 token 套餐）时为 undefined。 */
+  welfare?: CodeArtsDailyWelfare
 }
 
 /** 缓存里的一个结果：成功给值，失败给消息 —— 失败也要能被卡片看见。 */
@@ -219,17 +241,33 @@ export async function fetchCredits(
   credential: CodeArtsResolved,
   signal?: AbortSignal,
 ): Promise<CodeArtsCreditSnapshot> {
-  const [statistics, balance] = await Promise.all([
+  const [statistics, balance, welfare] = await Promise.all([
     signedGet(`${SNAP_HOST}${EP_STATISTICS_PLUGIN}`, credential, undefined, signal),
     signedGet(`${BENEFIT_GATEWAY_HOST}${EP_TOKEN_BALANCE}`, credential, undefined, signal).catch(
       () => ({ ok: false as const, status: 0, message: 'request failed' }),
     ),
+    // 签到状态也是附带的：拉不到只是按钮少一个依据，不该把积分数字一起拖没。
+    fetchWelfareCampaigns(credential, signal)
+      .then(campaigns => {
+        const daily = pickDailyWelfareCampaign(campaigns)
+        if (daily === undefined) return undefined
+        return {
+          claimable: daily.claimable,
+          claimedToday: !daily.claimable && isWelfareClaimedStatus(daily.status),
+          amount: daily.amount,
+        } satisfies CodeArtsDailyWelfare
+      })
+      .catch(() => undefined),
   ])
   if (!statistics.ok) throw errorOf('statistics', statistics)
   const credits = parseCreditStatistics(safeJson(statistics.text))
   if (credits === undefined) throw new Error('statistics response carries no credit metrics')
   const tokens = balance.ok ? parseTokenBalance(safeJson(balance.text)) : undefined
-  return { credits, ...tokens === undefined ? {} : { tokens } }
+  return {
+    credits,
+    ...tokens === undefined ? {} : { tokens },
+    ...welfare === undefined ? {} : { welfare },
+  }
 }
 
 function safeJson(text: string): unknown {

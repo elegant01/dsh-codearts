@@ -73,7 +73,7 @@ export {
   type UsageSnapshot,
   type UsageTotals,
 } from './usage.ts'
-import { claimBenefit } from './upstream.ts'
+import { claimDailyWelfare } from './upstream.ts'
 export { discoverModels, refreshCatalog, type DiscoveryOutcome } from './discovery.ts'
 export {
   SNAP_HOST,
@@ -200,13 +200,36 @@ export function apply(ctx: Context, rawConfig: Config): void {
           if (stored === undefined || stored.stale === true) continue
           const resolved = await store.resolve(id)
           if (resolved === undefined) continue
-          // 只开通限时福利渠道：它不改变积分，所以这里不碰积分缓存（积分看签到页）。
-          await claimBenefit(resolved, AbortSignal.timeout(10_000))
-          return { ok: true as const }
+          // 应用内点「领取」拿的是福利中心的每日签到活动（/v1/ops/delivery + /v1/ops/claim），
+          // 不是 claimBenefit 那条限时福利免费模型渠道 —— 后者不发积分。
+          const outcome = await claimDailyWelfare(resolved, AbortSignal.timeout(20_000))
+          if (outcome.state === 'claimed') {
+            // 余额真的变了，缓存必须丢掉，否则卡片下一次刷新还读旧的。
+            credits.invalidate()
+          }
+          return {
+            ok: outcome.state !== 'failed',
+            claimed: outcome.state === 'claimed',
+            state: outcome.state,
+            amount: outcome.amount,
+            message: outcome.message,
+          }
         }
-        return { ok: false as const, message: 'no usable credential' }
+        return {
+          ok: false,
+          claimed: false,
+          state: 'failed' as const,
+          amount: 0,
+          message: 'no usable credential',
+        }
       } catch (error: unknown) {
-        return { ok: false as const, message: error instanceof Error ? error.message : String(error) }
+        return {
+          ok: false,
+          claimed: false,
+          state: 'failed' as const,
+          amount: 0,
+          message: error instanceof Error ? error.message : String(error),
+        }
       }
     },
   }))

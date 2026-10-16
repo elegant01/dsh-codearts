@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Button, Checkbox, Input, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { CodeArtsWebStatus, CodeArtsWebUsage, CodeArtsCreditSnapshot } from '../web-status.ts'
+import type { CodeArtsWebStatus, CodeArtsWebUsage, CodeArtsCreditSnapshot, CodeArtsWelfareState } from '../web-status.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
 export interface CodeArtsPluginCardInjected {
@@ -73,24 +73,31 @@ function formatCredits(value: number): string {
   return Number.isFinite(value) ? new Intl.NumberFormat().format(Math.round(value)) : '0'
 }
 
-/**
- * 签到领积分的入口页。
- *
- * 官方 CodeArts Agent 客户端里，用户菜单的「活动福利（签到领 1000 积分）」点击后
- * **不发任何接口请求**，只是用系统浏览器打开这个页面（SnapChat 的 isActivity 分支 →
- * `jumpToBrowser(INIT_CONFIG.personalUsageSettings, isOutSideOpen: true)`，URL 来自
- * `vscode-codebot/product.json`）。也就是说积分的签到动作只在那一页上完成，AK/SK
- * 网关那套（benefit/claim、statistics/plugin）里没有任何发积分的接口 —— 详见
- * src/upstream.ts 的 claimBenefit：它开通的是「限时福利免费模型」渠道，不是积分。
- */
-export const CODEARTS_SIGN_IN_URL = 'https://codearts.huaweicloud.com/portal/settings/personal-usage'
+/** POST /api/codearts/claim 的响应（后端契约见 web-status.ts 的 CodeArtsClaimResult）。 */
+interface ClaimResponse {
+  ok?: boolean
+  claimed?: boolean
+  state?: CodeArtsWelfareState
+  amount?: number
+  message?: string
+}
 
-/** 打开签到页；带 locale 参数，与官方客户端的拼法一致。 */
-function openSignInPage(): void {
-  if (typeof window === 'undefined') return
-  const lang = typeof navigator === 'undefined' ? '' : navigator.language ?? ''
-  const locale = lang.toLowerCase().startsWith('en') ? 'en-us' : 'zh-cn'
-  window.open(`${CODEARTS_SIGN_IN_URL}?locale=${locale}`, '_blank', 'noopener')
+type Translate = CodeArtsPluginCardInjected['t']
+
+/**
+ * 领取结果 → 文案。
+ *
+ * 本地状态（claimed/already/没有这个活动）用界面自己的话；只有 failed 才透出
+ * 上游给的 reason —— 那句往往才是排障要的东西（签名失败、404、非 JSON…）。
+ */
+function claimText(data: ClaimResponse | null, t: Translate): string {
+  if (data?.claimed === true) {
+    return t('claimDone', { amount: formatCredits(data.amount ?? 0) })
+  }
+  if (data?.state === 'already') return t('claimAlready')
+  if (data?.state === 'unavailable') return t('claimUnavailable')
+  const message = typeof data?.message === 'string' && data.message !== '' ? data.message : 'request failed'
+  return t('claimFailed', { message })
 }
 
 /**
@@ -104,13 +111,24 @@ function CreditsSection({
   credits,
   error,
   t,
+  onClaim,
+  claiming,
+  claimResult,
+  justClaimed,
 }: {
   credits?: CodeArtsCreditSnapshot
   error?: string
   t: CodeArtsPluginCardInjected['t']
+  onClaim: () => void
+  claiming: boolean
+  /** 上一次领取的结果文案；null 表示本次还没点过。 */
+  claimResult: string | null
+  /** 这一次刚领成：领完后 delivery 有几秒还回「可领」，这段时间靠它兜住按钮。 */
+  justClaimed: boolean
 }): React.ReactElement | null {
   if (credits === undefined && error === undefined) return null
   const c = credits?.credits
+  const claimedToday = justClaimed || credits?.welfare?.claimedToday === true
   return (
     <div className={styles.section}>
       <div className={styles.sectionHead}>
@@ -121,15 +139,13 @@ function CreditsSection({
               {t('creditsRemaining', { remain: formatCredits(c.total.remain), total: formatCredits(c.total.total) })}
             </span>
           )}
-          {/* 积分只能去官网签到页领（官方客户端就是这么做的），所以这里不做请求，
-              也不记「今天已领取」——签没签到只有那一页知道。 */}
-          <Button variant="outline" size="sm" onClick={() => openSignInPage()}>
-            {t('signInButton')}
+          <Button variant="outline" size="sm" disabled={claiming || claimedToday} onClick={onClaim}>
+            {claiming ? t('claimPending') : claimedToday ? t('claimButtonDone') : t('claimButton')}
           </Button>
         </span>
       </div>
       {error !== undefined && <p className={styles.hint}>{t('creditsUnavailable', { message: error })}</p>}
-      <p className={styles.hint}>{t('signInHint')}</p>
+      <p className={styles.hint}>{claimResult ?? t('claimHint')}</p>
       {c !== undefined && (
         <>
           <div className={styles.choiceRow}>
@@ -274,6 +290,34 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [modelError, setModelError] = useState<string | null>(null)
   /** 账号身份是否展开：默认遮蔽（false = 显示 *******）。 */
   const [accountsRevealed, setAccountsRevealed] = useState(false)
+  const [claiming, setClaiming] = useState(false)
+  const [claimResult, setClaimResult] = useState<string | null>(null)
+  const [justClaimed, setJustClaimed] = useState(false)
+
+  /**
+   * 领一次每日签到积分。
+   *
+   * 除了这一次刚领成，「今天已领」都来自上游的福利活动状态（积分快照里的 welfare），
+   * 所以刷新、重开窗口都不会把按钮说错。领完不记日期：去重在上游按天做。
+   */
+  async function claim(): Promise<void> {
+    setClaiming(true)
+    try {
+      const res = await fetch('/api/codearts/claim', { method: 'POST' })
+      const data = (await res.json().catch(() => null)) as ClaimResponse | null
+      setClaimResult(claimText(data, t))
+      if (data?.claimed === true) {
+        setJustClaimed(true)
+        await refresh()
+      }
+    } catch (error: unknown) {
+      setClaimResult(t('claimFailed', {
+        message: error instanceof Error ? error.message : String(error),
+      }))
+    } finally {
+      setClaiming(false)
+    }
+  }
 
   async function refresh(): Promise<void> {
     try {
@@ -647,7 +691,15 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         )}
 
         {signedIn && (status?.credits !== undefined || status?.creditsError !== undefined) && (
-          <CreditsSection credits={status?.credits} error={status?.creditsError} t={t} />
+          <CreditsSection
+            credits={status?.credits}
+            error={status?.creditsError}
+            t={t}
+            onClaim={() => void claim()}
+            claiming={claiming}
+            claimResult={claimResult}
+            justClaimed={justClaimed}
+          />
         )}
         {status?.usage !== undefined && <UsageSection usage={status.usage} t={t} />}
       </div>

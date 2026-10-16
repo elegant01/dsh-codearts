@@ -933,3 +933,213 @@ export async function claimBenefit(credential: CodeArtsResolved, abort?: AbortSi
     )
   }
 }
+
+/**
+ * 福利中心（活动积分）接口：26.9.901 起应用内「每日签到领 1000 积分」走这套。
+ *
+ * host 与积分统计是同一个 snap-access 网关，路径前缀 `/v1/ops`，鉴权头对齐官方客户端
+ * 的 `Pz()`（`x-auth-token` + `Agent-Type: PromptCenter`），再补上我们直连必须的
+ * AK/SK 签名。三个实测出来的坑：
+ *
+ *  1. bundle 里 URL 有两套变体，带前缀的 `/PromptCenterService/v1/ops/*` 在这个网关上
+ *     回 **404 APIG.0101（未发布）** —— 只有裸 `/v1/ops/*` 能用；
+ *  2. 只带 `x-auth-token` 会被拒（`APIG.0301 decrypt token fail`）；
+ *  3. **业务失败也回 HTTP 200**，成败只看 body 的 `code`（0 才是成功）。
+ *     今天已领时是 `code:40001 尚未到达权益刷新时间，暂时无法领取`。
+ *
+ * 领的是「活动」而不是额度：`/ops/delivery` 给活动清单（含 campaignId / status /
+ * claimable），`/ops/claim` 按 campaignId 领。`idempotentKey` 上游不返回，官方客户端
+ * 自己生成随机串（与 `x-snap-traceid` 同一个生成器），按天去重落在服务端。
+ */
+const EP_OPS_DELIVERY = '/v1/ops/delivery'
+const EP_OPS_CLAIM = '/v1/ops/claim'
+
+/** 每日签到活动的 type（实测为 campaignId 1，benefitAmount 1000 CREDIT）。 */
+const WELFARE_DAILY_TYPE = 'USER_LOGIN'
+
+/** 上游按钮文案的状态机：这几个都表示「今天已经领过了」。 */
+const WELFARE_ALREADY_STATES = new Set(['CLAIMED', 'CONFIRMED', 'CONSUMED'])
+
+/** 活动状态是不是「今天已经领过了」（区别于「要先登录」「没资格」这些同样不可领的情况）。 */
+export function isWelfareClaimedStatus(status: string): boolean {
+  return WELFARE_ALREADY_STATES.has(status)
+}
+
+/**
+ * 「今日已领」的业务码。
+ *
+ * 这个分支不是冗余的：领取成功后的几十秒里 delivery 有可能还回一份**陈旧**的
+ * `claimable:true / ELIGIBLE`（实测 2026-10-16，领完立刻读会看到），于是会真的
+ * POST 第二次 —— 服务端按天去重回这个码，所以按「已领」处理，不能当失败。
+ */
+const WELFARE_CODE_NOT_YET = 40001
+
+export interface CodeArtsWelfareCampaign {
+  campaignId: number
+  title: string
+  type: string
+  /** 这一条活动给多少福利。 */
+  amount: number
+  /** CREDIT / 其它；只有 CREDIT 才是积分。 */
+  unit: string
+  claimable: boolean
+  /** 上游状态；活动未开始时为 ''。 */
+  status: string
+}
+
+/** 领取结果。UI 按 state 出文案，message 只在上游给了更有用的话时兜底。 */
+export type CodeArtsWelfareState = 'claimed' | 'already' | 'unavailable' | 'failed'
+
+export interface CodeArtsWelfareOutcome {
+  state: CodeArtsWelfareState
+  /** 本次拿到的积分数（只有 claimed 才非 0）。 */
+  amount: number
+  message: string
+}
+
+/** 福利接口的请求：签名 + 官方那套头，返回解析后的 body。 */
+async function welfareRequest(
+  url: string,
+  method: 'GET' | 'POST',
+  credential: CodeArtsResolved,
+  body?: string,
+  signal?: AbortSignal,
+): Promise<
+  | { ok: true; code: number; message: string; data: unknown }
+  | { ok: false; message: string }
+> {
+  const req = new Request(url, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Language': 'zh-cn',
+      'x-snap-traceid': hex32(),
+      'x-auth-token': credential.token,
+      'Agent-Type': 'PromptCenter',
+      'X-Security-Token': credential.securityToken,
+    },
+    ...(body === undefined ? {} : { body }),
+  })
+  const bodyBuf = Buffer.from(body ?? '')
+  if (credential.accessKeyId !== undefined && credential.secretAccessKey !== undefined) {
+    signRequest(req, bodyBuf, {
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey,
+      securityToken: credential.securityToken,
+    })
+  }
+  let resp: Response
+  try {
+    resp = await fetch(req, { signal })
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+  const text = await resp.text().catch(() => '')
+  if (!resp.ok) return { ok: false, message: `HTTP ${resp.status} ${text.slice(0, 200)}` }
+  // 200 + 非 JSON 是 APIG 的错误页，不能当成功。
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return { ok: false, message: `unexpected non-JSON response: ${text.slice(0, 200)}` }
+  }
+  const envelope = asRecord(parsed)
+  return {
+    ok: true,
+    code: typeof envelope.code === 'number' ? envelope.code : -1,
+    message: firstString(envelope.message),
+    data: envelope.data,
+  }
+}
+
+/** 活动清单（`GET /v1/ops/delivery?channel=IDE`）。 */
+export async function fetchWelfareCampaigns(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<CodeArtsWelfareCampaign[]> {
+  const resp = await welfareRequest(
+    `${SNAP_HOST}${EP_OPS_DELIVERY}?channel=IDE`,
+    'GET',
+    credential,
+    undefined,
+    signal,
+  )
+  if (!resp.ok) throw new Error(`welfare delivery: ${resp.message}`)
+  return asArray(asRecord(resp.data).items).flatMap(item => {
+    const raw = asRecord(item)
+    const campaignId = typeof raw.campaignId === 'number' ? raw.campaignId : Number.NaN
+    if (Number.isFinite(campaignId) === false) return []
+    return [{
+      campaignId,
+      title: firstString(raw.title),
+      type: firstString(raw.type),
+      amount: typeof raw.benefitAmount === 'number' ? raw.benefitAmount : 0,
+      unit: firstString(raw.benefitUnit),
+      claimable: raw.claimable === true,
+      status: firstString(raw.status),
+    } satisfies CodeArtsWelfareCampaign]
+  })
+}
+
+/**
+ * 从活动清单里挑「每日签到」那条。
+ *
+ * 同一个 type 理论上可能有多条（上游换活动的时候），优先挑当前可领的那条。
+ */
+export function pickDailyWelfareCampaign(
+  campaigns: readonly CodeArtsWelfareCampaign[],
+): CodeArtsWelfareCampaign | undefined {
+  const daily = campaigns.filter(c => c.type === WELFARE_DAILY_TYPE && c.unit === 'CREDIT')
+  return daily.find(c => c.claimable) ?? daily[0]
+}
+
+/**
+ * 领一次每日签到积分。
+ *
+ * 不抛异常：这是卡片上一个按钮的后续，失败要变成能显示的文案而不是断掉的请求。
+ */
+export async function claimDailyWelfare(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<CodeArtsWelfareOutcome> {
+  if (credential.accessKeyId === undefined || credential.secretAccessKey === undefined) {
+    return { state: 'failed', amount: 0, message: 'no AK/SK to sign' }
+  }
+  let campaigns: CodeArtsWelfareCampaign[]
+  try {
+    campaigns = await fetchWelfareCampaigns(credential, signal)
+  } catch (error) {
+    return {
+      state: 'failed',
+      amount: 0,
+      message: error instanceof Error ? error.message : String(error),
+    }
+  }
+  const target = pickDailyWelfareCampaign(campaigns)
+  if (target === undefined) {
+    return { state: 'unavailable', amount: 0, message: 'no daily check-in campaign' }
+  }
+  if (!target.claimable) {
+    return isWelfareClaimedStatus(target.status)
+      ? { state: 'already', amount: 0, message: '' }
+      : { state: 'unavailable', amount: 0, message: target.status }
+  }
+  const resp = await welfareRequest(
+    `${SNAP_HOST}${EP_OPS_CLAIM}`,
+    'POST',
+    credential,
+    JSON.stringify({
+      campaignId: target.campaignId,
+      idempotentKey: hex32(),
+      channel: 'IDE',
+    }),
+    signal,
+  )
+  if (!resp.ok) return { state: 'failed', amount: 0, message: resp.message }
+  if (resp.code === 0) return { state: 'claimed', amount: target.amount, message: resp.message }
+  return {
+    state: resp.code === WELFARE_CODE_NOT_YET ? 'already' : 'failed',
+    amount: 0,
+    message: resp.message,
+  }
+}
