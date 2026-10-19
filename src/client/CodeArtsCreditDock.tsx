@@ -106,6 +106,10 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
         lineHeight: '18px',
         fontVariantNumeric: 'tabular-nums',
         whiteSpace: 'nowrap',
+        // 这一行是所有插件共用的 flex 行（[data-composer-dock]），别人写 width:100%
+        // 就会来抢我们的份。max-content 是硬下限，flex-shrink:0 是双保险。
+        flex: '0 0 auto',
+        minWidth: 'max-content',
       }}
       title={title}
     >
