@@ -111,8 +111,12 @@ function backup(path) {
  * @param {(json: any) => void} mutate
  * @returns {{changed: boolean, backup?: string}}
  */
-function patchManifest(path, mutate) {
-  if (!existsSync(path)) throw new Error(`manifest 不存在: ${path}`)
+function patchManifest(path, mutate, optional = false) {
+  if (!existsSync(path)) {
+    // 新版 pnpm 不再维护 .package-map.json，宿主也不读它；缺了就是没这一步。
+    if (optional) return { changed: false, missing: true }
+    throw new Error(`manifest 不存在: ${path}`)
+  }
   assertNoBom(path)
   const original = readFileSync(path, 'utf8')
   const before = JSON.parse(original)
@@ -194,8 +198,14 @@ export function deploy(options = {}) {
     json['.'] = json['.'] ?? { dependencies: {} }
     json['.'].dependencies = json['.'].dependencies ?? {}
     json['.'].dependencies[pkgName] = pkgName
-  })
-  log(manifests.packageMap.changed ? '✓ .package-map.json' : '· .package-map.json 无需改动')
+  }, true)
+  log(
+    manifests.packageMap.missing === true
+      ? '· .package-map.json 不存在（新版 pnpm 不再写），跳过'
+      : manifests.packageMap.changed
+        ? '✓ .package-map.json'
+        : '· .package-map.json 无需改动',
+  )
 
   // 4) .modules.yaml 的 hoistedLocations
   manifests.modulesYaml = patchManifest(join(profileDir, 'node_modules', '.modules.yaml'), (json) => {
