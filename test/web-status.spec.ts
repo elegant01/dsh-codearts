@@ -19,6 +19,15 @@ vi.mock('../src/oauth.ts', async importOriginal => {
   return { ...actual, startLogin: startLoginMock }
 })
 
+// 登录成功后 web-status 会立刻问一次上游身份。真实实现是带签名的网络请求
+// （最长等 8s），在 CI 上会拖过 vi.waitFor 默认的 1s 超时，让「迟到的轮询必须
+// 拿到 done」这条回归测试误报成 idle。这里让它立刻返回 null，走「拿不到身份就
+// 退回 token.userId」的既有分支，测试只验证终态记账逻辑。
+vi.mock('../src/upstream.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/upstream.ts')>()
+  return { ...actual, fetchCallerIdentity: vi.fn(async () => null) }
+})
+
 import { CodeArtsAccountStore, credentialFromOAuth } from '../src/auth.ts'
 import {
   CODEARTS_ACCOUNTS_PATH,
