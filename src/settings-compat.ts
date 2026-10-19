@@ -15,8 +15,18 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import * as settingsModule from '@deepseek-ai/dsh-settings'
-import type { SettingsNamespace, SettingsSectionHooks } from '@deepseek-ai/dsh-settings'
+import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
+
+/**
+ * DSH 0.1.x exported this as `SettingsSectionHooks`; 0.2 dropped it along with
+ * `installSection`, keeping only the managed-form generation. Both generations
+ * consume just these two members, so the shape lives here instead.
+ */
+interface SettingsSectionHooksCompat<T> {
+  setSource?(current: () => T): void
+  onChange(): void
+}
 
 type SettingsModuleCompat = {
   settingsNamespace?: (value: string) => SettingsNamespace
@@ -25,7 +35,7 @@ type SettingsModuleCompat = {
     ns: SettingsNamespace,
     schema: z<T>,
     entry: T,
-    hooks: SettingsSectionHooks<T>,
+    hooks: SettingsSectionHooksCompat<T>,
   ) => void
 }
 
@@ -36,7 +46,7 @@ interface SettingsProviderCompat {
     ns: SettingsNamespace,
     schema: z<T>,
     entry: T,
-    hooks: SettingsSectionHooks<T>,
+    hooks: SettingsSectionHooksCompat<T>,
   ) => void
   describe?: () => readonly { ns: SettingsNamespace | string; value?: unknown }[]
 }
@@ -87,7 +97,7 @@ export function installSettingsSectionCompat<T>(
   ns: SettingsNamespace,
   schema: z<T>,
   entry: T,
-  hooks: SettingsSectionHooks<T>,
+  hooks: SettingsSectionHooksCompat<T>,
 ): void {
   const legacyInstaller = compatModule.installSettingsSection
   if (legacyInstaller !== undefined) {
