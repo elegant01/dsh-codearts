@@ -41,7 +41,7 @@ import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CODEARTS_VERSION } from './version.ts'
 
 /** Bumped when a `--json` document changes shape (5: identity backfill). */
-const JSON_SCHEMA_VERSION = 5
+const JSON_SCHEMA_VERSION = 6
 
 type Action = 'doctor' | 'identity' | 'logout' | 'models' | 'status' | 'usage'
 
@@ -59,7 +59,6 @@ interface StatusOut {
   signable: boolean
   /** All stored accounts; requests rotate across them. */
   accounts: readonly CodeArtsAccountSummary[]
-  models: readonly { id: string; name: string }[]
 }
 
 interface DoctorOut {
@@ -113,7 +112,8 @@ async function status(jsonOutput: boolean): Promise<number> {
     signedIn: accounts.length > 0,
     signable: accounts.some(account => account.signable),
     accounts,
-    models: FALLBACK_CODEARTS_MODELS.map(m => ({ id: m.id, name: m.name })),
+    // 目录不在 CLI 侧缓存，也不拿参数表冒充「可用模型」：schemaVersion 6 起这个字段
+    // 整个去掉了，要看上游此刻给了什么，跑 `dsh-codearts models`（它现问一次上游）。
   }
   if (cred !== undefined) {
     if (cred.label !== undefined) out.label = cred.label
@@ -136,16 +136,15 @@ async function status(jsonOutput: boolean): Promise<number> {
   } else {
     process.stdout.write('not signed in (no account stored; sign in from the CodeArts settings card)\n')
   }
-  process.stdout.write(`models (${out.models.length}):\n`)
-  for (const m of out.models) process.stdout.write(`  - ${m.id}  ${m.name}\n`)
+  process.stdout.write('models: CLI 不缓存目录，跑 `dsh-codearts models` 现问上游\n')
   return out.signedIn ? 0 : 1
 }
 
 /**
  * 动态发现当前可用模型（三路：内置 / 限时福利 / agent-center）。
  *
- * 这是排查「模型选择器里没有某个模型」的第一手段：它打印的是上游真实返回，
- * 而不是插件里那份手维护的种子清单。未登录时退回种子清单并说明原因。
+ * 这是排查「模型选择器里没有某个模型」的第一手段：它打印的是上游真实返回。
+ * 未登录时就是没有目录，直接说明原因 —— 不打印手维护的种子清单冒充上游结果。
  */
 async function models(jsonOutput: boolean): Promise<number> {
   const accounts = await store().list()
@@ -156,13 +155,10 @@ async function models(jsonOutput: boolean): Promise<number> {
         version: CODEARTS_VERSION,
         discovered: false,
         reason: 'not signed in',
-        models: FALLBACK_CODEARTS_MODELS.map(m => ({ id: m.id, name: m.name, benefit: isBenefitModel(m.id) })),
+        models: [],
       }, null, 2) + '\n')
     } else {
-      process.stdout.write('not signed in — showing the built-in seed catalog\n')
-      for (const m of FALLBACK_CODEARTS_MODELS) {
-        process.stdout.write(`  - ${m.id}  ${m.name}${isBenefitModel(m.id) ? '  [benefit]' : ''}\n`)
-      }
+      process.stdout.write('not signed in — 没有目录可展示（不会用种子清单冒充上游返回）\n')
     }
     return 1
   }

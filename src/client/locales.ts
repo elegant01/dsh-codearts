@@ -32,7 +32,14 @@ export interface CodeArtsSettingsKey {
   optionalModelsAllHint: string
   selectedCount: string
   selectAll: string
-  free: string
+  benefit: string
+  benefitBlocked: string
+  benefitBlockedHint: string
+  refreshModels: string
+  refreshing: string
+  refreshed: string
+  refreshStale: string
+  refreshFailed: string
   saveModels: string
   saving: string
   saved: string
@@ -110,7 +117,14 @@ export const zh: CodeArtsSettingsKey = {
   optionalModelsAllHint: '所有模型默认都出现在选择器里；取消勾选不想用的即可。',
   selectedCount: '已选 {n} / {total}',
   selectAll: '全选',
-  free: '免费',
+  benefit: '福利',
+  benefitBlocked: '福利今日不可用',
+  benefitBlockedHint: '{n} 个福利模型今天被上游判定没有权益（活动领完或渠道未开），发出去会直接报 benefit not found。',
+  refreshModels: '刷新模型列表',
+  refreshing: '刷新中…',
+  refreshed: '已刷新：{n} 个模型，其中 {benefit} 个走福利路由',
+  refreshStale: '上游没回应，仍是旧名单（{n} 个模型）',
+  refreshFailed: '刷新失败：{message}',
   saveModels: '保存模型选择',
   saving: '保存中…',
   saved: '已保存',
@@ -187,7 +201,14 @@ export const en: CodeArtsSettingsKey = {
   optionalModelsAllHint: 'All models show in the picker by default; uncheck the ones you don’t want.',
   selectedCount: '{n} of {total} selected',
   selectAll: 'Select all',
-  free: 'Free',
+  benefit: 'Benefit',
+  benefitBlocked: 'Benefit unavailable today',
+  benefitBlockedHint: '{n} benefit model(s) were told they have no entitlement today (campaign exhausted or channel not opened); sending to them fails with benefit not found.',
+  refreshModels: 'Refresh models',
+  refreshing: 'Refreshing…',
+  refreshed: 'Refreshed: {n} models, {benefit} on the benefit route',
+  refreshStale: 'Upstream did not answer; still showing the old {n} models',
+  refreshFailed: 'Refresh failed: {message}',
   saveModels: 'Save selection',
   saving: 'Saving…',
   saved: 'Saved',

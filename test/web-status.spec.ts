@@ -29,11 +29,13 @@ vi.mock('../src/upstream.ts', async importOriginal => {
 })
 
 import { CodeArtsAccountStore, credentialFromOAuth } from '../src/auth.ts'
+import { clearBenefitBlocked, isBenefitBlocked, markBenefitBlocked, setDiscoveredBenefitModels } from '../src/catalog.ts'
 import {
   CODEARTS_ACCOUNTS_PATH,
   CODEARTS_CLAIM_PATH,
   CODEARTS_LOGIN_PATH,
   CODEARTS_LOGIN_STATUS_PATH,
+  CODEARTS_REFRESH_MODELS_PATH,
   CODEARTS_STATUS_PATH,
   registerCodeArtsStatusRoute,
   type CodeArtsClaimResult,
@@ -327,6 +329,59 @@ describe('POST /api/codearts/claim', () => {
 
   it('404s when no claim handler is attached', async () => {
     const res = await call(routes.get(CODEARTS_CLAIM_PATH)!, POST, CODEARTS_CLAIM_PATH)
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('POST /api/codearts/refresh-models', () => {
+  afterEach(() => {
+    clearBenefitBlocked()
+    setDiscoveredBenefitModels([])
+  })
+
+  const benefitCatalog = [
+    { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash · x0.00 · 福利', contextWindow: 128_000, maxTokens: 8_000, supportsImages: true },
+    { id: 'GLM-5.2', name: 'GLM-5.2 · x0.70', contextWindow: 128_000, maxTokens: 8_000, supportsImages: true, ratio: '0.7x' },
+  ]
+
+  function refreshHandler(refreshModels?: () => Promise<{ models: number; benefit: number; refreshed: boolean }>): Handler {
+    return mountRoutes({ store, models: () => benefitCatalog, refreshModels }).get(CODEARTS_REFRESH_MODELS_PATH)!
+  }
+
+  // 福利权益缺失是按天记的；用户点刷新就是「上游回来了，别再灰着」。
+  it('clears today\'s benefit-blocked marks and answers with the fresh selection', async () => {
+    setDiscoveredBenefitModels(['glm-5.3-flash'])
+    markBenefitBlocked('glm-5.3-flash')
+    const refreshModels = vi.fn(async () => ({ models: 2, benefit: 1, refreshed: true }))
+    const res = await call(refreshHandler(refreshModels), POST, CODEARTS_REFRESH_MODELS_PATH)
+    expect(refreshModels).toHaveBeenCalledOnce()
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ ok: true, models: 2, benefit: 1, refreshed: true })
+    const choices = (res.body?.selection as { choices: { id: string; benefit?: boolean; blocked?: boolean; ratio?: string }[] }).choices
+    // 福利模型不论上游给的 credit，倍率一律是 x0.00；普通模型照抄上游。
+    expect(choices.find(c => c.id === 'glm-5.3-flash')).toMatchObject({ benefit: true, blocked: false, ratio: 'x0.00' })
+    expect(choices.find(c => c.id === 'GLM-5.2')).toMatchObject({ benefit: false, ratio: 'x0.70' })
+  })
+
+  it('still reports the blocked ones when upstream did not answer', async () => {
+    setDiscoveredBenefitModels(['glm-5.3-flash'])
+    markBenefitBlocked('glm-5.3-flash')
+    const res = await call(refreshHandler(async () => ({ models: 2, benefit: 1, refreshed: false })), POST, CODEARTS_REFRESH_MODELS_PATH)
+    expect(res.status).toBe(200)
+    expect(res.body?.refreshed).toBe(false)
+    expect(isBenefitBlocked('glm-5.3-flash')).toBe(false)
+  })
+
+  it('reports a failing refresh as 500 with the reason', async () => {
+    const res = await call(refreshHandler(async () => {
+      throw new Error('model discovery failed on every source')
+    }), POST, CODEARTS_REFRESH_MODELS_PATH)
+    expect(res.status).toBe(500)
+    expect(res.body?.message).toContain('every source')
+  })
+
+  it('404s when no refresh handler is attached', async () => {
+    const res = await call(routes.get(CODEARTS_REFRESH_MODELS_PATH)!, POST, CODEARTS_REFRESH_MODELS_PATH)
     expect(res.status).toBe(404)
   })
 })

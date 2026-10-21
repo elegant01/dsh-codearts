@@ -1,6 +1,7 @@
 import { request as httpRequest } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createCodeArtsShim, type CodeArtsShim } from '../src/shim.ts'
+import { clearBenefitBlocked, isBenefitBlocked } from '../src/catalog.ts'
 import { resetTokenCeilings } from '../src/upstream.ts'
 
 /**
@@ -271,6 +272,21 @@ describe('end-to-end: legacy cumulative-snapshot protocol', () => {
     const res = await postSse(port, bearer, ASK)
     expect(res.text).toContain('InferHub.001001005.400')
     expect(doneCount(res.text)).toBe(1)
+  })
+
+  // 2026-10-21 实测：账号没有福利权益时上游回 HTTP 200 + 这句流内帧。它既不能重发
+  // 也不能换号（去掉 maas_type 就变成 model is not registered），唯一能做的就是让卡片
+  // 今天别再推这个模型。
+  it('marks the model as benefit-blocked for today when the entitlement is missing', async () => {
+    clearBenefitBlocked()
+    await startShim([
+      'data: {"error_code":"InferHub.4004.200","error_msg":"benefit not found"}\n\n',
+    ])
+    const res = await postSse(port, bearer, { ...ASK, model: 'deepseek-v4.1-flash' })
+    expect(res.text).toContain('benefit not found')
+    expect(isBenefitBlocked('deepseek-v4.1-flash')).toBe(true)
+    expect(isBenefitBlocked('glm-5.2')).toBe(false)
+    clearBenefitBlocked()
   })
 })
 

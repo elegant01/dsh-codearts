@@ -18,6 +18,9 @@ const CAP_BODY = JSON.stringify({
   error_msg: '并发会话数已达上限(3个)，请关闭部分会话后重试。',
 })
 
+/** 模型级 TPM 限流：2026-10-21 实测是 HTTP 200 + 流内 error_code（当天真实码是 81114）。 */
+const TPM_FRAME = 'data: {"error_code":"InferHub.ModelArts.81114.429","error_msg":"Too many requests, the rate limit is 50000000 tokens per minute."}\n\n'
+
 function sseResponse(chunks: readonly string[]): Response {
   const encoder = new TextEncoder()
   const body = new ReadableStream<Uint8Array>({
@@ -102,14 +105,16 @@ function credentialFor(id: string): { token: string; accessKeyId: string; secret
  * `capOnce` 让 A 只被拒第一次、之后放行，用来测单账号的原地重试兜底。
  * 账号 B 永远正常。
  */
-function stubUpstream(options: { capTimes?: number } = {}): void {
+function stubUpstream(options: { capTimes?: number; tpmTimes?: number } = {}): void {
   let aCalls = 0
-  const capTimes = options.capTimes ?? Number.POSITIVE_INFINITY
+  const capTimes = options.capTimes ?? (options.tpmTimes === undefined ? Number.POSITIVE_INFINITY : 0)
+  const tpmTimes = options.tpmTimes ?? 0
   vi.stubGlobal('fetch', vi.fn(async (input: Request) => {
     const token = input.headers.get('x-auth-token') ?? ''
     seenTokens.push(token)
     if (token === TOKEN_A) {
       aCalls += 1
+      if (aCalls <= tpmTimes) return sseResponse([TPM_FRAME])
       if (aCalls <= capTimes) {
         return new Response(CAP_BODY, { status: 400, headers: { 'content-type': 'application/json' } })
       }
@@ -118,7 +123,7 @@ function stubUpstream(options: { capTimes?: number } = {}): void {
   }))
 }
 
-async function start(accountIds: string[], options: { capTimes?: number } = {}): Promise<void> {
+async function start(accountIds: string[], options: { capTimes?: number; tpmTimes?: number } = {}): Promise<void> {
   ids = accountIds
   seenTokens = []
   stubUpstream(options)
@@ -286,5 +291,30 @@ describe('cross-account failover', () => {
     expect(res.text).toContain('来自 B')
     expect(Date.now() - started).toBeGreaterThan(1_000)
     expect(seenTokens.length).toBeGreaterThanOrEqual(2)
+  }, 20_000)
+
+  // 2026-10-21：TPM 限流以流内首帧返回（HTTP 200），以前会被当成正常流原样透传，
+  // 用户只看到一句英文 PI_AI_ERROR。它应当像并发上限一样进入本地排队。
+  it('queues on a first-frame TPM error and then delivers the retry', async () => {
+    // 第一次在主循环里撞 TPM，排队后的第一次重试再撞一次，第三次才放行。
+    await start(['A'], { tpmTimes: 2 })
+    const started = Date.now()
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('来自 B')
+    expect(Date.now() - started).toBeGreaterThan(3_000)
+    expect(seenTokens.length).toBe(3)
+  }, 20_000)
+
+  // TPM 是配额问题，不是账号坏了；排队期间绝不能把它冷却/停用。
+  it('does not cool down an account that hit the TPM limit', async () => {
+    await start(['A'], { tpmTimes: 2 })
+    await post(port, bearer)
+
+    const a = pool.get('A')
+    expect(a?.disabled).toBe(false)
+    expect(a?.coolUntil).toBe(0)
+    expect(pool.healthy('A')).toBe(true)
   }, 20_000)
 })

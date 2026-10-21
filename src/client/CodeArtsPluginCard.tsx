@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Button, Checkbox, Input, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { CodeArtsWebStatus, CodeArtsWebUsage, CodeArtsCreditSnapshot, CodeArtsWelfareState } from '../web-status.ts'
+import { stripModelSuffixes } from '../catalog.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
 export interface CodeArtsPluginCardInjected {
@@ -18,7 +19,10 @@ interface ModelChoice {
   id: string
   name: string
   enabled: boolean
-  free?: boolean
+  benefit?: boolean
+  blocked?: boolean
+  /** 后端已经格式化好的倍率（`x0.18`，福利为 `x0.00`）。 */
+  ratio?: string
 }
 
 interface ModelSelectionDoc {
@@ -27,6 +31,16 @@ interface ModelSelectionDoc {
     restricted: boolean
     writable: boolean
   }
+}
+
+/** POST /api/codearts/refresh-models 的响应（后端契约见 web-status.ts）。 */
+interface RefreshModelsResponse {
+  ok?: boolean
+  models?: number
+  benefit?: number
+  refreshed?: boolean
+  selection?: ModelSelectionDoc['selection']
+  message?: string
 }
 
 function formatStored(ts: number | undefined): string {
@@ -38,11 +52,9 @@ function formatStored(ts: number | undefined): string {
   }
 }
 
-/** 上游给的 name 自带「 (免费)」尾巴，已经用 Tag 表达了就别重复一遍。 */
-const TRAILING_FREE = /\s*[（(]\s*免费\s*[)）]\s*$/
-
+/** 目录里的 name 自带「 · x0.18 · 福利」尾巴，这里已经用 Tag 表达了就别重复。 */
 function modelName(choice: ModelChoice): string {
-  return choice.free === true ? choice.name.replace(TRAILING_FREE, '') : choice.name
+  return stripModelSuffixes(choice.name)
 }
 
 /** 官方用量明细页。 */
@@ -288,6 +300,8 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [savingModels, setSavingModels] = useState(false)
   const [savedModels, setSavedModels] = useState(false)
   const [modelError, setModelError] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
   /** 账号身份是否展开：默认遮蔽（false = 显示 *******）。 */
   const [accountsRevealed, setAccountsRevealed] = useState(false)
   const [claiming, setClaiming] = useState(false)
@@ -400,6 +414,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
 
   // 服务端把「空数组」当作「不加限制 = 全部可用」，所以全选时回写空数组。
   const all = selection?.choices.length ?? 0
+  const blockedCount = selection?.choices.filter(c => c.blocked === true).length ?? 0
   const wire = draft.length === all ? [] : draft
   const savedIds = selection?.choices.filter(c => c.enabled).map(c => c.id) ?? []
   const dirty = savedIds.length !== draft.length || savedIds.some(id => !draft.includes(id))
@@ -431,6 +446,39 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       setModelError(err instanceof Error ? err.message : String(err))
     } finally {
       setSavingModels(false)
+    }
+  }
+
+  /**
+   * 手动重拉一次模型目录。
+   *
+   * 存在的理由：限时福利名单会轮换（模型被移出、被转正），后台每小时才拉一次，
+   * 干等或重启都不是办法。顺带清掉「福利今日不可用」标记 —— 活动回来时这是唯一
+   * 不用等第二天的出口。
+   */
+  async function refreshCatalog(): Promise<void> {
+    setRefreshing(true)
+    setRefreshMsg(null)
+    try {
+      const res = await fetch('/api/codearts/refresh-models', { method: 'POST' })
+      const data = (await res.json().catch(() => null)) as RefreshModelsResponse | null
+      if (!res.ok) throw new Error(data?.message ?? `HTTP ${res.status}`)
+      if (data?.selection !== undefined) {
+        setSelection(data.selection)
+        setDraft(data.selection.choices.filter(c => c.enabled).map(c => c.id))
+        setSavedModels(true)
+      }
+      setRefreshMsg(
+        data?.refreshed === false
+          ? t('refreshStale', { n: data.models ?? 0 })
+          : t('refreshed', { n: data?.models ?? 0, benefit: data?.benefit ?? 0 }),
+      )
+    } catch (err) {
+      setRefreshMsg(t('refreshFailed', {
+        message: err instanceof Error ? err.message : String(err),
+      }))
+    } finally {
+      setRefreshing(false)
     }
   }
 
@@ -647,10 +695,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
             <div className={styles.sectionHead}>
               <span className={styles.sectionLabel}>{t('modelsTitle')}</span>
               <span className={styles.count}>{t('selectedCount', { n: draft.length, total: all })}</span>
+              <Button variant="outline" size="sm" disabled={refreshing} onClick={() => void refreshCatalog()}>
+                {refreshing ? t('refreshing') : t('refreshModels')}
+              </Button>
             </div>
             <p className={styles.hint}>
               {selection.restricted ? t('optionalModelsHint') : t('optionalModelsAllHint')}
             </p>
+            {blockedCount > 0 && <p className={styles.hint}>{t('benefitBlockedHint', { n: blockedCount })}</p>}
             <div className={styles.choices}>
               {selection.choices.map(choice => (
                 <div key={choice.id} className={styles.choiceRow}>
@@ -661,7 +713,12 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     onChange={(on) => setModel(choice.id, on)}
                     label={modelName(choice)}
                   />
-                  {choice.free === true && <Tag tone="success">{t('free')}</Tag>}
+                  {choice.benefit === true && (
+                    <Tag tone={choice.blocked === true ? 'warning' : 'success'}>
+                      {choice.blocked === true ? t('benefitBlocked') : t('benefit')}
+                    </Tag>
+                  )}
+                  {choice.ratio !== undefined && <Tag tone="quiet">{choice.ratio}</Tag>}
                 </div>
               ))}
             </div>

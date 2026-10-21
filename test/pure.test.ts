@@ -1,19 +1,22 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import {
-  BENEFIT_MODELS,
   filterEnabledModels,
   isBenefitModel,
+  setDiscoveredBenefitModels,
   FALLBACK_CODEARTS_MODELS,
 } from '../src/catalog.ts'
 import {
   canonicalModel,
   degradeTokenCeiling,
   estimateTokens,
+  isTpmLimit,
   maxTokensCeilingFor,
   prepareChatBody,
+  rateLimitFrame,
   resetTokenCeilings,
   SNAP_HOST,
   MAX_TOKENS_CEILING,
+  upstreamErrorMessage,
 } from '../src/upstream.ts'
 
 describe('canonicalModel', () => {
@@ -33,16 +36,15 @@ describe('canonicalModel', () => {
 })
 
 describe('isBenefitModel', () => {
-  it('recognises every seeded benefit model regardless of case', () => {
-    for (const id of BENEFIT_MODELS) {
-      expect(isBenefitModel(id)).toBe(true)
-      expect(isBenefitModel(id.toUpperCase())).toBe(true)
-    }
-  })
+  afterEach(() => setDiscoveredBenefitModels([]))
 
-  it('does not classify commercial models as benefit', () => {
+  // 名单只来自 gateway/config 的发现结果，没有静态种子：没发现过就不是福利模型。
+  it('is empty until discovery confirms, and matches case-insensitively after', () => {
+    expect(isBenefitModel('glm-5.3-flash')).toBe(false)
     expect(isBenefitModel('GLM-5.2')).toBe(false)
-    expect(isBenefitModel('Qwen3-VL-235B')).toBe(false)
+    setDiscoveredBenefitModels(['glm-5.3-flash'])
+    expect(isBenefitModel('GLM-5.3-Flash')).toBe(true)
+    expect(isBenefitModel('GLM-5.2')).toBe(false)
   })
 })
 
@@ -264,5 +266,43 @@ describe('degradeTokenCeiling', () => {
     expect([degradeTokenCeiling('GLM-5.2'), degradeTokenCeiling('GLM-5.2'), degradeTokenCeiling('GLM-5.2')])
       .toEqual([32_768, 16_384, 8_192])
     expect(degradeTokenCeiling('GLM-5.2')).toBe(0)
+  })
+})
+
+describe('TPM rate limiting', () => {
+  const tpm = (message = 'The model TPM limit has been significantly exceeded. Please reduce the request rate and retry later.') =>
+    ({ ok: false as const, kind: 'soft_rate' as const, status: 200, message })
+
+  it('recognises the upstream TPM error by code or by message', () => {
+    expect(isTpmLimit(tpm())).toBe(true)
+    expect(isTpmLimit(tpm('InferHub.ModelArts.81111.429: too many tokens'))).toBe(true)
+    // 同一天另一个实测形状：码是 81114，报文里根本没有 "TPM limit" 这个词。
+    expect(isTpmLimit(tpm('InferHub.ModelArts.81114.429: Too many requests, the rate limit is 50000000 tokens per minute.')))
+      .toBe(true)
+    expect(isTpmLimit({ ok: false, kind: 'soft_rate', status: 429, message: 'session expired' })).toBe(false)
+    expect(isTpmLimit({ ok: true, stream: new ReadableStream() })).toBe(false)
+  })
+
+  // 首帧限流帧有两种形状：chatStream 已转换过的 OpenAI error 帧，
+  // 以及上游原始 error_code 帧。两种都得认出来，否则排队逻辑永远不触发。
+  it('detects a first-frame rate error in both frame shapes', () => {
+    const openai = 'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}],"error":{"code":"InferHub.ModelArts.81111.429","message":"The model TPM limit has been significantly exceeded."}}\n\n'
+    const legacy = 'data: {"error_code":"InferHub.ModelArts.81114.429","error_msg":"Too many requests, the rate limit is 50000000 tokens per minute."}\n\n'
+    expect(rateLimitFrame(openai)?.code).toBe('InferHub.ModelArts.81111.429')
+    expect(rateLimitFrame(legacy)?.code).toBe('InferHub.ModelArts.81114.429')
+    expect(rateLimitFrame('data: {"choices":[{"delta":{"content":"你好"}}]}\n\n')).toBeUndefined()
+  })
+
+  // 用户看到的必须是「不是你的错、可以怎么办」，而不是英文错误码。
+  it('explains known upstream failures in Chinese', () => {
+    expect(upstreamErrorMessage('InferHub.ModelArts.81111.429: The model TPM limit has been significantly exceeded.'))
+      .toContain('不是你的账号或插件问题')
+    expect(upstreamErrorMessage('InferHub.ModelArts.81114.429: Too many requests, the rate limit is 50000000 tokens per minute.'))
+      .toContain('不是你的账号或插件问题')
+    expect(upstreamErrorMessage('TM.00001041: 并发会话数已达上限(3个)'))
+      .toContain('3 个会话')
+    expect(upstreamErrorMessage('InferHub.4004.200: benefit not found'))
+      .toContain('限时福利')
+    expect(upstreamErrorMessage('weird failure', 500)).toContain('weird failure')
   })
 })

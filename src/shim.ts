@@ -26,8 +26,12 @@ import {
   degradeTokenCeiling,
   isConcurrencyCap,
   isParamInvalidFrame,
+  isQueueableRate,
+  isTpmLimit,
   maxTokensCeilingFor,
   prepareChatBody,
+  rateLimitFrame,
+  upstreamErrorMessage,
   type ChatResult,
   type CodeArtsResolved,
   type PreparedChatBody,
@@ -126,26 +130,6 @@ const ERROR_COOLDOWN_MS = 60_000
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
-/**
- * 在**同一个账号**上重发，直到不再撞上限或预算耗尽。
- *
- * 只在没有别的账号可选时使用 —— 等 52s 是最后手段，能换号就换号。
- * 命中上限不甩给 pi-ai：429 会被重试 5 次，每次再去要一个会话，越试越满。
- */
-async function openStream(
-  credential: CodeArtsResolved,
-  prepared: { url: string; body: string; model: string; chatId?: string },
-  signal: AbortSignal,
-): Promise<ChatResult> {
-  const until = Date.now() + CAP_WAIT_LIMIT
-  for (;;) {
-    const result = await chatStream(credential, prepared, signal)
-    if (result.ok) return result
-    const worthWaiting = isConcurrencyCap(result) && !signal.aborted && Date.now() + CAP_RETRY_GAP <= until
-    if (!worthWaiting) return result
-    await sleep(CAP_RETRY_GAP)
-  }
-}
 
 export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   const { store, catalog } = options
@@ -263,6 +247,16 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       const reader = result.stream.getReader()
       const first = await reader.read()
       const head = first.done ? undefined : first.value
+      // 首帧就是限流错误（TPM 实测是 HTTP 200 + 流内 error_code）：此时一个字都没
+      // 吐出来，重发是安全的。必须在这里降级成真正的请求失败，交给下面的排队逻辑；
+      // 否则错误会被当成正常流转发，DSH 侧只看到一句英文 PI_AI_ERROR。
+      const rate = head === undefined ? undefined : rateLimitFrame(new TextDecoder().decode(head))
+      if (rate !== undefined) {
+        reader.releaseLock()
+        await result.stream.cancel().catch(() => {})
+        logger?.warn(`dsh-codearts: ${prepared.model} 首帧被判限流（${rate.code}），进入本地排队`)
+        return { prepared, result: { ok: false, kind: 'soft_rate', status: 429, message: `${rate.code}: ${rate.message}` } }
+      }
       const shouldHeal = heal < MAX_CEILING_HEALS && head !== undefined && isParamInvalidFrame(new TextDecoder().decode(head))
       reader.releaseLock()
       if (!shouldHeal) return { prepared, result, head }
@@ -271,6 +265,36 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         return { prepared, result: { ok: false, kind: 'client', status: 400, message: `${prepared.model}: max_tokens 已降到下限仍被判参数非法` } }
       }
       logger?.warn(`dsh-codearts: ${prepared.model} 被判参数非法，max_tokens 降档到 ${maxTokensCeilingFor(prepared.model)} 后重发`)
+    }
+  }
+
+  /**
+   * 在**同一个账号**上重发，直到不再被限流或预算耗尽。
+   *
+   * 并发槽位是账号级的：有别的号就该换号，等 52s 是最后手段。
+   * TPM 是模型级配额：换号只是换个账号撞同一堵墙，只能原地等窗口滑过去 ——
+   * 间隔逐次翻倍（3s → 6s → 12s → 24s，封顶 30s），避免在配额已经满的时候
+   * 把重试本身也打成一波流量。
+   *
+   * 命中限流不甩给 pi-ai：429 会被重试 5 次，每次再撞一次限流，越试越满。
+   */
+  async function openStream(
+    credential: CodeArtsResolved,
+    raw: string,
+    contextWindow: number,
+    signal: AbortSignal,
+  ): Promise<{ prepared: PreparedChatBody; result: ChatResult; head?: Uint8Array; waitedMs: number }> {
+    const started = Date.now()
+    const until = started + CAP_WAIT_LIMIT
+    let gap = CAP_RETRY_GAP
+    for (;;) {
+      const opened = await openWithCeilingHeal(credential, raw, contextWindow, signal)
+      const waitedMs = Date.now() - started
+      if (opened.result.ok || signal.aborted) return { ...opened, waitedMs }
+      if (!isQueueableRate(opened.result)) return { ...opened, waitedMs }
+      if (isTpmLimit(opened.result)) gap = Math.min(gap * 2, 30_000)
+      if (Date.now() + gap > until) return { ...opened, waitedMs }
+      await sleep(gap)
     }
   }
 
@@ -335,6 +359,8 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     // 而不是让用户干等 —— 这正是「打断后重新提问」卡住的根因。
     const tried = new Set<string>()
     let cappedAccount: string | undefined
+    let tpmAccount: string | undefined
+    let queueWaitedMs = 0
     let lastKind: UpstreamErrorKind | undefined
     let lastStatus = 0
     let lastMessage = ''
@@ -375,6 +401,12 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           cappedAccount = id
           continue
         }
+        if (isTpmLimit(result)) {
+          // TPM 是模型级配额，换号也只是换个账号去撞同一堵墙；原地排队等窗口。
+          // 账号本身完全健康，不要标记 capped/冷却。
+          tpmAccount = id
+          break
+        }
         if (result.kind === 'session_dead') {
           // 凭据失效，这个号得重新登录了，换下一个。
           pool.disable(id, result.message)
@@ -394,25 +426,27 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
 
     if (controller.signal.aborted) return
 
-    // 所有账号都撞在上限上：回到单账号时代的做法 —— 挑一个号原地排队等槽位释放。
+    // 所有账号都撞在上限上：回到单账号时代的做法 —— 挑一个号原地排队等限流解除。
     // 多账号时走不到这里；单账号时这是唯一的兜底。
-    if (cappedAccount !== undefined) {
-      if (pool.acquire(cappedAccount)) {
+    const queueAccount = cappedAccount ?? tpmAccount
+    if (queueAccount !== undefined) {
+      if (pool.acquire(queueAccount)) {
         // 上限降档在主循环里已经跑过（learned 表是进程内共享的），这里不再重跑，
         // 只沿用排队等槽位的兜底。
-        const prepared = prepareChatBody(raw, contextWindow)
         try {
-          const credential = await store.resolve(cappedAccount)
+          const credential = await store.resolve(queueAccount)
           if (credential !== undefined) {
-            const result = await openStream(credential, prepared, controller.signal)
+            const opened = await openStream(credential, raw, contextWindow, controller.signal)
+            const { result } = opened
+            queueWaitedMs = opened.waitedMs
             // 同上：客户端主动中止不算账号故障，不要拿它去回写池状态。
             if (controller.signal.aborted) {
               if (result.ok) await result.stream.cancel().catch(() => {})
               return
             }
             if (result.ok) {
-              pool.noteSuccess(cappedAccount)
-              await pipeToResponse(res, result.stream, controller.signal, { accountId: cappedAccount, model: prepared.model })
+              pool.noteSuccess(queueAccount)
+              await pipeToResponse(res, result.stream, controller.signal, { accountId: queueAccount, model: opened.prepared.model }, opened.head)
               return
             }
             lastKind = result.kind
@@ -420,7 +454,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             lastMessage = result.message
           }
         } finally {
-          pool.release(cappedAccount)
+          pool.release(queueAccount)
         }
       }
     }
@@ -429,12 +463,10 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       writeOpenAIError(res, 429, 'soft_rate', 'codearts 当前没有可用账号（全部被禁用或冷却中），请稍后重试')
       return
     }
-    writeOpenAIError(
-      res,
-      KIND_STATUS[lastKind],
-      lastKind,
-      `codearts upstream ${lastKind} (http ${lastStatus}): ${lastMessage.slice(0, 400)}`,
-    )
+    // 排队等过就明说等过多久：否则用户不知道插件已经努力过，只会觉得「又失败了」。
+    const explanation = upstreamErrorMessage(lastMessage, lastStatus)
+    const waited = queueWaitedMs >= 1_000 ? `（本地已排队重试 ${Math.round(queueWaitedMs / 1000)} 秒）` : ''
+    writeOpenAIError(res, KIND_STATUS[lastKind], lastKind, `${explanation}${waited}`)
   }
 
   /**

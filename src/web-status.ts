@@ -21,7 +21,13 @@ import type { UsageSnapshot, UsageTotals } from './usage.ts'
 // 否则 client 侧只能越过本模块去直引 credits.ts。
 export type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
-import { filterEnabledModels, isBenefitModel } from './catalog.ts'
+import {
+  clearBenefitBlocked,
+  creditRatioLabel,
+  filterEnabledModels,
+  isBenefitBlocked,
+  isBenefitModel,
+} from './catalog.ts'
 import { fetchCallerIdentity, type CallerIdentity, type CodeArtsWelfareState } from './upstream.ts'
 import { startLogin, type LoginSession, type OAuthToken } from './oauth.ts'
 // 领取结果里的 state 也是卡片要认的契约，同上不外露 upstream 模块。
@@ -41,18 +47,24 @@ export const CODEARTS_LOGIN_STATUS_PATH = '/api/codearts/login/status'
 export const CODEARTS_ACCOUNTS_PATH = '/api/codearts/accounts'
 /** POST /api/codearts/claim — 领一次福利中心的每日签到积分（幂等由上游按天去重）。 */
 export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
+/** POST /api/codearts/refresh-models — 立刻重拉一次模型目录，并清掉「福利今日不可用」标记。 */
+export const CODEARTS_REFRESH_MODELS_PATH = '/api/codearts/refresh-models'
 
 /** 勾选 UI 的一个选项。 */
 export interface CodeArtsModelChoice {
   id: string
   name: string
-  /** 限时福利（免费）模型。 */
-  free?: boolean
+  /** 走限时福利路由的模型（不是「免费随便用」，是单独的福利权益）。 */
+  benefit?: boolean
+  /** 福利今天被上游判定缺失（InferHub.4004.200），卡片据此置灰。 */
+  blocked?: boolean
+  /** 已格式化的积分倍率（`x0.18`；福利恒为 `x0.00`，上游没给倍率时缺省）。 */
+  ratio?: string
 }
 
 /** enabled-models 路由返回的 selection 文档（与 codebuddy 的 shape 对齐）。 */
 export interface CodeArtsModelSelection {
-  choices: { id: string; name: string; enabled: boolean; free?: boolean }[]
+  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string }[]
   /** 已选子集是否小于全集（卡片据此显示不同提示）。 */
   restricted: boolean
   /** 是否可写（无 settings provider 时为 false，卡片只读）。 */
@@ -63,7 +75,7 @@ export interface CodeArtsModelSelection {
  * 由完整目录 + 已存 enabled 计算 selection。
  * - enabled 为空/未存 => 全部勾选（restricted=false）
  * - enabled 为非空列表 => 仅勾选其中的（restricted=true），缺的按未勾选
- * 福利模型用 catalog 的 benefit 标记（这里靠 model.free 字段，由调用方注入）。
+ * 福利模型用 catalog 的 benefit 标记（这里靠 model.benefit 字段，由调用方注入）。
  */
 export function selectionOf(
   models: readonly CodeArtsModelChoice[],
@@ -75,10 +87,27 @@ export function selectionOf(
   const choices = models.map(m => ({
     id: m.id,
     name: m.name,
-    free: m.free,
+    benefit: m.benefit,
+    blocked: m.blocked,
+    ratio: m.ratio,
     enabled: restricted ? allowed.has(m.id) : true,
   }))
   return { choices, restricted, writable }
+}
+
+/** 目录 -> 勾选 UI 的选项（福利标记、今日不可用标记与倍率都在这里算）。 */
+function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
+  return deps.models().map(m => {
+    const benefit = isBenefitModel(m.id)
+    const ratio = creditRatioLabel(m.ratio, benefit)
+    return {
+      id: m.id,
+      name: m.name,
+      benefit,
+      blocked: isBenefitBlocked(m.id),
+      ...(ratio === undefined ? {} : { ratio }),
+    }
+  })
 }
 
 /**
@@ -170,6 +199,13 @@ export interface CodeArtsStatusRouteOptions {
    * 卡片已经不再拿它当「领取积分」用，这个路由留给需要手动补开通福利的场景。
    */
   claim?: () => Promise<CodeArtsClaimResult>
+  /**
+   * 立刻重拉一次模型目录（不等每小时那一次）。
+   *
+   * 存在的理由：限时福利名单会变（模型被移出/转正），而唯一权威来源 `gateway/config`
+   * 只在发现流程里拉。上游轮换后，用户需要一个立刻见效的出口。
+   */
+  refreshModels?: () => Promise<{ models: number; benefit: number; refreshed: boolean }>
   /**
    * Persist a new allowlist. Resolves false when no settings provider is
    * attached, which the card renders as a read-only selection.
@@ -371,7 +407,7 @@ function modelsSelectionHandler(deps: CodeArtsStatusRouteOptions) {
       return
     }
     if (req.method === 'GET') {
-      const all = deps.models().map(m => ({ id: m.id, name: m.name, free: isBenefitModel(m.id) }))
+      const all = choicesOf(deps)
       const writable = deps.setEnabledModels !== undefined
       const selection = selectionOf(all, deps.enabledModels?.(), writable)
       json(res, 200, { selection })
@@ -398,7 +434,7 @@ function modelsSelectionHandler(deps: CodeArtsStatusRouteOptions) {
           json(res, 403, { error: 'selection-not-writable' })
           return
         }
-        const all = deps.models().map(m => ({ id: m.id, name: m.name, free: isBenefitModel(m.id) }))
+        const all = choicesOf(deps)
         const selection = selectionOf(all, deps.enabledModels?.(), true)
         json(res, 200, { selection })
       } catch (error: unknown) {
@@ -527,6 +563,41 @@ function claimHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/**
+ * POST /api/codearts/refresh-models — 立刻重拉目录，并清掉「福利今日不可用」标记。
+ *
+ * 清标记放在拉目录**之前**：福利回来时这是唯一的自救出口，不能让用户等到明天。
+ * 代价是「今天确实领完了」的那种缺失也会被一并清掉，再点一次就重新记上。
+ */
+function refreshModelsHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    if (deps.refreshModels === undefined) {
+      json(res, 404, { error: 'refresh not available' })
+      return
+    }
+    try {
+      clearBenefitBlocked()
+      const counted = await deps.refreshModels()
+      const selection = selectionOf(
+        choicesOf(deps),
+        deps.enabledModels?.(),
+        deps.setEnabledModels !== undefined,
+      )
+      json(res, 200, { ok: true, ...counted, selection })
+    } catch (error: unknown) {
+      json(res, 500, { ok: false, message: safeMessage(error) })
+    }
+  }
+}
+
 /** Mount the status / models / token routes. */
 export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRouteOptions): void {
   ctx.effect(() => {
@@ -576,6 +647,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_CLAIM_PATH,
       handler: claimHandler(deps),
     })
+    const disposeRefresh = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_REFRESH_MODELS_PATH,
+      handler: refreshModelsHandler(deps),
+    })
     return () => {
       disposeStatus()
       disposeModels()
@@ -585,6 +661,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeLoginStatus()
       disposeAccounts()
       disposeClaim()
+      disposeRefresh()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()
     }

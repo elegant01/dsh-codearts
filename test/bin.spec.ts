@@ -100,11 +100,12 @@ describe('status', () => {
   it('emits a machine-readable document with --json', async () => {
     await seed()
     const res = await cli(home, ['status', '--json'])
-    const doc = JSON.parse(res.stdout) as { signedIn: boolean; signable: boolean; schemaVersion: number; models: unknown[] }
+    const doc = JSON.parse(res.stdout) as { signedIn: boolean; signable: boolean; schemaVersion: number; models?: unknown[] }
     expect(doc.signedIn).toBe(true)
     expect(doc.signable).toBe(true)
-    expect(doc.schemaVersion).toBe(5)
-    expect(doc.models.length).toBeGreaterThan(0)
+    expect(doc.schemaVersion).toBe(6)
+    // schemaVersion 6 起没有 models：CLI 不缓存目录，也不拿参数表冒充上游给的模型。
+    expect(doc.models).toBeUndefined()
   })
 
   it('flags a pasted-token credential as not signable', async () => {
@@ -115,7 +116,7 @@ describe('status', () => {
 
   it('defaults to the status action when no action is given', async () => {
     const res = await cli(home, [])
-    expect(res.stdout).toContain('models (')
+    expect(res.stdout).toContain('CLI 不缓存目录')
   })
 })
 
@@ -192,24 +193,23 @@ describe('argument handling', () => {
   })
 })
 
-// 已登录的 `models` 会真的去问上游，所以这里只覆盖离线分支（未登录退回种子清单）；
+// 已登录的 `models` 会真的去问上游，所以这里只覆盖离线分支（未登录就是没有目录）；
 // 三路解析与合并由 test/models.spec.ts 打桩 fetch 覆盖。
 describe('models', () => {
-  it('falls back to the seed catalog when signed out', async () => {
+  it('shows nothing when signed out instead of a hand-maintained list', async () => {
     const res = await cli(home, ['models'])
     expect(res.code).toBe(1)
     expect(res.stdout).toContain('not signed in')
-    expect(res.stdout).toContain('GLM-5.2')
-    expect(res.stdout).toContain('[benefit]')
+    expect(res.stdout).not.toContain('GLM-5.2')
   })
 
-  it('reports the fallback reason in JSON', async () => {
+  it('reports the empty reason in JSON', async () => {
     const res = await cli(home, ['models', '--json'])
     const doc = JSON.parse(res.stdout) as { discovered: boolean; reason: string; models: unknown[]; schemaVersion: number }
     expect(doc.discovered).toBe(false)
     expect(doc.reason).toBe('not signed in')
-    expect(doc.schemaVersion).toBe(5)
-    expect(doc.models.length).toBeGreaterThan(0)
+    expect(doc.schemaVersion).toBe(6)
+    expect(doc.models).toEqual([])
   })
 })
 
@@ -233,7 +233,7 @@ describe('usage', () => {
     expect(doc.today.requests).toBe(0)
     expect(doc.allTime.requests).toBe(0)
     expect(doc.days).toBe(0)
-    expect(doc.schemaVersion).toBe(5)
+    expect(doc.schemaVersion).toBe(6)
   })
 })
 

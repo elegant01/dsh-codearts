@@ -29,7 +29,7 @@ import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { CodeArtsAccountStore, codeartsAccountsPath } from './auth.ts'
 import { CodeArtsAccountPool } from './account-pool.ts'
-import { CodeArtsCatalog, filterEnabledModels } from './catalog.ts'
+import { CodeArtsCatalog, filterEnabledModels, isBenefitModel } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
 import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CodeArtsCreditCache, type CodeArtsCreditState } from './credits.ts'
@@ -184,6 +184,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
 
   // Same-origin status/token routes backing the Plugin-configuration card.
   // 卡片另外读账号池的槽位占用与用量账本：这两个都是本机事实，不涉及令牌。
+  /** 手动「刷新模型列表」的预算：三路来源各打一次，比每小时的后台刷新更该给足时间。 */
+  const MANUAL_REFRESH_MS = 60_000
   ctx.inject(['webServer'], webCtx => registerCodeArtsStatusRoute(webCtx, {
     store,
     models: () => catalog.current(),
@@ -230,6 +232,15 @@ export function apply(ctx: Context, rawConfig: Config): void {
           amount: 0,
           message: error instanceof Error ? error.message : String(error),
         }
+      }
+    },
+    refreshModels: async () => {
+      const outcome = await refreshCatalog(store, catalog, AbortSignal.timeout(MANUAL_REFRESH_MS))
+      const models = catalog.current()
+      return {
+        models: models.length,
+        benefit: models.filter(model => isBenefitModel(model.id)).length,
+        refreshed: outcome?.anySucceeded === true,
       }
     },
   }))

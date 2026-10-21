@@ -14,8 +14,9 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { signRequest, type SignCredential } from './signer.ts'
 import {
-  fillFromSeed,
+  backfillParams,
   isBenefitModel,
+  markBenefitBlocked,
   mergeModelLists,
   type CodeArtsModelInfo,
 } from './catalog.ts'
@@ -363,6 +364,96 @@ export function isConcurrencyCap(result: ChatResult): boolean {
   return !result.ok && result.message.includes(CONCURRENCY_CAP_CODE)
 }
 
+/**
+ * 模型级 TPM（tokens per minute）配额超限。2026-10-21 实测：它和并发上限不同，
+ * 是**流内首帧**（HTTP 200）回的，所以照样绕过了 classify；换号也没用（配额按
+ * 模型共享），能做的只有本地排队等窗口滑过去。
+ *
+ * 上游的码并不固定：同一小时内见过 `InferHub.ModelArts.81111.429`（"The model TPM
+ * limit has been significantly exceeded."）和 `InferHub.ModelArts.81114.429`
+ * （"Too many requests, the rate limit is 50000000 tokens per minute."）。所以按
+ * 形状认（ModelArts.*.429）而不是按某一个常量认。
+ */
+export const TPM_LIMIT_CODE = 'InferHub.ModelArts.81111.429'
+
+const MODEL_RATE_CODE = /InferHub\.ModelArts\.\d+\.429/
+const MODEL_RATE_TEXT = /tpm limit|rate limit|too many requests/i
+
+export function isTpmLimit(result: ChatResult): boolean {
+  if (result.ok) return false
+  return MODEL_RATE_CODE.test(result.message) || MODEL_RATE_TEXT.test(result.message)
+}
+
+/** 撞到这两类限流都值得原地等，而不是直接甩给 pi-ai 重试。 */
+export function isQueueableRate(result: ChatResult): boolean {
+  return isConcurrencyCap(result) || isTpmLimit(result)
+}
+
+/**
+ * 从一帧已转成 OpenAI 形状的 SSE 里认出「可排队限流」。
+ *
+ * 只在**还没有任何内容产出**的首帧上使用：此时重发是安全的；一旦下游已经收到
+ * 字节，HTTP 头也发出去了，就只能把错误帧原样交出去。
+ */
+export function rateLimitFrame(text: string): { code: string; message: string } | undefined {
+  if (!text.includes('error')) return undefined
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const payload = trimmed.slice(5).trim()
+    if (payload === '' || payload === '[DONE]') continue
+    let ev: { error?: { code?: unknown; message?: unknown }; error_code?: unknown; error_msg?: unknown }
+    try {
+      ev = JSON.parse(payload) as typeof ev
+    } catch {
+      continue
+    }
+    const code = String(ev.error?.code ?? ev.error_code ?? '')
+    const message = String(ev.error?.message ?? ev.error_msg ?? '')
+    const probe: ChatResult = { ok: false, kind: 'soft_rate', status: 429, message: `${code}: ${message}` }
+    if (code === CONCURRENCY_CAP_CODE || isTpmLimit(probe)) {
+      return { code: code === '' ? TPM_LIMIT_CODE : code, message }
+    }
+  }
+  return undefined
+}
+
+/**
+ * 把上游错误翻译成用户能看懂的一句话。
+ *
+ * 这些错误都发生在「账号、插件都正常」的时候 —— 原样把英文码甩给用户，只会
+ * 让人以为是自己配错了。默认分支仍保留原始信息，便于排查。
+ */
+export function upstreamErrorMessage(message: string, status = 0): string {
+  if (MODEL_RATE_CODE.test(message) || MODEL_RATE_TEXT.test(message)) {
+    return '华为侧该模型当前请求过多（共享 TPM 超限），不是你的账号或插件问题。稍后重试，或临时改用 GLM-5.2 / GLM-5.3。'
+  }
+  if (message.includes(CONCURRENCY_CAP_CODE)) {
+    return 'CodeArts 免费档同时只允许 3 个会话，当前槽位一直占满（被打断的会话约 1 分钟才释放）。请稍后重试。'
+  }
+  if (isBenefitMissing('', message)) {
+    return '这个模型属于限时福利，当前福利通道不可用（不是账号问题）。可以刷新模型列表，改用非福利模型。'
+  }
+  if (message.toLowerCase().includes('model is not registered')) {
+    return '上游没有注册这个模型，它可能已经下线；请刷新模型列表后重选。'
+  }
+  return `codearts 上游错误 (http ${status}): ${message.slice(0, 400)}`
+}
+
+/**
+ * 「这个账号当前没有该模型的限时福利权益」。2026-10-21 实测：上游回 HTTP 200，
+ * 错误在**流内帧**里（不在状态码上），所以它既不走 retry 也不走换号，用户看到的
+ * 就是正文里裸裸一句 `benefit not found`。
+ *
+ * 这条不是请求写错了，重发也不会好：福利模型只有福利路由，去掉 `maas_type: benefit`
+ * 就变成 InferHub.002002009.404 model is not registered。唯一出路是等活动回来。
+ */
+export const BENEFIT_MISSING_CODE = 'InferHub.4004.200'
+
+export function isBenefitMissing(code: string, message: string): boolean {
+  return code === BENEFIT_MISSING_CODE || message.toLowerCase().includes('benefit not found')
+}
+
 function classify(status: number, message: string): UpstreamErrorKind {
   const m = message.toLowerCase()
   if (status === 401 || status === 403) return 'session_dead'
@@ -452,6 +543,7 @@ export async function chatStream(
   }
   if (!resp.ok) {
     const text = await resp.text().catch(() => '')
+    if (isBenefitMissing('', text)) markBenefitBlocked(prepared.model)
     return { ok: false, kind: classify(resp.status, text), status: resp.status, message: text.slice(0, 400) }
   }
 
@@ -513,6 +605,9 @@ export async function chatStream(
               continue
             }
             if (ev.error_code && ev.error_code !== '0' && ev.error_code !== 0) {
+              // 福利权益缺失要落到目录状态里：卡片得把这条模型标成「今日不可用」，
+              // 而不是让用户对着裸的 "benefit not found" 猜是自己哪里配错了。
+              if (isBenefitMissing(String(ev.error_code), String(ev.error_msg ?? ''))) markBenefitBlocked(model)
               controller.enqueue(
                 openAIData({
                   choices: [{ delta: { content: '' }, finish_reason: 'stop' }],
@@ -686,6 +781,25 @@ function asArray(value: unknown): unknown[] {
 }
 
 /**
+ * 从 `credit[]` 里取常规时段的展示倍率（原样 `0.18x`）。
+ *
+ * 上游给每个时段一条（`default` / `off_peak`，实测 2026-10-21）。这里只取
+ * `default`：尖峰价才是用户平时付的，低峰 0.09x 属于额外优惠，拿来当标题会低估。
+ * 没有 credit 的模型（如 Qwen3-VL）返回 undefined —— 界面上就不显示倍率。
+ */
+function creditRatioOf(record: Record<string, unknown>): string | undefined {
+  const credits = asArray(record.credit).map(asRecord)
+  if (credits.length === 0) return undefined
+  const pick =
+    credits.find(entry => entry.time_slot_id === 'default') ??
+    credits.find(entry => entry.time_slot_id === null || entry.time_slot_id === undefined) ??
+    credits[0]
+  if (pick === undefined) return undefined
+  const match = /^\s*(\d+(?:\.\d+)?)\s*x\s*$/i.exec(firstString(pick.ratio_display))
+  return match === null ? undefined : `${match[1]}x`
+}
+
+/**
  * 内置模型：`GET /v1/model/builtin`（`Agent-Type: PromptCenter`）。
  * 实测响应 `{ count, builtinModels: [{ model_id, model_name, model_desc,
  * enable, display_enabled, supports_images, ... }] }` —— 注意它**不带**
@@ -704,12 +818,14 @@ async function fetchBuiltinModels(
     if (model.enable === false) continue
     const id = firstString(model.model_id, model.model_name)
     if (id === '') continue
+    const ratio = creditRatioOf(model)
     out.push({
       id,
       name: firstString(model.model_name, id),
       contextWindow: positive(model.context_window),
       maxTokens: positive(model.max_tokens),
       supportsImages: model.supports_images === true,
+      ...(ratio === undefined ? {} : { ratio }),
     })
   }
   return out
@@ -736,12 +852,15 @@ async function fetchBenefitModels(
     const model = asRecord(raw)
     const id = firstString(model.model_id, model.model_name)
     if (id === '') continue
+    // 福利模型的上游 credit 照样记下（展示层强制 x0.00），别把原始事实丢掉。
+    const ratio = creditRatioOf(model)
     out.push({
       id,
       name: firstString(model.model_name, id),
       contextWindow: positive(model.context_window),
       maxTokens: positive(model.max_tokens),
       supportsImages: model.supports_images === true,
+      ...(ratio === undefined ? {} : { ratio }),
       benefit: true,
     })
   }
@@ -806,12 +925,15 @@ async function fetchAgentModels(
     // 聊天按注册名路由，取错就会多出一个根本不存在的模型条目（且选它必然 404）。
     const id = firstString(params.model_id, model.model_id, model.model_alias, model.model_name)
     if (id === '') continue
+    // 实测 credit 挂在条目顶层；params 里也试一把，免得上游换位置就整列消失。
+    const ratio = creditRatioOf(model) ?? creditRatioOf(params)
     out.push({
       id,
       name: firstString(model.model_name, model.model_alias, id),
       contextWindow: positive(params.context_window),
       maxTokens: positive(params.max_tokens),
       supportsImages: model.supports_images === true,
+      ...(ratio === undefined ? {} : { ratio }),
     })
   }
   return out
@@ -865,9 +987,9 @@ export async function fetchModels(
     throw new Error(`model discovery failed on every source: ${errors.map(e => `${e.source}: ${e.message}`).join('; ')}`)
   }
 
-  // 种子只用来补缺（补发现结果里缺席的模型、补齐为 0 的参数），不参与竞争 ——
-  // 否则种子里的占位参数会压过上游返回的真实值（见 fillFromSeed 的注释）。
-  const merged = fillFromSeed(mergeModelLists(discovered))
+  // 参数表只补齐为 0 的字段，不往目录里塞上游没给的模型，也不参与竞争 ——
+  // 否则表里的占位参数会压过上游返回的真实值（见 backfillParams 的注释）。
+  const merged = backfillParams(mergeModelLists(discovered))
   if (merged.length === 0) throw new Error('model discovery returned an empty catalog')
 
   const models = merged.map(model => ({
