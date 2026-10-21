@@ -76,10 +76,18 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
         })
         if (!res.ok) return
         const data = (await res.json().catch(() => undefined)) as CodeArtsWebStatus | undefined
-        if (data === undefined || data.credits === undefined) return
+        if (data === undefined) return
+        // 多账号时把各号余额加在一起：底部条只表达「这台机器上还能用多少」。
+        const snapshots = (data.creditsByAccount ?? [])
+          .map(entry => entry.credits)
+          .filter((value): value is NonNullable<typeof value> => value !== undefined)
+        const pool = snapshots.length > 0
+          ? snapshots
+          : data.credits === undefined ? [] : [data.credits]
+        if (pool.length === 0) return
         if (mounted.current) {
-          setRemain(Math.round(data.credits.credits.total.remain))
-          setTotal(Math.round(data.credits.credits.total.total))
+          setRemain(Math.round(pool.reduce((sum, item) => sum + item.credits.total.remain, 0)))
+          setTotal(Math.round(pool.reduce((sum, item) => sum + item.credits.total.total, 0)))
         }
       } catch {
         // 积分是锦上添花，拉不到就别显示 —— 别在对话底部弹错误打扰用户。

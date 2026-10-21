@@ -32,10 +32,11 @@ import { CodeArtsAccountPool } from './account-pool.ts'
 import { CodeArtsCatalog, filterEnabledModels, isBenefitModel } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
 import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
-import { CodeArtsCreditCache, type CodeArtsCreditState } from './credits.ts'
+import { CodeArtsCreditCache } from './credits.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { createCodeArtsShim } from './shim.ts'
-import { registerCodeArtsStatusRoute } from './web-status.ts'
+import { registerCodeArtsStatusRoute, summarizeClaims } from './web-status.ts'
+import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult } from './web-status.ts'
 import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
 
 export { CODEARTS_PROVIDER, createCodeArtsAdapter, type CodeArtsAdapter } from './adapter.ts'
@@ -143,30 +144,34 @@ export function apply(ctx: Context, rawConfig: Config): void {
   const CREDIT_TIMEOUT_MS = 8_000
 
   /**
-   * 拉一次积分。
+   * 拉一次积分（每个账号各自一份）。
    *
-   * 积分是**账号级**属性，不随请求轮转：这里挑第一个没用坏的账号，够覆盖正常用法
-   * （多账号下的积分差异不在本插件关心范围内）。
+   * 积分是**账号级**属性：多账号下每个号的余额、到期、签到状态都不同，所以逐号
+   * 并发拉、逐号缓存（缓存键就是账号 id）。一个号失败只影响它自己那一份。
    */
-  const loadCredits = async (signal?: AbortSignal): Promise<CodeArtsCreditState> => {
+  const loadCredits = async (signal?: AbortSignal): Promise<CodeArtsAccountCredits[]> => {
     const ids = await store.ids()
-    if (ids.length === 0) return { phase: 'error', message: 'not signed in', at: Date.now() }
+    if (ids.length === 0) return []
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), CREDIT_TIMEOUT_MS)
     timer.unref?.()
     signal?.addEventListener('abort', () => controller.abort(), { once: true })
     try {
-      let last: CodeArtsCreditState | undefined
-      for (const id of ids) {
+      return await Promise.all(ids.map(async (id): Promise<CodeArtsAccountCredits> => {
         const stored = await store.credential(id)
-        if (stored === undefined || stored.stale === true) continue
-        const resolved = await store.resolve(id)
-        if (resolved === undefined) continue
-        const state = await credits.get(resolved, controller.signal)
-        if (state.phase === 'ok') return state
-        last = state
-      }
-      return last ?? { phase: 'error', message: 'no usable credential', at: Date.now() }
+        if (stored === undefined) return { id, creditsError: 'account no longer stored' }
+        if (stored.stale === true) return { id, creditsError: 'account needs sign-in' }
+        try {
+          const resolved = await store.resolve(id)
+          if (resolved === undefined) return { id, creditsError: 'no usable credential' }
+          const state = await credits.get(id, resolved, controller.signal)
+          return state.phase === 'ok'
+            ? { id, credits: state.value }
+            : { id, creditsError: state.message }
+        } catch (error: unknown) {
+          return { id, creditsError: error instanceof Error ? error.message : String(error) }
+        }
+      }))
     } finally {
       clearTimeout(timer)
     }
@@ -194,45 +199,59 @@ export function apply(ctx: Context, rawConfig: Config): void {
     pool: () => pool.list(),
     usage: () => usage.snapshot(),
     credits: signal => loadCredits(signal),
-    claim: async () => {
-      try {
-        const ids = await store.ids()
-        for (const id of ids) {
+    claim: async (accountId?: string) => {
+      const ids = accountId === undefined ? await store.ids() : [accountId]
+      if (ids.length === 0) {
+        return { ok: false, claimed: false, state: 'failed' as const, amount: 0, message: 'no usable credential' }
+      }
+      // 逐号串行领：签到是轻量操作，串行能避免同一时刻对福利中心打一串并发。
+      const results: CodeArtsClaimAccountResult[] = []
+      for (const id of ids) {
+        try {
           const stored = await store.credential(id)
-          if (stored === undefined || stored.stale === true) continue
+          if (stored === undefined || stored.stale === true) {
+            results.push({
+              id,
+              ok: false,
+              claimed: false,
+              state: 'failed',
+              amount: 0,
+              message: stored === undefined ? 'account not found' : 'account needs sign-in',
+            })
+            continue
+          }
           const resolved = await store.resolve(id)
-          if (resolved === undefined) continue
+          if (resolved === undefined) {
+            results.push({ id, ok: false, claimed: false, state: 'failed', amount: 0, message: 'no usable credential' })
+            continue
+          }
           // 应用内点「领取」拿的是福利中心的每日签到活动（/v1/ops/delivery + /v1/ops/claim），
           // 不是 claimBenefit 那条限时福利免费模型渠道 —— 后者不发积分。
           const outcome = await claimDailyWelfare(resolved, AbortSignal.timeout(20_000))
           if (outcome.state === 'claimed') {
             // 余额真的变了，缓存必须丢掉，否则卡片下一次刷新还读旧的。
-            credits.invalidate()
+            credits.invalidate(id)
           }
-          return {
+          results.push({
+            id,
             ok: outcome.state !== 'failed',
             claimed: outcome.state === 'claimed',
             state: outcome.state,
             amount: outcome.amount,
             message: outcome.message,
-          }
-        }
-        return {
-          ok: false,
-          claimed: false,
-          state: 'failed' as const,
-          amount: 0,
-          message: 'no usable credential',
-        }
-      } catch (error: unknown) {
-        return {
-          ok: false,
-          claimed: false,
-          state: 'failed' as const,
-          amount: 0,
-          message: error instanceof Error ? error.message : String(error),
+          })
+        } catch (error: unknown) {
+          results.push({
+            id,
+            ok: false,
+            claimed: false,
+            state: 'failed',
+            amount: 0,
+            message: error instanceof Error ? error.message : String(error),
+          })
         }
       }
+      return summarizeClaims(results)
     },
     refreshModels: async () => {
       const outcome = await refreshCatalog(store, catalog, AbortSignal.timeout(MANUAL_REFRESH_MS))

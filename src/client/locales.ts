@@ -1,5 +1,9 @@
 export interface CodeArtsSettingsKey {
   tabLabel: string
+  tabsLabel: string
+  tabAccounts: string
+  tabModels: string
+  tabUsage: string
   cardTitle: string
   statusSignedIn: string
   statusSignedOut: string
@@ -17,10 +21,9 @@ export interface CodeArtsSettingsKey {
   saveToken: string
   expiredHint: string
   accountsTitle: string
-  accountsShow: string
-  accountsHide: string
   accountRemove: string
   addAccount: string
+  pasteTokenAdd: string
   accountsRotateHint: string
   accountNeedsSignIn: string
   accountNoKey: string
@@ -51,7 +54,11 @@ export interface CodeArtsSettingsKey {
   modelsLoading: string
   usageTitle: string
   usageToday: string
+  usageTodayTotal: string
+  usageLast30: string
+  usageByAccount: string
   usageRequests: string
+  usageRequestCount: string
   usageTokens: string
   usageAllTime: string
   usageByModel: string
@@ -62,19 +69,24 @@ export interface CodeArtsSettingsKey {
   usageStateDisabled: string
   usageNoQuota: string
   usageEmpty: string
-  creditsTitle: string
-  creditsRemaining: string
+  creditsUnit: string
   creditsUsed: string
-  creditsExpiring: string
+  creditsUsedOfTotal: string
+  creditsTotal: string
+  creditsExpiringShort: string
+  creditsUpdated: string
   creditsReset: string
+  creditsDetailLink: string
   creditsTokensToday: string
   creditsTokensBalance: string
   creditsUnavailable: string
+  creditsNeedSignIn: string
   creditsDock: string
   creditsDockTitle: string
   claimButton: string
   claimButtonDone: string
   claimPending: string
+  claimAll: string
   claimHint: string
   claimDone: string
   claimAlready: string
@@ -85,6 +97,10 @@ export interface CodeArtsSettingsKey {
 
 export const zh: CodeArtsSettingsKey = {
   tabLabel: 'CodeArts',
+  tabsLabel: 'CodeArts 设置',
+  tabAccounts: '账号 · {n}',
+  tabModels: '模型 · {n}/{total}',
+  tabUsage: '用量',
   cardTitle: 'DSH CodeArts Connect',
   statusSignedIn: '已登录',
   statusSignedOut: '未登录',
@@ -94,7 +110,7 @@ export const zh: CodeArtsSettingsKey = {
   storedMeta: '{label} · 存于 {time}',
   storedMetaNoLabel: '存于 {time}',
   refresh: '刷新',
-  clearToken: '清除凭证',
+  clearToken: '清除全部凭据',
   tokenLabel: 'cloud_dragon_token',
   tokenPlaceholder: '粘贴从 CodeArts 网页/桌面端拿到的 token……',
   labelLabel: '备注（可选）',
@@ -102,10 +118,9 @@ export const zh: CodeArtsSettingsKey = {
   saveToken: '保存 token',
   expiredHint: '凭证已过期，请重新登录以继续使用；已勾选的模型设置会保留。',
   accountsTitle: '账号',
-  accountsShow: '显示账号',
-  accountsHide: '隐藏账号',
   accountRemove: '删除',
   addAccount: '添加账号',
+  pasteTokenAdd: '粘贴 Token 添加',
   accountsRotateHint: '已存多个账号：请求会自动轮转，某个账号忙时改用下一个，不用干等。',
   accountNeedsSignIn: '需重新登录',
   accountNoKey: '无 AK/SK',
@@ -136,7 +151,11 @@ export const zh: CodeArtsSettingsKey = {
   modelsLoading: '模型勾选区加载中…（若长期不出现，请确认已登录且 DSH 已完全重启）',
   usageTitle: '本机用量',
   usageToday: '今日',
+  usageTodayTotal: '今日合计',
+  usageLast30: '近 30 天',
+  usageByAccount: '今日按账号',
   usageRequests: '{n} 次请求',
+  usageRequestCount: '{n} 条',
   usageTokens: '输入 {prompt} · 输出 {completion}',
   usageAllTime: '累计（{days} 天）',
   usageByModel: '今日按模型',
@@ -147,19 +166,24 @@ export const zh: CodeArtsSettingsKey = {
   usageStateDisabled: '已停用',
   usageNoQuota: '这里是本机经插件发出的请求统计（不等于账号总额度）；官方用量明细见',
   usageEmpty: '还没有记录：发一条消息就会开始累计。',
-  creditsTitle: '积分',
-  creditsRemaining: '剩余 {remain} / {total}',
+  creditsUnit: '积分',
   creditsUsed: '已用 {used}',
-  creditsExpiring: '其中 {expiring} 将在 {date} 重置时作废',
+  creditsUsedOfTotal: '已用 {used} / {total}',
+  creditsTotal: '总额度 {total}',
+  creditsExpiringShort: '即将到期 {expiring}',
+  creditsUpdated: '{time} 更新',
   creditsReset: '额度重置 {date}',
+  creditsDetailLink: '查看积分明细 →',
   creditsTokensToday: '今日 token {used} / {limit}',
   creditsTokensBalance: '余额 {balance}',
   creditsUnavailable: '积分不可用：{message}',
+  creditsNeedSignIn: '这个账号需要重新登录',
   creditsDock: '积分 {remain}',
   creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
   claimButton: '签到领积分',
   claimButtonDone: '今日已领',
   claimPending: '领取中…',
+  claimAll: '全部账号领取',
   claimHint: '每天领一次 1000 积分，走官方福利中心接口（与客户端里那个「每日签到」同一件事）。',
   claimDone: '已领取 {amount} 积分',
   claimAlready: '今日已领，明天再来',
@@ -169,6 +193,10 @@ export const zh: CodeArtsSettingsKey = {
 
 export const en: CodeArtsSettingsKey = {
   tabLabel: 'CodeArts',
+  tabsLabel: 'CodeArts settings',
+  tabAccounts: 'Accounts · {n}',
+  tabModels: 'Models · {n}/{total}',
+  tabUsage: 'Usage',
   cardTitle: 'DSH CodeArts Connect',
   statusSignedIn: 'Signed in',
   statusSignedOut: 'Not signed in',
@@ -178,7 +206,7 @@ export const en: CodeArtsSettingsKey = {
   storedMeta: '{label} · stored {time}',
   storedMetaNoLabel: 'stored {time}',
   refresh: 'Refresh',
-  clearToken: 'Clear credential',
+  clearToken: 'Clear all credentials',
   tokenLabel: 'cloud_dragon_token',
   tokenPlaceholder: 'Paste the token taken from the CodeArts web/desktop client……',
   labelLabel: 'Label (optional)',
@@ -186,10 +214,9 @@ export const en: CodeArtsSettingsKey = {
   saveToken: 'Save token',
   expiredHint: 'Your credential has expired. Sign in again to continue; your model selection is kept.',
   accountsTitle: 'Accounts',
-  accountsShow: 'Show accounts',
-  accountsHide: 'Hide accounts',
   accountRemove: 'Remove',
   addAccount: 'Add account',
+  pasteTokenAdd: 'Paste a token',
   accountsRotateHint: 'Multiple accounts stored: requests rotate automatically, so a busy account hands over to the next one instead of making you wait.',
   accountNeedsSignIn: 'Needs sign-in',
   accountNoKey: 'No AK/SK',
@@ -220,7 +247,11 @@ export const en: CodeArtsSettingsKey = {
   modelsLoading: 'Loading model selection… (if it never appears, make sure you are signed in and DSH was fully restarted)',
   usageTitle: 'Local usage',
   usageToday: 'Today',
+  usageTodayTotal: 'Today',
+  usageLast30: 'Last 30 days',
+  usageByAccount: 'Today by account',
   usageRequests: '{n} request(s)',
+  usageRequestCount: '{n} reqs',
   usageTokens: 'in {prompt} · out {completion}',
   usageAllTime: 'All time ({days} days)',
   usageByModel: 'Today by model',
@@ -231,19 +262,24 @@ export const en: CodeArtsSettingsKey = {
   usageStateDisabled: 'Disabled',
   usageNoQuota: 'Counts the requests this machine sent through the plugin (not the account balance). Official usage:',
   usageEmpty: 'Nothing recorded yet: send a message to start counting.',
-  creditsTitle: 'Credits',
-  creditsRemaining: '{remain} of {total} left',
+  creditsUnit: 'credits',
   creditsUsed: '{used} used',
-  creditsExpiring: '{expiring} of them expire at the next reset on {date}',
+  creditsUsedOfTotal: '{used} of {total} used',
+  creditsTotal: '{total} total',
+  creditsExpiringShort: '{expiring} expiring',
+  creditsUpdated: 'updated {time}',
   creditsReset: 'Quota resets {date}',
+  creditsDetailLink: 'View credit details →',
   creditsTokensToday: 'Today {used} / {limit} tokens',
   creditsTokensBalance: '{balance} left',
   creditsUnavailable: 'Credits unavailable: {message}',
+  creditsNeedSignIn: 'This account needs signing in again',
   creditsDock: 'Credits {remain}',
   creditsDockTitle: 'CodeArts credits left {remain} / {total}',
   claimButton: 'Claim daily credits',
   claimButtonDone: 'Claimed today',
   claimPending: 'Claiming…',
+  claimAll: 'Claim for all accounts',
   claimHint: 'Claim 1,000 credits once a day through CodeArts’ welfare centre — the same check-in the official client does.',
   claimDone: 'Claimed {amount} credits',
   claimAlready: 'Already claimed today — come back tomorrow',

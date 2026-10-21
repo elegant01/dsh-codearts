@@ -89,6 +89,19 @@ describe('CodeArtsUsageTracker', () => {
     expect(snapshot.days).toBe(2)
   })
 
+  it('rolls everything up for the last 30 days but keeps the full ledger in allTime', () => {
+    const tracker = new CodeArtsUsageTracker()
+    const now = new Date(2026, 8, 30, 12, 0, 0).getTime()
+    const longAgo = now - 40 * 86_400_000
+    tracker.noteUsage('acct-1', 'GLM-5.2', { total_tokens: 500 }, longAgo)
+    tracker.noteUsage('acct-1', 'GLM-5.2', { total_tokens: 100 }, now - 5 * 86_400_000)
+    tracker.noteUsage('acct-1', 'GLM-5.2', { total_tokens: 20 }, now)
+
+    const snapshot = tracker.snapshot(now)
+    expect(snapshot.last30.totalTokens).toBe(120)
+    expect(snapshot.allTime.totalTokens).toBe(620)
+  })
+
   it('survives a restart: writes atomically and reads the ledger back', async () => {
     const path = join(dir, '.codearts-usage.json')
     const first = new CodeArtsUsageTracker({ path, saveDebounceMs: 0 })

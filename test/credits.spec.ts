@@ -164,15 +164,15 @@ describe('CodeArtsCreditCache', () => {
     })
     let now = 1000
     const cache = new CodeArtsCreditCache({ ttlMs: 60_000, load, now: () => now })
-    const a = await cache.get(fakeCredential)
-    const b = await cache.get(fakeCredential)
+    const a = await cache.get('uid-a', fakeCredential)
+    const b = await cache.get('uid-a', fakeCredential)
     expect(a.phase).toBe('ok')
     expect(b.phase).toBe('ok')
     expect(calls).toBe(1)
     expect(load).toHaveBeenCalledTimes(1)
     // TTL 过期后重新拉。
     now += 61_000
-    await cache.get(fakeCredential)
+    await cache.get('uid-a', fakeCredential)
     expect(load).toHaveBeenCalledTimes(2)
   })
 
@@ -182,16 +182,16 @@ describe('CodeArtsCreditCache', () => {
     })
     let now = 1000
     const cache = new CodeArtsCreditCache({ ttlMs: 60_000, failureTtlMs: 5_000, load, now: () => now })
-    const a = await cache.get(fakeCredential)
+    const a = await cache.get('uid-a', fakeCredential)
     expect(a.phase).toBe('error')
     expect((a as { message: string }).message).toBe('upstream down')
     // 4s 后：仍在失败缓存窗口内，不重新拉。
     now += 4_000
-    await cache.get(fakeCredential)
+    await cache.get('uid-a', fakeCredential)
     expect(load).toHaveBeenCalledTimes(1)
     // 6s 后：超过 failureTtlMs，重新拉。
     now += 6_000
-    await cache.get(fakeCredential)
+    await cache.get('uid-a', fakeCredential)
     expect(load).toHaveBeenCalledTimes(2)
   })
 
@@ -202,14 +202,29 @@ describe('CodeArtsCreditCache', () => {
     })
     const load = vi.fn(() => pending)
     const cache = new CodeArtsCreditCache({ load })
-    const a = cache.get(fakeCredential)
-    const b = cache.get(fakeCredential)
-    const c = cache.get(fakeCredential)
+    const a = cache.get('uid-a', fakeCredential)
+    const b = cache.get('uid-a', fakeCredential)
+    const c = cache.get('uid-a', fakeCredential)
     resolve!(snapshot)
     const [ra, rb, rc] = await Promise.all([a, b, c])
     expect(load).toHaveBeenCalledTimes(1)
     expect(ra).toBe(rb)
     expect(rb).toBe(rc)
+  })
+
+  it('keeps one cache slot per account', async () => {
+    const load = vi.fn(async () => snapshot)
+    const cache = new CodeArtsCreditCache({ load })
+    await cache.get('uid-a', fakeCredential)
+    await cache.get('uid-b', fakeCredential)
+    await cache.get('uid-a', fakeCredential)
+    expect(load).toHaveBeenCalledTimes(2)
+    // 只清一个号，不影响另一个号。
+    cache.invalidate('uid-a')
+    await cache.get('uid-b', fakeCredential)
+    expect(load).toHaveBeenCalledTimes(2)
+    await cache.get('uid-a', fakeCredential)
+    expect(load).toHaveBeenCalledTimes(3)
   })
 
   it('invalidate drops the cache', async () => {
@@ -219,9 +234,9 @@ describe('CodeArtsCreditCache', () => {
       return snapshot
     })
     const cache = new CodeArtsCreditCache({ load })
-    await cache.get(fakeCredential)
-    cache.invalidate()
-    await cache.get(fakeCredential)
+    await cache.get('uid-a', fakeCredential)
+    cache.invalidate('uid-a')
+    await cache.get('uid-a', fakeCredential)
     expect(load).toHaveBeenCalledTimes(2)
   })
 })

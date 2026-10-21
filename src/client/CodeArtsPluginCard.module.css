@@ -66,6 +66,237 @@
   padding: 4px 0 16px;
 }
 
+.tabs {
+  margin-top: 12px;
+}
+
+/* 面板只留一点上间距：内层 section 自己带 16px 的 margin-top。 */
+.tabPanel {
+  padding-top: 2px;
+}
+
+/* 账号页顶部两条入口：粘贴 token / 登录添加。 */
+.accountToolbar {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.accountToolbar > * {
+  flex: 1;
+}
+
+.manualForm {
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  margin-top: 12px;
+  padding: 12px;
+}
+
+/* 账号 + 积分共用一张卡：上半截是谁登录着，下半截是这个号的额度。 */
+/* 多账号时每个号是一张独立的卡：容器只负责拉开间距，边界靠卡片自身的边框。 */
+.accountCard {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.accountEntry {
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.accountRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+}
+
+/* 批量领取是账号列表之外的动作：用一条分隔线把它和最后一张卡分开。 */
+.claimAllRow {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+  padding: 10px 12px 0;
+}
+
+.avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.accountInfo {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.accountNameRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.accountName {
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.accountRowActions {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+
+.accountHint {
+  margin: 0;
+  padding: 0 12px 12px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.creditBlock {
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+  padding: 12px;
+}
+
+.balanceRow {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.balance {
+  color: var(--dsw-alias-label-primary);
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 34px;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.balanceUnit {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+}
+
+.balanceMeta {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  margin-left: 2px;
+}
+
+.updated {
+  margin-left: auto;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.creditRows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.creditRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.usageBar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  /* 卡片底色就是 layer-2，空轨道用 layer-3 几乎看不见；border-l2 才能保证 0% 也有形。 */
+  background: var(--dsw-alias-border-l2);
+  margin-top: 4px;
+  overflow: hidden;
+}
+
+.usageFill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--dsw-alias-brand-primary);
+  transition: width 0.2s ease;
+}
+
+.expiryRow {
+  margin-top: 2px;
+}
+
+.expiryLabel {
+  color: var(--dsw-alias-state-warn-label);
+}
+
+.bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--dsw-alias-bg-layer-3);
+  margin-top: 6px;
+  overflow: hidden;
+}
+
+.barFill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.creditLink {
+  display: inline-block;
+  margin-top: 8px;
+}
+
+.creditFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+  margin-top: 12px;
+  padding-top: 10px;
+}
+
+.creditHint {
+  margin: 8px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
 .section {
   margin-top: 16px;
 }
@@ -81,14 +312,6 @@
   color: var(--dsw-alias-label-tertiary);
   font-size: 11px;
   font-weight: 500;
-}
-
-/* 账号区块标题行右侧：账号数 + 显示/隐藏切换，两者一起贴右。 */
-.headActions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
 }
 
 .count {
@@ -160,6 +383,62 @@
 
 .choiceRow:hover {
   background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* 今日按模型：名称 | 横条 | token | 占比 | 请求数，条长就是占今日总量的比例。 */
+.modelChart {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.modelRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(48px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.modelName {
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelTrack {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--dsw-alias-border-l2);
+  overflow: hidden;
+}
+
+.modelFill {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--dsw-alias-brand-primary);
+  transition: width 160ms ease;
+}
+
+.modelTokens,
+.modelShare,
+.modelRequests {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.modelRequests {
+  color: var(--dsw-alias-label-tertiary);
 }
 
 /* Checkbox 自己带 <label><input><span>，这里只负责让它在行里撑开并省略号。 */

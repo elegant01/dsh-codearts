@@ -298,8 +298,9 @@ export interface CreditCacheOptions {
  * 而上游对同一账号的并发是有成本/风险的。
  */
 export class CodeArtsCreditCache {
-  private state: CodeArtsCreditState | undefined
-  private inflight: Promise<CodeArtsCreditState> | undefined
+  /** 按账号分槽：多账号下每个号有自己的余额，不能共用一个快照。 */
+  private readonly states = new Map<string, CodeArtsCreditState>()
+  private readonly inflights = new Map<string, Promise<CodeArtsCreditState>>()
   private readonly ttlMs: number
   private readonly failureTtlMs: number
   private readonly load: (credential: CodeArtsResolved, signal?: AbortSignal) => Promise<CodeArtsCreditSnapshot>
@@ -312,38 +313,50 @@ export class CodeArtsCreditCache {
     this.now = options.now ?? (() => Date.now())
   }
 
-  /** 当前缓存内容（不触发请求），供只想读快照的场景使用。 */
-  peek(): CodeArtsCreditState | undefined {
-    return this.state
+  /** 某账号的缓存内容（不触发请求），供只想读快照的场景使用。 */
+  peek(accountId: string): CodeArtsCreditState | undefined {
+    return this.states.get(accountId)
   }
 
-  /** 丢掉缓存，下次 get 会重新拉（重新登录/添加账号后调用）。 */
-  invalidate(): void {
-    this.state = undefined
-    this.inflight = undefined
+  /** 丢掉缓存，下次 get 会重新拉（重新登录/添加账号后调用）。省略账号则清空全部。 */
+  invalidate(accountId?: string): void {
+    if (accountId === undefined) {
+      this.states.clear()
+      this.inflights.clear()
+      return
+    }
+    this.states.delete(accountId)
+    this.inflights.delete(accountId)
   }
 
   /**
-   * 取一次积分。命中缓存直接返回；否则合并成一次上游请求。
+   * 取一次某账号的积分。命中缓存直接返回；否则合并成一次上游请求。
    * **不抛异常**：失败以 `phase: 'error'` 返回，调用方（状态路由）照样能渲染。
    */
-  async get(credential: CodeArtsResolved, signal?: AbortSignal): Promise<CodeArtsCreditState> {
-    const cached = this.state
+  async get(accountId: string, credential: CodeArtsResolved, signal?: AbortSignal): Promise<CodeArtsCreditState> {
+    const cached = this.states.get(accountId)
     if (cached !== undefined) {
       const ttl = cached.phase === 'ok' ? this.ttlMs : this.failureTtlMs
       if (this.now() - cached.at < ttl) return cached
     }
-    const inflight = this.inflight ??= this.run(credential, signal).finally(() => {
-      this.inflight = undefined
+    const existing = this.inflights.get(accountId)
+    if (existing !== undefined) return existing
+    const inflight = this.run(accountId, credential, signal).finally(() => {
+      this.inflights.delete(accountId)
     })
+    this.inflights.set(accountId, inflight)
     return inflight
   }
 
-  private async run(credential: CodeArtsResolved, signal?: AbortSignal): Promise<CodeArtsCreditState> {
+  private async run(
+    accountId: string,
+    credential: CodeArtsResolved,
+    signal?: AbortSignal,
+  ): Promise<CodeArtsCreditState> {
     try {
       const value = await this.load(credential, signal)
       const state: CodeArtsCreditState = { phase: 'ok', value, at: this.now() }
-      this.state = state
+      this.states.set(accountId, state)
       return state
     } catch (error) {
       const state: CodeArtsCreditState = {
@@ -351,7 +364,7 @@ export class CodeArtsCreditCache {
         message: error instanceof Error ? error.message : String(error),
         at: this.now(),
       }
-      this.state = state
+      this.states.set(accountId, state)
       return state
     }
   }

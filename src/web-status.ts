@@ -116,12 +116,47 @@ function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
  * `ok` 是「这次请求跑通了没有」，`claimed` 才是「积分真的加上了」——
  * 今天已领 / 账号没有这个活动都算 ok 但没 claimed，UI 不该把它们当报错。
  */
-export interface CodeArtsClaimResult {
+export interface CodeArtsClaimOutcome {
   ok: boolean
   claimed: boolean
   state: CodeArtsWelfareState
   amount: number
   message: string
+}
+
+/** 批量领取时每个账号各自的结果。 */
+export interface CodeArtsClaimAccountResult extends CodeArtsClaimOutcome {
+  id: string
+}
+
+export interface CodeArtsClaimResult extends CodeArtsClaimOutcome {
+  /** 一次领多个账号时逐号给出结果；单账号旧调用方不看这个字段。 */
+  results?: readonly CodeArtsClaimAccountResult[]
+}
+
+/** 某个账号的积分：成功给快照，失败给原因 —— 一个号拉不到不影响别的号。 */
+export interface CodeArtsAccountCredits {
+  id: string
+  credits?: CodeArtsCreditSnapshot
+  creditsError?: string
+}
+
+/**
+ * 把逐账号的领取结果汇总成一条：HTTP 层只看 ok，卡片看 results 逐号展示。
+ * 有一个号失败就算整批 ok=false，但别的号领到的结果照样在 results 里。
+ */
+export function summarizeClaims(results: readonly CodeArtsClaimAccountResult[]): CodeArtsClaimResult {
+  const failed = results.find(result => result.state === 'failed')
+  const claimed = results.filter(result => result.claimed)
+  const messages = [...new Set(results.map(result => result.message).filter(message => message !== ''))]
+  return {
+    ok: results.length > 0 && failed === undefined,
+    claimed: claimed.length > 0,
+    state: claimed.length > 0 ? 'claimed' : failed?.state ?? results[0]?.state ?? 'failed',
+    amount: claimed.reduce((sum, result) => sum + result.amount, 0),
+    message: results.length === 1 ? results[0].message : messages.join('; ').slice(0, 300),
+    results,
+  }
 }
 
 export interface CodeArtsWebStatus {
@@ -140,6 +175,11 @@ export interface CodeArtsWebStatus {
   credits?: CodeArtsCreditSnapshot
   /** 积分拿不到时的原因 —— 有值就说明 credits 缺席，且要让用户看见为什么。 */
   creditsError?: string
+  /**
+   * 每个账号各自的积分（按 account id 对齐）。多账号下 credits 只是其中一份快照，
+   * 卡片要按账号展示就必须读这里。
+   */
+  creditsByAccount?: readonly CodeArtsAccountCredits[]
 }
 
 /**
@@ -154,8 +194,12 @@ export interface CodeArtsWebUsage {
   today: UsageTotals
   /** 账本里保留天数的合计。 */
   allTime: UsageTotals
+  /** 最近 30 天（含今天）的合计。 */
+  last30: UsageTotals
   /** 今天按模型，按 token 降序（卡片只展示前几条）。 */
   byModelToday: readonly { id: string; totals: UsageTotals }[]
+  /** 今天按账号 —— 多账号时用来看是哪个号在用。 */
+  byAccountToday: Record<string, UsageTotals>
   /** 账本覆盖天数。 */
   days: number
   lastAt?: number
@@ -191,14 +235,12 @@ export interface CodeArtsStatusRouteOptions {
    * 拉一次账号积分（内部应带缓存，别每次刷新都打上游）。
    * 省略则卡片不显示积分区块。
    */
-  credits?: (signal?: AbortSignal) => Promise<CodeArtsCreditState>
+  credits?: (signal?: AbortSignal) => Promise<readonly CodeArtsAccountCredits[]>
   /**
-   * 开通「限时福利」免费模型渠道（幂等）。
-   *
-   * **它不发积分**：积分只能在 CodeArts 官网的签到页领（官方客户端也是跳那一页）。
-   * 卡片已经不再拿它当「领取积分」用，这个路由留给需要手动补开通福利的场景。
+   * 领每日签到积分（福利中心 /v1/ops/delivery + /v1/ops/claim）。
+   * 省略 id 时逐个可用账号都领一遍；上游按天去重，重复领返回 already。
    */
-  claim?: () => Promise<CodeArtsClaimResult>
+  claim?: (accountId?: string) => Promise<CodeArtsClaimResult>
   /**
    * 立刻重拉一次模型目录（不等每小时那一次）。
    *
@@ -314,7 +356,9 @@ function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
   return {
     today: snapshot?.today ?? noTotals,
     allTime: snapshot?.allTime ?? noTotals,
+    last30: snapshot?.last30 ?? noTotals,
     byModelToday: snapshot?.byModelToday ?? [],
+    byAccountToday: snapshot?.byAccountToday ?? {},
     days: snapshot?.days ?? 0,
     ...snapshot?.lastAt === undefined ? {} : { lastAt: snapshot.lastAt },
     slots: slotsOf(deps),
@@ -330,8 +374,16 @@ function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
 async function creditsOf(deps: CodeArtsStatusRouteOptions): Promise<Partial<CodeArtsWebStatus>> {
   if (deps.credits === undefined) return {}
   try {
-    const state = await deps.credits()
-    return state.phase === 'ok' ? { credits: state.value } : { creditsError: state.message }
+    const entries = await deps.credits()
+    // credits / creditsError 保留给对话底部的单行积分条：取第一份拿到的快照。
+    const primary = entries.find(entry => entry.credits !== undefined) ?? entries[0]
+    return {
+      ...primary?.credits === undefined ? {} : { credits: primary.credits },
+      ...primary?.credits === undefined && primary?.creditsError !== undefined
+        ? { creditsError: primary.creditsError }
+        : {},
+      ...entries.length === 0 ? {} : { creditsByAccount: entries },
+    }
   } catch (error: unknown) {
     return { creditsError: safeMessage(error) }
   }
@@ -548,8 +600,19 @@ function claimHandler(deps: CodeArtsStatusRouteOptions) {
       json(res, 403, { error: 'request-not-trusted' })
       return
     }
+    let accountId: string | undefined
+    const type = req.headers['content-type']
+    if (typeof type === 'string' && type.trim().toLowerCase().startsWith('application/json')) {
+      try {
+        const body = JSON.parse(await readBody(req)) as { id?: unknown }
+        if (typeof body?.id === 'string' && body.id.trim() !== '') accountId = body.id.trim()
+      } catch {
+        json(res, 400, { error: 'expected {"id"?: string}' })
+        return
+      }
+    }
     try {
-      const result = await deps.claim()
+      const result = await deps.claim(accountId)
       json(res, result.ok ? 200 : 500, result)
     } catch (error: unknown) {
       json(res, 500, {

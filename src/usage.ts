@@ -64,6 +64,8 @@ export interface UsageSnapshot {
   today: UsageTotals
   /** 账本里所有保留天数的合计。 */
   allTime: UsageTotals
+  /** 最近 30 天（含今天）的合计。 */
+  last30: UsageTotals
   /** 今天按模型的合计，按 totalTokens 降序。 */
   byModelToday: { id: string; totals: UsageTotals }[]
   /** 今天按账号的合计。 */
@@ -230,14 +232,20 @@ export class CodeArtsUsageTracker {
   snapshot(at: number = this.now()): UsageSnapshot {
     const todayKey = localDateKey(at)
     const today = this.days.get(todayKey)
+    const cutoff = localDateKey(at - 30 * 86_400_000)
     const allTime = emptyTotals()
-    for (const day of this.days.values()) {
-      for (const totals of Object.values(day.models)) mergeTotals(allTime, totals)
+    const last30 = emptyTotals()
+    for (const [date, day] of this.days) {
+      for (const totals of Object.values(day.models)) {
+        mergeTotals(allTime, totals)
+        if (date >= cutoff) mergeTotals(last30, totals)
+      }
     }
     const models = today?.models ?? {}
     return {
       today: { ...emptyTotals(), ...(today === undefined ? {} : sumOf(models)) },
       allTime,
+      last30,
       byModelToday: Object.entries(models)
         .map(([id, totals]) => ({ id, totals: { ...totals } }))
         .sort((a, b) => b.totals.totalTokens - a.totals.totalTokens || (a.id < b.id ? -1 : 1)),

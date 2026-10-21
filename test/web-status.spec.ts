@@ -38,6 +38,7 @@ import {
   CODEARTS_REFRESH_MODELS_PATH,
   CODEARTS_STATUS_PATH,
   registerCodeArtsStatusRoute,
+  summarizeClaims,
   type CodeArtsClaimResult,
 } from '../src/web-status.ts'
 
@@ -64,8 +65,22 @@ function mountRoutes(deps: Parameters<typeof registerCodeArtsStatusRoute>[1]): M
   return routes
 }
 
-function mockReq(method: string, url: string, headers: Record<string, string> = {}): IncomingMessage {
-  return { method, url, headers: { host: '127.0.0.1:3080', ...headers } } as unknown as IncomingMessage
+function mockReq(
+  method: string,
+  url: string,
+  headers: Record<string, string> = {},
+  body?: string,
+): IncomingMessage {
+  const req: Record<string, unknown> = { method, url, headers: { host: '127.0.0.1:3080', ...headers } }
+  if (body !== undefined) {
+    req.on = (event: string, callback: (chunk?: Buffer) => void): unknown => {
+      if (event === 'data') callback(Buffer.from(body))
+      if (event === 'end') callback()
+      return req
+    }
+    req.destroy = (): void => {}
+  }
+  return req as unknown as IncomingMessage
 }
 
 function mockRes(): { res: ServerResponse; status: () => number; body: () => Record<string, unknown> | undefined } {
@@ -87,9 +102,10 @@ async function call(
   method: string,
   url: string,
   headers: Record<string, string> = {},
+  requestBody?: string,
 ): Promise<{ status: number; body: Record<string, unknown> | undefined }> {
   const { res, status, body } = mockRes()
-  await handler(mockReq(method, url, headers), res)
+  await handler(mockReq(method, url, headers, requestBody), res)
   return { status: status(), body: body() }
 }
 
@@ -272,6 +288,36 @@ describe('GET /api/codearts/status', () => {
     expect((res.body?.accounts as { id: string }[]).map(a => a.id)).toEqual(['uid-a'])
   })
 
+  it('reports every account credits separately and keeps one snapshot for the dock', async () => {
+    await store.upsert(credential('uid-a'))
+    await store.upsert(credential('uid-b'))
+    const snapshot = (remain: number) => ({
+      credits: {
+        planName: '体验版',
+        planNameEn: 'Trial',
+        specCode: 'trial',
+        planStatus: 'active' as const,
+        isCreditPackage: true,
+        total: { total: 2000, used: 2000 - remain, remain, expiring: 0 },
+        fetchedAt: Date.now(),
+      },
+    })
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      credits: async () => [
+        { id: 'uid-a', credits: snapshot(2500) },
+        { id: 'uid-b', creditsError: 'decrypt token fail' },
+      ],
+    })
+    const res = await call(scoped.get(CODEARTS_STATUS_PATH)!, 'GET', CODEARTS_STATUS_PATH)
+    const entries = res.body?.creditsByAccount as { id: string; creditsError?: string }[]
+    expect(entries.map(entry => entry.id)).toEqual(['uid-a', 'uid-b'])
+    expect(entries[1].creditsError).toBe('decrypt token fail')
+    // 底部积分条仍读单份快照（第一份拿到的），不显示错误账号。
+    expect((res.body?.credits as { credits: { total: { remain: number } } }).credits.total.remain).toBe(2500)
+  })
+
   // 一个账号过期不该让整张卡片显示「未登录」——别的账号还能用。
   it('stays signed-in while any account is still usable', async () => {
     await store.upsert(credential('uid-a'))
@@ -282,6 +328,27 @@ describe('GET /api/codearts/status', () => {
     })
     const res = await call(routes.get(CODEARTS_STATUS_PATH)!, 'GET', CODEARTS_STATUS_PATH)
     expect(res.body?.status).toBe('signed-in')
+  })
+
+  // 用量页的四段式要按账号/按近 30 天看数据，这两项必须在契约里透传。
+  it('passes per-account and last-30-day usage through to the card', async () => {
+    const totals = { requests: 2, promptTokens: 10, completionTokens: 5, totalTokens: 15 }
+    const usageRoutes = mountRoutes({
+      store,
+      models: () => [],
+      usage: () => ({
+        today: totals,
+        allTime: totals,
+        last30: totals,
+        byModelToday: [{ id: 'GLM-5.2', totals }],
+        byAccountToday: { 'uid-a': totals },
+        days: 1,
+      }),
+    })
+    const res = await call(usageRoutes.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)
+    const usage = res.body?.usage as Record<string, unknown>
+    expect(usage.last30).toEqual(totals)
+    expect((usage.byAccountToday as Record<string, Record<string, number>>)['uid-a']?.totalTokens).toBe(15)
   })
 
   it('reports expired when every account is stale', async () => {
@@ -327,9 +394,73 @@ describe('POST /api/codearts/claim', () => {
     expect(res.body?.message).toBe('decrypt token fail')
   })
 
+  it('passes the account id from the JSON body so one account can be claimed alone', async () => {
+    let received: string | undefined = 'unset'
+    const handler = mountRoutes({
+      store,
+      models: () => [],
+      claim: async (id) => {
+        received = id
+        return { ok: true, claimed: true, state: 'claimed', amount: 1000, message: 'ok' }
+      },
+    }).get(CODEARTS_CLAIM_PATH)!
+    const res = await call(
+      handler,
+      POST,
+      CODEARTS_CLAIM_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'uid-b' }),
+    )
+    expect(received).toBe('uid-b')
+    expect(res.status).toBe(200)
+  })
+
+  it('claims every account when the body carries no id', async () => {
+    let received: string | undefined = 'unset'
+    const handler = mountRoutes({
+      store,
+      models: () => [],
+      claim: async (id) => {
+        received = id
+        return { ok: true, claimed: true, state: 'claimed', amount: 1000, message: 'ok' }
+      },
+    }).get(CODEARTS_CLAIM_PATH)!
+    const res = await call(
+      handler,
+      POST,
+      CODEARTS_CLAIM_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({}),
+    )
+    expect(received).toBeUndefined()
+    expect(res.status).toBe(200)
+  })
+
   it('404s when no claim handler is attached', async () => {
     const res = await call(routes.get(CODEARTS_CLAIM_PATH)!, POST, CODEARTS_CLAIM_PATH)
     expect(res.status).toBe(404)
+  })
+})
+
+describe('summarizeClaims', () => {
+  it('reports the batch as claimed when any account won, with per-account results', () => {
+    const summary = summarizeClaims([
+      { id: 'uid-a', ok: true, claimed: true, state: 'claimed', amount: 1000, message: 'ok' },
+      { id: 'uid-b', ok: true, claimed: false, state: 'already', amount: 0, message: '' },
+    ])
+    expect(summary).toMatchObject({ ok: true, claimed: true, state: 'claimed', amount: 1000 })
+    expect(summary.results?.map(result => result.id)).toEqual(['uid-a', 'uid-b'])
+  })
+
+  it('marks the batch failed when any account failed, keeping the others', () => {
+    const summary = summarizeClaims([
+      { id: 'uid-a', ok: false, claimed: false, state: 'failed', amount: 0, message: 'decrypt token fail' },
+      { id: 'uid-b', ok: true, claimed: true, state: 'claimed', amount: 1000, message: 'ok' },
+    ])
+    expect(summary.ok).toBe(false)
+    expect(summary.claimed).toBe(true)
+    expect(summary.amount).toBe(1000)
+    expect(summary.results).toHaveLength(2)
   })
 })
 
