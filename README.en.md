@@ -133,6 +133,10 @@ other local processes cannot impersonate it.
 - Docs: README and INSTALL have English versions; [DEV.md](./DEV.md) (hot-reload dev loop)
   is Chinese-only for now.
 
+## Changelog
+
+See [CHANGELOG.md](https://github.com/elegant01/dsh-codearts/blob/main/CHANGELOG.md) for the changes in each release.
+
 ## Disclaimer
 
 - This project is **for personal study and research only**. It drives the user’s own

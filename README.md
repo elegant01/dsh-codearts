@@ -99,10 +99,14 @@ shim 只监听回环地址，并校验 Host、Origin 与本进程随机密钥，
   `InferHub.001001005.400`。插件按**实测上限**下发请求（免费 DeepSeek 系列 65536、
   GLM-5.2 已实测可到 131072），没实测过的模型退回 65536 保守值。上下文长度用发现值，
   它只影响 DSH 的上下文计量与截断余量。
-- 用量账本只统计**本机经插件发出**的请求：CodeArts 不提供额度/积分接口，所以卡片上的数字
-  不等于账号总额度；官方明细请走卡片里的链接。账本按天保留 60 天，换机器/清 `$DSH_HOME` 即丢失。
+- 用量账本只统计**本机经插件发出**的请求，不等于账号总额度；额度/积分以卡片上的账号余额为准，
+  官方明细走卡片里的链接。账本按天保留 60 天，换机器/清 `$DSH_HOME` 即丢失。
 - 文档：README 与 INSTALL 有英文版（[README.en.md](./README.en.md) / [INSTALL.en.md](./INSTALL.en.md)），
   [DEV.md](./DEV.md)（热重载开发循环）目前只有中文。
+
+## 更新日志
+
+各版本的改动见 [CHANGELOG.md](https://github.com/elegant01/dsh-codearts/blob/main/CHANGELOG.md)。
 
 ## 免责声明
 
