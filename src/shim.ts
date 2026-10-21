@@ -38,6 +38,7 @@ import {
   type UpstreamErrorKind,
 } from './upstream.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
+import type { CodeArtsQueueGate } from './queue.ts'
 import type { CodeArtsUsageTracker } from './usage.ts'
 
 export interface ShimLogger {
@@ -59,6 +60,11 @@ export interface CodeArtsShimOptions {
   pool?: CodeArtsAccountPool
   /** 用量账本。给了就在转发流的同时把 usage 帧记下来（卡片上的「今日用量」）。 */
   usage?: CodeArtsUsageTracker
+  /**
+   * 上游排队闸门。给了就在发请求前占号、轮询到轮到再开流
+   * （底部积分条旁边展示「排队第 N 位」）。
+   */
+  queue?: CodeArtsQueueGate
   logger?: ShimLogger
 }
 
@@ -86,6 +92,19 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 
 function writeOpenAIError(res: ServerResponse, status: number, kind: string, message: string): void {
   writeJson(res, status, { error: { message, type: kind, code: kind } })
+}
+
+/**
+ * 排队没等到时回给用户的那句：优先用上游自己的文案（它就是写给人看的，带位置和
+ * 「建议切换模型/升级套餐」），上游没给才自己拼。
+ */
+function queuedMessage(
+  model: string,
+  gate: { position: number; length: number; message: string },
+): string {
+  const upstream = gate.message.trim()
+  const detail = upstream === '' ? `上游排队中：${model} 第 ${gate.position} 位（共 ${gate.length} 条）` : upstream
+  return `${detail} 插件没有一直等下去，请稍后重试。`
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -135,6 +154,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   const { store, catalog } = options
   const logger = options.logger
   const usage = options.usage
+  const queue = options.queue
   // 账号池。空池起步，每次请求前用 store.ids() 对齐（新增/删除账号自动跟上）。
   const pool = options.pool ?? new CodeArtsAccountPool([])
 
@@ -375,6 +395,24 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         if (credential === undefined) {
           pool.disable(id, 'no credential')
           continue
+        }
+        // 上游排队要客户端自己挂号：先占号、轮询到 working 再发聊天请求。
+        // 只等一小会儿（闸门里的 maxWaitMs），还在队里就把位置回给用户 ——
+        // 挂着他二十几分钟不是产品，而且宿主的 90 秒流空闲超时也会先掐掉。
+        if (queue !== undefined) {
+          const gate = await queue.wait(credential, checked.chatId, checked.model, controller.signal)
+          if (controller.signal.aborted) return
+          if (gate.kind === 'queued') {
+            // 400 而不是 429：宿主的 classifyPiAiError 按状态码归类，429 会被判成
+            // RATE_LIMIT 并自动重试 5 次（实测），用户看到的是「一直转圈」而不是一句
+            // 「在排队，稍后再试」。INVALID_REQUEST 不在重试名单里，一次就把话说到。
+            writeOpenAIError(res, 400, 'queued', queuedMessage(checked.model, gate))
+            return
+          }
+          if (gate.kind === 'queue_full' || gate.kind === 'error') {
+            writeOpenAIError(res, gate.kind === 'queue_full' ? 429 : 502, gate.kind, gate.message)
+            return
+          }
         }
         const opened = await openWithCeilingHeal(credential, raw, contextWindow, controller.signal)
         const { prepared, result } = opened

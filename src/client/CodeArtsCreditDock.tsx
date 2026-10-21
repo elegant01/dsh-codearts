@@ -16,8 +16,17 @@ import type { CodeArtsWebStatus } from '../web-status.ts'
 /** 与 src/adapter.ts 的 CODEARTS_PROVIDER 对齐 —— client 不能 import host 模块。 */
 const CODEARTS_PROVIDER = 'codearts'
 const STATUS_PATH = '/api/codearts/status'
+const QUEUE_PATH = '/api/codearts/queue'
 /** 轮询间隔：与缓存 TTL（60s）对齐，再短也只是反复命中缓存。 */
 const REFRESH_INTERVAL_MS = 60_000
+/** 排队位置变得快：官方客户端也是 5 秒一次；这是本机路由，打不疼上游。 */
+const QUEUE_INTERVAL_MS = 5_000
+
+interface QueueEntry {
+  model: string
+  position: number
+  length: number
+}
 
 interface ModelSelectionEntry {
   provider?: string
@@ -54,6 +63,7 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
   const active = isCodeArts(selection)
   const [remain, setRemain] = useState<number | null>(null)
   const [total, setTotal] = useState<number>(0)
+  const [queued, setQueued] = useState<QueueEntry | null>(null)
   const mounted = useRef(true)
   useEffect(() => {
     mounted.current = true
@@ -100,9 +110,38 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
     }
   }, [active])
 
-  if (!active || remain === null) return null
-  const text = t('creditsDock', { remain: new Intl.NumberFormat().format(remain) })
-  const title = t('creditsDockTitle', { remain, total })
+  // 排队只在等上游开流时有值；没有排队就保持安静，别在底部常驻一个「排队 0」。
+  useEffect(() => {
+    if (!active) {
+      setQueued(null)
+      return
+    }
+    let timer: number | undefined
+    const refresh = async (): Promise<void> => {
+      try {
+        const res = await fetch(QUEUE_PATH, {
+          headers: { Accept: 'application/json' },
+          credentials: 'same-origin',
+        })
+        if (!res.ok) return
+        const data = (await res.json().catch(() => undefined)) as { queue?: QueueEntry[] } | undefined
+        if (mounted.current) setQueued(data?.queue?.[0] ?? null)
+      } catch {
+        // 排队信息是提示性的，拉不到就当没排队。
+      }
+    }
+    void refresh()
+    timer = window.setInterval(refresh, QUEUE_INTERVAL_MS)
+    return () => {
+      if (timer !== undefined) window.clearInterval(timer)
+    }
+  }, [active])
+
+  if (!active || (remain === null && queued === null)) return null
+  const text = remain === null ? undefined : t('creditsDock', { remain: new Intl.NumberFormat().format(remain) })
+  const title = queued !== null
+    ? t('queueDockTitle', { model: queued.model, position: queued.position, length: queued.length })
+    : t('creditsDockTitle', { remain: remain ?? 0, total })
   return (
     <div
       style={{
@@ -121,7 +160,8 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
       }}
       title={title}
     >
-      <span>{text}</span>
+      {queued !== null && <span>{t('queueDock', { position: queued.position })}</span>}
+      {text !== undefined && <span>{text}</span>}
     </div>
   )
 }

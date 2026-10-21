@@ -395,7 +395,10 @@
 
 .modelRow {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(48px, 1fr) auto auto auto;
+  /* 右侧三列必须给死宽度：`auto` 列每行按自己的内容要地方，会把左边的名称列挤得
+     忽宽忽窄 —— 实测「今日按模型」那几条柱子起点不齐（GLM-5.2 和 deepseek 差一截）。
+     写死之后每行的 fr 分配完全一致，名称列同宽、柱子同长同起点。 */
+  grid-template-columns: minmax(0, 1.2fr) minmax(48px, 1fr) 56px 52px 64px;
   align-items: center;
   gap: 8px;
   padding: 4px 0;

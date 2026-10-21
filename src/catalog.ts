@@ -18,12 +18,26 @@
  */
 
 /** One model the adapter exposes to DSH. */
+export interface CodeArtsModelThinking {
+  /** 上游提供的思考强度（`thinking-variants` 的 `strengths`，如 `['high','max']`）。 */
+  strengths: readonly string[]
+  /** 上游默认强度（`default_strength`）。宿主不强制使用，只作诊断。 */
+  default?: string
+}
+
 export interface CodeArtsModelInfo {
   id: string
   name: string
   contextWindow: number
   maxTokens: number
   supportsImages: boolean
+  /**
+   * 该模型可选的思考强度。
+   *
+   * 由动态发现填入（`POST /v1/model/thinking-variants`，按账号授予）：空/缺省表示
+   * 上游没给这条模型开关，宿主就不该显示推理档位选择器。
+   */
+  thinking?: CodeArtsModelThinking
   /**
    * 积分消耗倍率（上游 `credit[].ratio_display` 的原值，如 `0.18x`）。
    *
@@ -254,6 +268,7 @@ function richerModel(current: CodeArtsModelInfo, next: CodeArtsModelInfo): CodeA
   const keep = richerThan(next, current) ? next : current
   const drop = keep === next ? current : next
   const ratio = keep.ratio ?? drop.ratio
+  const thinking = keep.thinking ?? drop.thinking
   return {
     id: keep.id,
     name: keep.name || drop.name || keep.id,
@@ -261,6 +276,7 @@ function richerModel(current: CodeArtsModelInfo, next: CodeArtsModelInfo): CodeA
     maxTokens: keep.maxTokens > 0 ? keep.maxTokens : drop.maxTokens,
     supportsImages: keep.supportsImages || drop.supportsImages,
     ...(ratio === undefined ? {} : { ratio }),
+    ...(thinking === undefined ? {} : { thinking }),
     ...(benefit ? { benefit: true } : {}),
   }
 }
@@ -297,6 +313,7 @@ export function backfillParams(
       supportsImages: current.supportsImages || fallback.supportsImages,
       // 倍率只来自发现：参数表里的占位条目没有 ratio，绝不能拿它当兜底。
       ...(current.ratio === undefined ? {} : { ratio: current.ratio }),
+      ...(current.thinking === undefined ? {} : { thinking: current.thinking }),
       ...(current.benefit === true ? { benefit: true } : {}),
     })
   }

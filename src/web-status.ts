@@ -16,6 +16,7 @@ import type { CodeArtsAccountStore, CodeArtsAccountSummary } from './auth.ts'
 import type { AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
 import type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
+import type { CodeArtsQueueEntry } from './queue.ts'
 import type { UsageSnapshot, UsageTotals } from './usage.ts'
 // 卡片只认 web-status 这一份状态契约，所以契约里用到的积分类型要跟着转出去 ——
 // 否则 client 侧只能越过本模块去直引 credits.ts。
@@ -49,6 +50,8 @@ export const CODEARTS_ACCOUNTS_PATH = '/api/codearts/accounts'
 export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
 /** POST /api/codearts/refresh-models — 立刻重拉一次模型目录，并清掉「福利今日不可用」标记。 */
 export const CODEARTS_REFRESH_MODELS_PATH = '/api/codearts/refresh-models'
+/** GET /api/codearts/queue — 上游排队位置（只在等开流期间有值，底部积分条旁边展示）。 */
+export const CODEARTS_QUEUE_PATH = '/api/codearts/queue'
 
 /** 勾选 UI 的一个选项。 */
 export interface CodeArtsModelChoice {
@@ -248,6 +251,8 @@ export interface CodeArtsStatusRouteOptions {
    * 只在发现流程里拉。上游轮换后，用户需要一个立刻见效的出口。
    */
   refreshModels?: () => Promise<{ models: number; benefit: number; refreshed: boolean }>
+  /** 当前在上游排队、值得展示的请求。省略则卡片不显示排队信息。 */
+  queue?: () => readonly CodeArtsQueueEntry[]
   /**
    * Persist a new allowlist. Resolves false when no settings provider is
    * attached, which the card renders as a read-only selection.
@@ -661,6 +666,21 @@ function refreshModelsHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/** GET /api/codearts/queue — 排队位置快照（无跟踪器/无排队时给空数组）。 */
+function queueHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'GET') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    json(res, 200, { queue: deps.queue?.() ?? [] })
+  }
+}
+
 /** Mount the status / models / token routes. */
 export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRouteOptions): void {
   ctx.effect(() => {
@@ -715,6 +735,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_REFRESH_MODELS_PATH,
       handler: refreshModelsHandler(deps),
     })
+    const disposeQueue = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_QUEUE_PATH,
+      handler: queueHandler(deps),
+    })
     return () => {
       disposeStatus()
       disposeModels()
@@ -725,6 +750,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeAccounts()
       disposeClaim()
       disposeRefresh()
+      disposeQueue()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()
     }

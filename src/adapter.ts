@@ -9,13 +9,14 @@
  * MVP simplifications vs dsh-codebuddy-cli:
  *   - only the default-slot credit multiplier goes into the model name (`(x0.18)`);
  *     per-request cost is not modelled (subscription quota, cost reported as zero)
- *   - no per-model reasoning ladder (models are surfaced as plain chat models)
+ *   - reasoning levels are surfaced only where upstream's thinking-variants names
+ *     them (`GLM-5.2` → high/max); everything else stays a plain chat model
  *
  * @module dsh-codearts/adapter
  */
 
 import { createProvider } from '@earendil-works/pi-ai'
-import type { Api, Model, Provider } from '@earendil-works/pi-ai'
+import type { Api, Model, Provider, ThinkingLevelMap } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type { LlmModelInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
@@ -83,8 +84,32 @@ export interface CodeArtsAdapter {
   invalidate: () => void
 }
 
+/** pi-ai's selectable levels, in escalation order. */
+const REASONING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+/**
+ * Turn upstream's thinking strengths into pi-ai reasoning metadata.
+ *
+ * Every level upstream does not declare is pinned to `null`: pi-ai treats a
+ * missing entry as supported, so leaving them out would offer Off/Minimal/Low/
+ * Medium for a model that only knows high/max. `off` is pinned as well — the
+ * gateway's default is already high, and claiming Off would send no effort
+ * field and still think.
+ */
+export function thinkingFields(strengths: readonly string[] | undefined): {
+  reasoning: boolean
+  thinkingLevelMap?: ThinkingLevelMap
+} {
+  const offered = new Set(strengths ?? [])
+  if (!REASONING_LEVELS.some(level => level !== 'off' && offered.has(level))) return { reasoning: false }
+  const map = {} as Record<(typeof REASONING_LEVELS)[number], string | null>
+  for (const level of REASONING_LEVELS) map[level] = offered.has(level) ? level : null
+  return { reasoning: true, thinkingLevelMap: map }
+}
+
 /** Build one pi-ai model descriptor pointing at the loopback shim. */
 function toPiModel(info: CodeArtsModelInfo, baseUrl: string): Model<Api> {
+  const thinking = thinkingFields(info.thinking?.strengths)
   return {
     id: info.id,
     name: info.name,
@@ -92,8 +117,8 @@ function toPiModel(info: CodeArtsModelInfo, baseUrl: string): Model<Api> {
     provider: CODEARTS_PROVIDER,
     baseUrl,
     input: info.supportsImages === true ? (['text', 'image'] as const) : (['text'] as const),
-    // MVP: no reasoning ladder surfaced; CodeArts reasoning is not modeled here.
-    reasoning: false,
+    reasoning: thinking.reasoning,
+    ...(thinking.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: thinking.thinkingLevelMap }),
     cost: NO_COST,
     contextWindow: info.contextWindow,
     maxTokens: info.maxTokens,

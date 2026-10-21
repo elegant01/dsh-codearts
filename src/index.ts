@@ -14,11 +14,9 @@
  * (`src/discovery.ts`): the plugin asks CodeArts for the account's real model
  * list on startup and hourly, and falls back to the seed when that fails.
  *
- * Deliberately out of scope for now:
- *   - no account balance/credits: CodeArts exposes no such API. The plugin keeps
- *     its own ledger of requests it sent (`src/usage.ts`) and links to the
- *     official usage page instead of inventing a number.
- *   - no per-model reasoning ladder (models surface as plain chat models)
+ * Reasoning levels come from upstream's `thinking-variants` catalog (only the
+ * models it names, e.g. GLM-5.2 → high/max). While a request waits for its
+ * stream, the shim also polls the upstream queue position for the dock.
  *
  * @module dsh-codearts
  */
@@ -32,6 +30,7 @@ import { CodeArtsAccountPool } from './account-pool.ts'
 import { CodeArtsCatalog, filterEnabledModels, isBenefitModel } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
 import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
+import { CodeArtsQueueGate } from './queue.ts'
 import { CodeArtsCreditCache } from './credits.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { createCodeArtsShim } from './shim.ts'
@@ -137,6 +136,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
   const catalog = new CodeArtsCatalog()
   // 用量账本：记本机经插件发出的请求（账号总额度见 credits.ts，这里只记本机）。
   const usage = new CodeArtsUsageTracker({ path: codeartsUsagePath() })
+  // 上游排队位置：shim 在等开流时 start/stop，底部积分条轮询 /queue 读快照。
+  const queue = new CodeArtsQueueGate()
   // 积分：CodeArts **有**积分接口（2026-10 从官方 Agent 客户端挖出，见 credits.ts）。
   const credits = new CodeArtsCreditCache()
 
@@ -198,6 +199,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     setEnabledModels,
     pool: () => pool.list(),
     usage: () => usage.snapshot(),
+    queue: () => queue.snapshot(),
     credits: signal => loadCredits(signal),
     claim: async (accountId?: string) => {
       const ids = accountId === undefined ? await store.ids() : [accountId]
@@ -279,6 +281,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
   let stopped = false
   ctx.effect(() => () => {
     stopped = true
+    queue.dispose()
     // 账本落盘再关：不然最后几秒的用量会随进程一起丢。
     void usage.flush().catch(() => {})
     void shim.close().catch(() => {})
@@ -318,7 +321,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
   })
 
   // Build the loopback shim first; the adapter reads its origin at construction.
-  const shim = createCodeArtsShim({ store, catalog, pool, usage, logger: ctx.logger })
+  const shim = createCodeArtsShim({ store, catalog, pool, usage, queue, logger: ctx.logger })
 
   // 账本懒加载：读盘失败/文件不存在都不影响插件启动。
   void usage.load().catch(() => {})

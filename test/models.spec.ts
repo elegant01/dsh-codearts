@@ -16,6 +16,7 @@ import {
   type CodeArtsModelInfo,
 } from '../src/catalog.ts'
 import { refreshCatalog } from '../src/discovery.ts'
+import { thinkingFields } from '../src/adapter.ts'
 import { fetchModels, maxTokensCeilingFor, MAX_TOKENS_CEILING } from '../src/upstream.ts'
 
 const model = (id: string, patch: Partial<CodeArtsModelInfo> = {}): CodeArtsModelInfo => ({
@@ -204,6 +205,32 @@ describe('maxTokensCeilingFor', () => {
   })
 })
 
+describe('thinkingFields', () => {
+  // pi-ai 把「没写」当支持：只报 high/max 的模型必须把其余档位钉成 null，
+  // 否则选择器里会冒出 Off/Minimal/Low/Medium。
+  it('offers only the declared levels and pins the rest to null', () => {
+    const fields = thinkingFields(['high', 'max'])
+    expect(fields.reasoning).toBe(true)
+    expect(fields.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: null,
+      medium: null,
+      high: 'high',
+      xhigh: null,
+      max: 'max',
+    })
+  })
+
+  it('stays a plain chat model without a usable strength', () => {
+    expect(thinkingFields(undefined)).toEqual({ reasoning: false })
+    expect(thinkingFields([])).toEqual({ reasoning: false })
+    // 不认识的档位名不能编成推理能力，否则会发出上游不认的 reasoning_effort。
+    expect(thinkingFields(['ultra'])).toEqual({ reasoning: false })
+    expect(thinkingFields(['off'])).toEqual({ reasoning: false })
+  })
+})
+
 /** 三路响应都按 2026-09-30 实测形状裁剪。 */
 const BUILTIN_BODY = JSON.stringify({
   count: 4,
@@ -281,6 +308,15 @@ const AGENT_DETAIL_BODY = JSON.stringify({
   },
 })
 
+// 26.10.0 的思考档位：只有 GLM 系报了 high/max，其余空 strengths。
+const THINKING_BODY = JSON.stringify({
+  variants: {
+    'GLM-5.2': { strengths: ['high', 'max'], default_strength: 'high' },
+    'glm-5.2-sft-harmony': { strengths: ['high'], default_strength: 'high' },
+    'Qwen3-VL-235B': { strengths: [] },
+  },
+})
+
 const credential = {
   token: 'sts-token',
   accessKeyId: 'AKIDEXAMPLE',
@@ -313,6 +349,7 @@ describe('fetchModels', () => {
       '/api/v1/gateway/config': () => json(BENEFIT_BODY),
       '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
       '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/model/thinking-variants': () => json(THINKING_BODY),
     })
 
     const result = await fetchModels(credential)
@@ -340,6 +377,10 @@ describe('fetchModels', () => {
     // 参数表里有 GLM-5.1，但这次三路都没返回它 —— 目录里就不该出现（不做兜底）。
     expect(byId.has('GLM-5.1')).toBe(false)
     expect(result.models.every(m => m.maxTokens > 0 && m.contextWindow > 0)).toBe(true)
+    // 思考档位按上游清单挂上；声明了空清单的不带。
+    expect(byId.get('GLM-5.2')?.thinking).toEqual({ strengths: ['high', 'max'], default: 'high' })
+    expect(byId.get('glm-5.2-sft-harmony')?.thinking?.strengths).toEqual(['high'])
+    expect(byId.get('Qwen3-VL-235B')?.thinking).toBeUndefined()
   })
 
   it('keeps working when a source fails (benefit gateway down)', async () => {
@@ -348,12 +389,30 @@ describe('fetchModels', () => {
       '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
       '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
       '/api/v1/gateway/config': () => new Response('{"error_code":"0500"}', { status: 500 }),
+      '/v1/model/thinking-variants': () => json(THINKING_BODY),
     })
 
     const result = await fetchModels(credential)
     expect([...result.sources].sort()).toEqual(['agent', 'builtin'])
     expect(result.errors.map(e => e.source)).toEqual(['benefit'])
     expect(result.models.map(m => m.id)).toContain('GLM-5.2')
+  })
+
+  // 思考档位只是增强：这一路挂了不能把目录一起带走。
+  it('keeps the catalog when only thinking-variants fails', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/model/thinking-variants': () => new Response('nope', { status: 500 }),
+    })
+
+    const result = await fetchModels(credential)
+    expect(result.errors.map(e => e.source)).toEqual(['thinking'])
+    const glm = result.models.find(m => m.id === 'GLM-5.2')
+    expect(glm).toBeDefined()
+    expect(glm?.thinking).toBeUndefined()
   })
 
   it('reports an error when every source rejects the request', async () => {
@@ -389,6 +448,7 @@ describe('refreshCatalog 的显示名', () => {
       '/api/v1/gateway/config': () => json(BENEFIT_BODY),
       '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
       '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/model/thinking-variants': () => json(THINKING_BODY),
     })
     const catalog = new CodeArtsCatalog()
     await refreshCatalog(oneAccountStore(), catalog)

@@ -143,6 +143,16 @@ describe('prepareChatBody', () => {
     expect(parsed.tool_choice).toBe('auto')
   })
 
+  // DSH 的思考档位由 pi-ai 发成顶层 reasoning_effort；网关按官方内核的写法接受它。
+  it('forwards the reasoning effort pi-ai sends for thinking models', () => {
+    const { body } = prepareChatBody(JSON.stringify({
+      model: 'GLM-5.2',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 'max',
+    }))
+    expect(JSON.parse(body).reasoning_effort).toBe('max')
+  })
+
   it('clamps max_tokens to the upstream ceiling (InferHub.001001005.400 beyond it)', () => {
     const { body } = prepareChatBody(JSON.stringify({
       model: 'deepseek-v4.1-flash',

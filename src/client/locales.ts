@@ -83,6 +83,8 @@ export interface CodeArtsSettingsKey {
   creditsNeedSignIn: string
   creditsDock: string
   creditsDockTitle: string
+  queueDock: string
+  queueDockTitle: string
   claimButton: string
   claimButtonDone: string
   claimPending: string
@@ -180,6 +182,8 @@ export const zh: CodeArtsSettingsKey = {
   creditsNeedSignIn: '这个账号需要重新登录',
   creditsDock: '积分 {remain}',
   creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
+  queueDock: '排队第 {position} 位',
+  queueDockTitle: '上游排队：{model} · 第 {position} 位 / 共 {length} 条',
   claimButton: '签到领积分',
   claimButtonDone: '今日已领',
   claimPending: '领取中…',
@@ -276,6 +280,8 @@ export const en: CodeArtsSettingsKey = {
   creditsNeedSignIn: 'This account needs signing in again',
   creditsDock: 'Credits {remain}',
   creditsDockTitle: 'CodeArts credits left {remain} / {total}',
+  queueDock: 'Queued #{position}',
+  queueDockTitle: 'Upstream queue: {model} · position {position} of {length}',
   claimButton: 'Claim daily credits',
   claimButtonDone: 'Claimed today',
   claimPending: 'Claiming…',

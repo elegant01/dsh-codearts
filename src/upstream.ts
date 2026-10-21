@@ -32,6 +32,13 @@ const EP_BENEFIT_CONFIG = '/api/v1/gateway/config'
 const EP_AGENT_LIST = '/v1/agent-center/agents/useragents'
 const EP_AGENT_DETAIL = '/v1/agent-center/agents/detail'
 /**
+ * 模型的思考强度清单（26.10.0 新增）。**必须带 `Agent-Type: PromptCenter`**：
+ * 不带头时上游回 `TM.00001001 请求头Agent-Type为空`（实测）。
+ */
+const EP_THINKING_VARIANTS = '/v1/model/thinking-variants'
+/** 排队位置（26.10.0 新增）：按 chat_id 查这条请求在上游队里的排位。 */
+const EP_QUEUE_STATUS = '/api/v1/queue/status'
+/**
  * 当前登录身份。**必须带 `/snap-manager` 前缀**：2026-09-30 实测
  * `/v1/current/user` 是 APIG.0101（未发布），`/snap-manager/v1/current/user`
  * 才返回 `{user_id, user_name, domain_id}`。codearts2api 的 const.go 里少了这段前缀
@@ -273,7 +280,9 @@ export interface PreparedChatBody {
  *     （两者任一超限，上游都只会流内回 InferHub.001001005.400
  *     "The request param is invalid, Please check it"，不告诉我们是哪一个）
  *  3. 丢弃非白名单字段（stream_options / store / logprobs 等虽实测可容忍，
- *     但按 codearts2api 观察到的真实流量收窄，避免网关后续收紧）
+ *     但按 codearts2api 观察到的真实流量收窄，避免网关后续收紧）；
+ *     例外是 `reasoning_effort`（DSH 的思考档位）：官方内核同样以这个顶层字段
+ *     透传 variant，见 kernel 的 `inferhub getArgs`。
  *  4. tools[].function 去掉 strict（OpenAI 专有）
  *  5. 注入 CodeArts 特有字段：chat_id（按对话派生，见 conversationChatId）、
  *     prompt_cache_key、tool_stream
@@ -296,7 +305,7 @@ export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedCha
   // stream_options 实测可被网关接受，且 include_usage: true 会让上游在流末尾
   // 回真实 usage 帧（否则整条流 usage 全 0，DSH 底部的 token/tok/s 药丸没数据）。
   const body: Record<string, unknown> = {}
-  for (const key of ['messages', 'temperature', 'top_p', 'max_tokens', 'stop', 'presence_penalty', 'frequency_penalty', 'tools', 'tool_choice', 'user', 'stream_options']) {
+  for (const key of ['messages', 'temperature', 'top_p', 'max_tokens', 'stop', 'presence_penalty', 'frequency_penalty', 'tools', 'tool_choice', 'user', 'stream_options', 'reasoning_effort']) {
     if (parsed[key] !== undefined) body[key] = parsed[key]
   }
   // 上游默认不发 usage;强制要求回传(幂等,pi-ai 每次都会带)。
@@ -701,8 +710,11 @@ export async function fetchCallerIdentity(
   }
 }
 
-/** 模型清单的三路来源。任一路失败都不阻断，只有三路全失败才算失败。 */
-export type ModelSource = 'builtin' | 'benefit' | 'agent'
+/**
+ * 模型清单的来源。前三路是目录本身（任一路失败都不阻断，只有三路全失败才算失败），
+ * `thinking` 只是目录之上的可选增强：它失败时模型照常可用，只是没有思考档位选择器。
+ */
+export type ModelSource = 'builtin' | 'benefit' | 'agent' | 'thinking'
 
 export interface ModelDiscoveryResult {
   /** 合并后的清单（已去重、已排序）。 */
@@ -940,6 +952,161 @@ async function fetchAgentModels(
 }
 
 /**
+ * 思考强度清单：`POST /v1/model/thinking-variants`，body `{ model_names }`。
+ *
+ * 实测响应 `{ variants: { "GLM-5.2": { strengths: ["high","max"],
+ * default_strength: "high" }, ... } }`，键是请求里的名字（大小写原样），
+ * 不支持的模型给空 `strengths`。官方客户端限 50 个名字，这里照搬。
+ *
+ * 这是**可选增强**：上游没给（旧账号/接口漂移）时模型照常可用，只是宿主不显示
+ * 推理档位选择器。失败由调用方记进 errors，不抛断发现。
+ */
+async function fetchThinkingVariants(
+  credential: CodeArtsResolved,
+  modelIds: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<string, { strengths: string[]; default?: string }>> {
+  const out = new Map<string, { strengths: string[]; default?: string }>()
+  const modelNames = modelIds.slice(0, 50)
+  if (modelNames.length === 0) return out
+  const bodyBuf = Buffer.from(JSON.stringify({ model_names: modelNames }))
+  const req = new Request(`${SNAP_HOST}${EP_THINKING_VARIANTS}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-auth-token': credential.token,
+      'X-Security-Token': credential.securityToken,
+      'x-snap-traceid': randomTraceId(),
+      'X-Language': 'zh-cn',
+      'Agent-Type': 'PromptCenter',
+    },
+    body: bodyBuf,
+  })
+  if (credential.accessKeyId && credential.secretAccessKey) {
+    signRequest(req, bodyBuf, {
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey,
+      securityToken: credential.securityToken,
+    })
+  }
+  const resp = await fetch(req, { signal })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`thinking-variants HTTP ${resp.status} ${text.slice(0, 200)}`)
+  }
+  const body = asRecord(parseJson(await resp.text()))
+  for (const [name, raw] of Object.entries(asRecord(body.variants))) {
+    const variant = asRecord(raw)
+    const strengths = asArray(variant.strengths)
+      .map(value => firstString(value))
+      .filter(value => value !== '')
+    if (strengths.length === 0) continue
+    const fallback = firstString(variant.default_strength)
+    out.set(name.trim().toLowerCase(), {
+      strengths,
+      ...(fallback === '' ? {} : { default: fallback }),
+    })
+  }
+  return out
+}
+
+/** 一条请求在上游队列里的位置。 */
+export interface CodeArtsQueueStatus {
+  status: string
+  queueLength: number
+  queuePosition: number
+  message: string
+}
+
+/**
+ * 查一条请求的排队位置：`GET /api/v1/queue/status?task_id=<chat_id>&model=<model>`。
+ *
+ * ⚠ 这个 GET 是**占号**，不是只读查询：每次调用都会把 task 挂进队列、返回队尾位置，
+ * 用 `clearQueueStatus` 才清得掉（2026-10-21 实测）。队列空闲的模型（如 GLM）直接
+ * 回 `status:"working"`、位置 0；拥堵的模型（如 deepseek-v4.1-flash）对新号一律
+ * 回 `waiting` + 当前队尾。真正的 chat 请求不看这张票，所以要不要等由调用方决定
+ * （见 `src/queue.ts`）。
+ */
+export async function fetchQueueStatus(
+  credential: CodeArtsResolved,
+  chatId: string,
+  model: string,
+  signal?: AbortSignal,
+): Promise<CodeArtsQueueStatus> {
+  const url = new URL(`${SNAP_HOST}${EP_QUEUE_STATUS}`)
+  url.searchParams.set('task_id', chatId)
+  url.searchParams.set('model', model)
+  const req = new Request(url, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-auth-token': credential.token,
+      'X-Security-Token': credential.securityToken,
+      'x-snap-traceid': randomTraceId(),
+      'X-Language': 'zh-cn',
+    },
+  })
+  if (credential.accessKeyId && credential.secretAccessKey) {
+    signRequest(req, Buffer.alloc(0), {
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey,
+      securityToken: credential.securityToken,
+    })
+  }
+  const resp = await fetch(req, { signal })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`queue status HTTP ${resp.status} ${text.slice(0, 200)}`)
+  }
+  const body = asRecord(parseJson(await resp.text()))
+  return {
+    status: firstString(body.status),
+    queueLength: positive(body.queue_length),
+    queuePosition: positive(body.queue_position),
+    message: firstString(body.message),
+  }
+}
+
+/**
+ * 清掉 `fetchQueueStatus` 挂上去的占号：`DELETE /api/v1/queue/status?task_id=&model=`。
+ *
+ * 官方客户端在回答结束、用户取消、排队出错时都会调；不清的话每次查询都会在上游
+ * 队列里留一个幽灵任务，队列只会越来越长。
+ */
+export async function clearQueueStatus(
+  credential: CodeArtsResolved,
+  chatId: string,
+  model: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = new URL(`${SNAP_HOST}${EP_QUEUE_STATUS}`)
+  url.searchParams.set('task_id', chatId)
+  url.searchParams.set('model', model)
+  const req = new Request(url, {
+    method: 'DELETE',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-auth-token': credential.token,
+      'X-Security-Token': credential.securityToken,
+      'x-snap-traceid': randomTraceId(),
+      'X-Language': 'zh-cn',
+    },
+  })
+  if (credential.accessKeyId && credential.secretAccessKey) {
+    signRequest(req, Buffer.alloc(0), {
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey,
+      securityToken: credential.securityToken,
+    })
+  }
+  const resp = await fetch(req, { signal })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`queue clear HTTP ${resp.status} ${text.slice(0, 200)}`)
+  }
+}
+
+/**
  * 动态发现当前账号可用的模型清单（三路合并）。
  *
  * 与 codearts2api 的 `Client.FetchModels` 等价：内置、限时福利、agent-center 三路
@@ -992,14 +1159,27 @@ export async function fetchModels(
   const merged = backfillParams(mergeModelLists(discovered))
   if (merged.length === 0) throw new Error('model discovery returned an empty catalog')
 
-  const models = merged.map(model => ({
-    ...model,
-    contextWindow: model.contextWindow > 0 ? model.contextWindow : UNKNOWN_CONTEXT_WINDOW,
-    maxTokens: Math.min(
-      model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS,
-      maxTokensCeilingFor(model.id),
-    ),
-  }))
+  // 思考强度要在合并之后问：三路都可能有同一个模型，但只有并集才代表这个账号
+  // 真正能选的清单。这一路失败不阻断目录。
+  let variants = new Map<string, { strengths: string[]; default?: string }>()
+  try {
+    variants = await fetchThinkingVariants(credential, merged.map(model => model.id), signal)
+  } catch (error) {
+    errors.push({ source: 'thinking', message: error instanceof Error ? error.message : String(error) })
+  }
+
+  const models = merged.map(model => {
+    const thinking = variants.get(model.id.toLowerCase())
+    return {
+      ...model,
+      ...(thinking === undefined ? {} : { thinking }),
+      contextWindow: model.contextWindow > 0 ? model.contextWindow : UNKNOWN_CONTEXT_WINDOW,
+      maxTokens: Math.min(
+        model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS,
+        maxTokensCeilingFor(model.id),
+      ),
+    }
+  })
 
   // 这里**不**改全局福利集：多账号时要取并集，由调用方（discovery.ts）统一提交，
   // 否则最后拉的那个账号会覆盖掉别的账号确认过的福利模型。

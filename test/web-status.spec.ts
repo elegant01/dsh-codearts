@@ -35,6 +35,7 @@ import {
   CODEARTS_CLAIM_PATH,
   CODEARTS_LOGIN_PATH,
   CODEARTS_LOGIN_STATUS_PATH,
+  CODEARTS_QUEUE_PATH,
   CODEARTS_REFRESH_MODELS_PATH,
   CODEARTS_STATUS_PATH,
   registerCodeArtsStatusRoute,
@@ -355,6 +356,27 @@ describe('GET /api/codearts/status', () => {
     await store.upsert({ token: 'pasted', storedAt: Date.now(), expiration: '2000-01-01T00:00:00Z' })
     const res = await call(routes.get(CODEARTS_STATUS_PATH)!, 'GET', CODEARTS_STATUS_PATH)
     expect(res.body?.status).toBe('expired')
+  })
+})
+
+describe('GET /api/codearts/queue', () => {
+  it('returns the tracker snapshot', async () => {
+    const queued = [{ id: 'chat-1', model: 'GLM-5.2', position: 2, length: 4, status: 'queued', updatedAt: 1 }]
+    const scoped = mountRoutes({ store, models: () => [], queue: () => queued })
+    const res = await call(scoped.get(CODEARTS_QUEUE_PATH)!, 'GET', CODEARTS_QUEUE_PATH)
+    expect(res.status).toBe(200)
+    expect(res.body?.queue).toEqual(queued)
+  })
+
+  it('answers an empty queue when no tracker is wired', async () => {
+    const res = await call(routes.get(CODEARTS_QUEUE_PATH)!, 'GET', CODEARTS_QUEUE_PATH)
+    expect(res.status).toBe(200)
+    expect(res.body?.queue).toEqual([])
+  })
+
+  it('rejects untrusted requests', async () => {
+    const res = await call(routes.get(CODEARTS_QUEUE_PATH)!, 'GET', CODEARTS_QUEUE_PATH, { host: 'evil.example' })
+    expect(res.status).toBe(403)
   })
 })
 

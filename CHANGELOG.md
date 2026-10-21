@@ -3,6 +3,19 @@
 本文件记录本插件的重要改动。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-10-21
+
+### 新增
+
+- 思考强度：模型发现时拉 `thinking-variants`，只给上游声明过档位的模型（GLM-5.2 /
+  GLM-5.2-ArkTS-SPARK：high / max）露出推理选择器，请求以 `reasoning_effort` 透传；
+  这路失败不影响目录。
+- 上游排队：发请求前先向 `/api/v1/queue/status` 挂号并轮询（每 5 秒一次，最多替
+  用户等 20 秒），轮到才开流；等待期间对话底部积分条显示「排队第 N 位」。20 秒
+  还没轮到就不挂请求，直接回一句上游自己的排队文案（第几位 / 共多少条）加
+  「请稍后重试」；结束、取消、放弃都会 `DELETE` 清号，不留幽灵排队。
+- 新接口 `GET /api/codearts/queue`，给卡片读排队快照。
+
 ## [1.0.1] - 2026-10-21
 
 ### 文档
