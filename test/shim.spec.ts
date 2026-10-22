@@ -267,3 +267,67 @@ describe('usage accounting', () => {
     }
   })
 })
+
+/**
+ * 排队闸门的出口：没轮到就不发聊天请求，并把上游那句排队文案回给宿主。
+ *
+ * 状态码必须是 400 而不是 429 —— 宿主的 classifyPiAiError 按文本里的状态码归类，
+ * 429 会被判成 RATE_LIMIT 并自动重试 5 次（实测），用户看到的是「一直转圈」。
+ */
+describe('queue gate replies', () => {
+  async function withGate(outcome: unknown): Promise<{ port: number; bearer: string; close: () => Promise<void> }> {
+    const upstream = vi.fn(async () => {
+      throw new Error('排队没等到时不该发聊天请求')
+    })
+    vi.stubGlobal('fetch', upstream)
+    const gated = createCodeArtsShim({
+      store: { ids: async () => ['acct'], resolve: async () => ({ token: 't', securityToken: 't' }) } as never,
+      catalog: { current: () => CATALOG } as never,
+      queue: { wait: async () => outcome } as never,
+    })
+    await gated.ready
+    return {
+      port: Number(new URL(gated.baseUrl()).port),
+      bearer: gated.token(),
+      close: async () => {
+        await gated.close()
+        vi.unstubAllGlobals()
+      },
+    }
+  }
+
+  const chat = async (shimPort: number, token: string) =>
+    raw(shimPort, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: { host: `127.0.0.1:${shimPort}`, authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    })
+
+  it('answers a queued verdict with 400 and the upstream wording', async () => {
+    const gated = await withGate({ kind: 'queued', position: 595, length: 600, message: '当前请求量较大，您排在第595位。' })
+    try {
+      const res = await chat(gated.port, gated.bearer)
+      expect(res.status).toBe(400)
+      const error = (res.body as { error: { code: string; message: string } }).error
+      expect(error.code).toBe('queued')
+      expect(error.message).toContain('您排在第595位')
+      expect(error.message).toContain('请稍后重试')
+      // 429/timeout 这类词会踩到宿主的重试分类，正文里不能出现。
+      expect(error.message).not.toMatch(/\b429\b|rate.?limit|timeout/i)
+    } finally {
+      await gated.close()
+    }
+  })
+
+  it('answers queue_full with 429 and never opens the chat request', async () => {
+    const gated = await withGate({ kind: 'queue_full', message: '队列已满，请稍后再试' })
+    try {
+      const res = await chat(gated.port, gated.bearer)
+      expect(res.status).toBe(429)
+      expect((res.body as { error: { message: string } }).error.message).toBe('队列已满，请稍后再试')
+    } finally {
+      await gated.close()
+    }
+  })
+})
