@@ -3,6 +3,19 @@
 本文件记录本插件的重要改动。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-10-22
+
+### 修复
+
+- **带思考档位的模型（GLM-5.2 / GLM-5.2-ArkTS-SPARK）每轮必失败，报
+  `Message role cannot empty`**：1.1.0 给这些模型声明了 `reasoning`，宿主 pi-ai 于是
+  把系统提示从 `role:"system"` 换成 OpenAI 的新叫法 `role:"developer"` 发出来，
+  华为网关只认 system/user/assistant/tool，认不出来就回这一句黑话。出口处统一把
+  `developer` 归一回 `system`，与档位无关（Default/High/Max 之前都必现）。
+- 新增 `GET /api/codearts/debug`：回最近 8 次出站请求的**形状**摘要（消息条数、
+  每条的 role 名、工具数），只含 role 名不含任何内容。上游的参数错误全是同一句
+  黑话，没有这个就分不清是宿主发的还是插件拼的。
+
 ## [1.1.0] - 2026-10-21
 
 ### 新增

@@ -126,8 +126,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 /** 一次请求最多试几个账号（与 Go 参考的 MaxRotate 一致）。 */
-const MAX_ROTATE = 3
-/** 一次请求最多把 max_tokens 降几档（65536 → 32768 → 16384 → 8192）。 */
+const MAX_ROTATE = 3/** 一次请求最多把 max_tokens 降几档（65536 → 32768 → 16384 → 8192）。 */
 const MAX_CEILING_HEALS = 3
 /**
  * 所有账号都撞上并发上限时，回落到「在同一账号上原地重发」的预算。
@@ -149,6 +148,57 @@ const ERROR_COOLDOWN_MS = 60_000
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
+
+/**
+ * 最近几次出站请求的**形状**摘要：只有消息条数、role 名、工具数量，绝不记内容。
+ *
+ * 存在的理由只有一个：上游对参数问题只会回一句黑话（实测「Message role cannot
+ * empty」这类），不看请求形状就分不清是宿主发了空 role 还是我们拼坏了。
+ * 走 `/api/codearts/debug` 读，重启即清。
+ */
+export interface RequestShapeSummary {
+  at: number
+  model: string
+  messages: number
+  roles: string[]
+  /** role 为空（或缺失/非字符串）的消息下标。 */
+  emptyRoleAt: number[]
+  tools: number
+}
+
+const recentShapes: RequestShapeSummary[] = []
+
+/** 最近的请求形状，最新在前。 */
+export function recentRequestShapes(): readonly RequestShapeSummary[] {
+  return [...recentShapes].reverse()
+}
+
+function noteRequestShape(raw: string, model: string): void {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return
+  }
+  if (parsed === null || typeof parsed !== 'object') return
+  const list = Array.isArray((parsed as { messages?: unknown }).messages)
+    ? (parsed as { messages: unknown[] }).messages
+    : []
+  const roles = list.map(message => {
+    if (message === null || typeof message !== 'object') return ''
+    const role = (message as { role?: unknown }).role
+    return typeof role === 'string' ? role : ''
+  })
+  recentShapes.push({
+    at: Date.now(),
+    model,
+    messages: list.length,
+    roles,
+    emptyRoleAt: roles.map((role, index) => (role === '' ? index : -1)).filter(index => index >= 0),
+    tools: Array.isArray((parsed as { tools?: unknown }).tools) ? (parsed as { tools: unknown[] }).tools.length : 0,
+  })
+  if (recentShapes.length > 8) recentShapes.shift()
+}
 
 export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   const { store, catalog } = options
@@ -349,6 +399,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       // 解析不了就交给 prepareChatBody 自己的兜底路径
     }
     const checked = prepareChatBody(raw, contextWindow)
+    noteRequestShape(raw, checked.model)
     if (checked.error !== undefined) {
       writeOpenAIError(res, 400, 'context_overflow', checked.error)
       return

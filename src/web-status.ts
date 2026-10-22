@@ -52,6 +52,8 @@ export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
 export const CODEARTS_REFRESH_MODELS_PATH = '/api/codearts/refresh-models'
 /** GET /api/codearts/queue — 上游排队位置（只在等开流期间有值，底部积分条旁边展示）。 */
 export const CODEARTS_QUEUE_PATH = '/api/codearts/queue'
+/** 最近出站请求的**形状**摘要（只有 role 名与计数，不含内容），排障用。 */
+export const CODEARTS_DEBUG_PATH = '/api/codearts/debug'
 
 /** 勾选 UI 的一个选项。 */
 export interface CodeArtsModelChoice {
@@ -253,6 +255,8 @@ export interface CodeArtsStatusRouteOptions {
   refreshModels?: () => Promise<{ models: number; benefit: number; refreshed: boolean }>
   /** 当前在上游排队、值得展示的请求。省略则卡片不显示排队信息。 */
   queue?: () => readonly CodeArtsQueueEntry[]
+  /** 最近几次出站请求的形状摘要（`/api/codearts/debug`）。 */
+  recentRequests?: () => readonly unknown[]
   /**
    * Persist a new allowlist. Resolves false when no settings provider is
    * attached, which the card renders as a read-only selection.
@@ -681,6 +685,21 @@ function queueHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/** GET /api/codearts/debug — 最近出站请求的形状摘要（只有 role 名与计数）。 */
+function debugHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'GET') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    json(res, 200, { requests: deps.recentRequests?.() ?? [] })
+  }
+}
+
 /** Mount the status / models / token routes. */
 export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRouteOptions): void {
   ctx.effect(() => {
@@ -740,6 +759,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_QUEUE_PATH,
       handler: queueHandler(deps),
     })
+    const disposeDebug = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_DEBUG_PATH,
+      handler: debugHandler(deps),
+    })
     return () => {
       disposeStatus()
       disposeModels()
@@ -751,6 +775,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeClaim()
       disposeRefresh()
       disposeQueue()
+      disposeDebug()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()
     }

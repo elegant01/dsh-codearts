@@ -33,7 +33,7 @@ import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CodeArtsQueueGate } from './queue.ts'
 import { CodeArtsCreditCache } from './credits.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
-import { createCodeArtsShim } from './shim.ts'
+import { createCodeArtsShim, recentRequestShapes } from './shim.ts'
 import { registerCodeArtsStatusRoute, summarizeClaims } from './web-status.ts'
 import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult } from './web-status.ts'
 import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
@@ -200,6 +200,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     pool: () => pool.list(),
     usage: () => usage.snapshot(),
     queue: () => queue.snapshot(),
+    recentRequests: () => recentRequestShapes(),
     credits: signal => loadCredits(signal),
     claim: async (accountId?: string) => {
       const ids = accountId === undefined ? await store.ids() : [accountId]

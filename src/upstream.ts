@@ -308,6 +308,14 @@ export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedCha
   for (const key of ['messages', 'temperature', 'top_p', 'max_tokens', 'stop', 'presence_penalty', 'frequency_penalty', 'tools', 'tool_choice', 'user', 'stream_options', 'reasoning_effort']) {
     if (parsed[key] !== undefined) body[key] = parsed[key]
   }
+  // 华为网关只认 system/user/assistant/tool。pi-ai 在模型声明 reasoning 时会把系统
+  // 提示发成 `role:"developer"`（OpenAI 的新叫法），上游认不出来就回一句
+  // 「Message role cannot empty」（实测 2026-10-22，GLM-5.2 带思考档位后必现）。
+  if (Array.isArray(body.messages)) {
+    body.messages = (body.messages as Record<string, unknown>[]).map(message =>
+      message?.role === 'developer' ? { ...message, role: 'system' } : message,
+    )
+  }
   // 上游默认不发 usage;强制要求回传(幂等,pi-ai 每次都会带)。
   if (body.stream_options === undefined || typeof body.stream_options !== 'object') {
     body.stream_options = { include_usage: true }

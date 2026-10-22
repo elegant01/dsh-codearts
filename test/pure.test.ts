@@ -80,8 +80,22 @@ describe('prepareChatBody', () => {
     expect(parsed.messages).toEqual([{ role: 'user', content: 'hi' }])
   })
 
-  it('passes malformed input through so the upstream can report the error', () => {
-    const raw = '{not json'
+  it('rewrites the OpenAI "developer" role to system — 华为网关只认四种 role', () => {
+    const { body } = prepareChatBody(JSON.stringify({
+      model: 'GLM-5.2',
+      messages: [
+        { role: 'developer', content: '系统提示' },
+        { role: 'user', content: 'hi' },
+      ],
+    }))
+    const parsed = JSON.parse(body)
+    expect(parsed.messages).toEqual([
+      { role: 'system', content: '系统提示' },
+      { role: 'user', content: 'hi' },
+    ])
+  })
+
+  it('passes malformed input through so the upstream can report the error', () => {    const raw = '{not json'
     const { body, model } = prepareChatBody(raw)
     expect(body).toBe(raw)
     expect(model).toBe('')
