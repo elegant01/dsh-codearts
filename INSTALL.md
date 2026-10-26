@@ -104,6 +104,28 @@ node scripts/deploy.mjs [profileDir]     # profileDir 默认 <用户目录>/.dsh
 2. **用 Node `fs.writeFileSync`**（默认无 BOM）。
 3. **用 PowerShell 7 的 `-Encoding utf8NoBOM`**（PS5.1 没有该选项）。
 
+## 八、更新到 1.1.3+ 报「更新失败：`ERR_PNPM_IGNORED_BUILDS`」
+
+不是安装失败 —— 看输出里的 `+ dsh-codearts 1.1.3`，包其实已经装好了。报错的是
+pnpm 11 的收尾检查：1.1.3 起插件自带一份 `@earendil-works/pi-ai`，它间接依赖
+`@google/genai` 和 `protobufjs`，这两个包带安装期脚本；pnpm 11 默认拦截未批准的依赖
+脚本（`strictDepBuilds`）并以**非零码退出**，DSH 更新器据此判为失败。这两个脚本一个
+是 no-op echo、一个是包完整性自检，**不跑没有任何功能影响**。
+
+修法（一次性）：在 profile 的 `pnpm-workspace.yaml`（如
+`~/.dsh/profiles/desktop/pnpm-workspace.yaml`）里追加：
+
+```yaml
+allowBuilds:
+  '@google/genai': false
+  protobufjs: false
+```
+
+`false` 表示「明确不跑它们的安装脚本」。然后重新更新即可。注意：如果该文件里已有
+`'@google/genai': set this to true or false` 这样的占位行（pnpm 自动加的），必须把值
+改成 `false` —— 占位符不算决定，会一直报错。也可以在 profile 目录跑
+`pnpm approve-builds` 交互式处理。
+
 写入后务必用 Node 校验前 3 字节是否为 BOM：
 ```js
 const fs=require('fs');const b=fs.readFileSync(p);

@@ -12,6 +12,7 @@ import { MIN_PI_AI_VERSION, probePiAiCompat, resetPiAiCompatProbe } from '../src
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
   dependencies?: Record<string, string>
   peerDependencies?: Record<string, string>
+  devDependencies?: Record<string, string>
 }
 
 afterEach(() => {
@@ -21,11 +22,13 @@ afterEach(() => {
 })
 
 describe('pi-ai packaging', () => {
-  // 只写 peerDependencies 的话，npm 装插件时区间不会被强制满足：没有自己的
-  // node_modules，ESM 解析直接落到 profile 顶层那份（实测可以是 0.82.1）。
-  it('ships pi-ai as a real dependency, not a peer', () => {
-    expect(pkg.dependencies?.['@earendil-works/pi-ai']).toMatch(/^\^?\d+\.\d+\.\d+$/)
+  // 1.1.3 把 pi-ai 放进 dependencies「自带一份」，但它拖进 @google/genai / protobufjs
+  // （都带安装脚本），pnpm 11 的 strictDepBuilds 让用户更新直接失败。1.1.4 起改为构建期
+  // 打包进 lib/：运行时零 npm 依赖，hoist 版本冲突和脚本拦截一起绝根。
+  it('bundles pi-ai at build time — no runtime dependency at all', () => {
+    expect(pkg.dependencies?.['@earendil-works/pi-ai']).toBeUndefined()
     expect(pkg.peerDependencies?.['@earendil-works/pi-ai']).toBeUndefined()
+    expect(pkg.devDependencies?.['@earendil-works/pi-ai']).toMatch(/^\^?\d+\.\d+\.\d+$/)
   })
 })
 

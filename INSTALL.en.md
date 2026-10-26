@@ -133,3 +133,27 @@ console.log(b[0]===0xEF&&b[1]===0xBB&&b[2]===0xBF?'BOM!':'no-BOM');
 > PS 5.1, which crashed startup repeatedly. It was fixed by rewriting the file with Node
 > (backup `package.json.bak-bomfix-*`). A scan of the whole `~/.dsh` tree found that one
 > file only.
+
+## 8. Update to 1.1.3+ fails with `ERR_PNPM_IGNORED_BUILDS`
+
+It is not actually a failed install — the `+ dsh-codearts 1.1.3` line means the package
+already landed. What fails is pnpm 11's post-install check: since 1.1.3 the plugin bundles
+its own copy of `@earendil-works/pi-ai`, which transitively pulls `@google/genai` and
+`protobufjs`; both carry install-time scripts, pnpm 11 blocks unapproved dependency scripts
+by default (`strictDepBuilds`) and exits non-zero, which the DSH updater reports as failure.
+Neither script does anything needed at runtime (one is a no-op echo, the other a package
+integrity self-check), so skipping them is safe.
+
+One-time fix: append to the profile's `pnpm-workspace.yaml`
+(e.g. `~/.dsh/profiles/desktop/pnpm-workspace.yaml`):
+
+```yaml
+allowBuilds:
+  '@google/genai': false
+  protobufjs: false
+```
+
+`false` means "deliberately never run their install scripts". Then retry the update. If the
+file already contains placeholder lines like `'@google/genai': set this to true or false`
+(auto-added by pnpm), replace the value with `false` — placeholders count as undecided and
+keep failing. `pnpm approve-builds` in the profile directory works too.

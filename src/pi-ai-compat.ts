@@ -9,8 +9,8 @@
  * 用户只看得到一句「本轮运行失败」。
  *
  * 什么时候会拿到旧的那份：profile 顶层被别的插件 hoist 了一个低版本，而本插件的依赖
- * 没落地到自己的 `node_modules`。1.1.3 起 `@earendil-works/pi-ai` 已从 peerDependencies
- * 移进 dependencies，区间真正生效；这里再探测一次，把「版本不兼容」明说，而不是让
+ * 没落地到自己的 `node_modules`。1.1.4 起 pi-ai 直接打包进 `lib/`（不再经 npm 解析），
+ * 版本漂移在结构上不可能了；这里仍探测一次，把「产物损坏/不兼容」明说，而不是让
  * 每条消息各自崩在一个看不懂的 TypeError 上。
  *
  * 探测用能力而不是版本号：不依赖 package.json 能不能读到，也对未来的版本漂移免疫。
@@ -35,8 +35,8 @@ export function resetPiAiCompatProbe(): void {
 }
 
 async function runProbe(): Promise<string | undefined> {
-  const hint = `需要 @earendil-works/pi-ai >= ${MIN_PI_AI_VERSION}，请重装 dsh-codearts（1.1.3 起它自带这份依赖），`
-    + '或把 profile 顶层那份升级到同一区间'
+  const hint = `需要 @earendil-works/pi-ai >= ${MIN_PI_AI_VERSION} 的行为；1.1.4 起它已打进插件产物，`
+    + '探测失败说明产物损坏或被改动，请重装 dsh-codearts'
   let estimate: ((message: never) => number) | undefined
   try {
     ;({ estimateMessageTokens: estimate } = await import('@earendil-works/pi-ai/utils/estimate'))

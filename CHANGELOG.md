@@ -3,6 +3,20 @@
 本文件记录本插件的重要改动。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.4] - 2026-10-26
+
+### 修复
+
+- **升级到 1.1.3 报「更新失败：`ERR_PNPM_IGNORED_BUILDS`」**：1.1.3 为修 issue #2 把
+  `@earendil-works/pi-ai` 移进 `dependencies`，连带拉入 `@google/genai` / `protobufjs`
+  （都带安装期脚本）；pnpm 11 默认拦截未批准的依赖脚本并以非零码退出，DSH 更新器据此
+  判失败（包其实已装上）。现在 pi-ai 改为**构建期打包进 `lib/`**：它的厂商 SDK 全是
+  懒加载 lane，插件只用 OpenAI 一路，tree-shaking 后 `@google/genai` / `protobufjs`
+  不进产物也不进依赖树 —— 安装时零新增 npm 包，脚本拦截绝根；pi-ai 版本漂移（issue #2
+  的根因）在结构上一并不可能了。1.1.3 用户侧的临时处理见 INSTALL「八」。
+- 产物体积随之涨到约 1.1 MB（含 pi-ai 核心 + openai SDK 的 openai-completions 懒加载
+  chunk），功能与接口不变。
+
 ## [1.1.3] - 2026-10-26
 
 ### 修复
