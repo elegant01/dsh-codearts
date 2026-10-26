@@ -13,6 +13,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { CodeArtsAccountStore, CodeArtsAccountSummary } from './auth.ts'
+import { MANUAL_ACCOUNT_ID } from './auth.ts'
 import type { AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
 import type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
@@ -22,6 +23,7 @@ import type { UsageSnapshot, UsageTotals } from './usage.ts'
 // 否则 client 侧只能越过本模块去直引 credits.ts。
 export type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
+import { probePiAiCompat } from './pi-ai-compat.ts'
 import {
   clearBenefitBlocked,
   creditRatioLabel,
@@ -185,6 +187,11 @@ export interface CodeArtsWebStatus {
    * 卡片要按账号展示就必须读这里。
    */
   creditsByAccount?: readonly CodeArtsAccountCredits[]
+  /**
+   * 运行时解析到的 `@earendil-works/pi-ai` 不满足要求时的说明。
+   * 有值 = 模型全跑不动（每条消息在出网前就失败），且这是版本装配问题，不是账号或网络。
+   */
+  piAiError?: string
 }
 
 /**
@@ -234,6 +241,11 @@ export interface CodeArtsStatusRouteOptions {
   enabledModels?: () => readonly string[] | undefined
   /** 账号池运行时（槽位占用/冷却/禁用）。省略则卡片不显示槽位区块。 */
   pool?: () => readonly AccountRuntime[]
+  /**
+   * 凭据换新（登录成功/手动贴 token）后复活池里的账号：清掉 disabled 与冷却。
+   * 省略则「重新登录」不影响池状态（disabled 只能靠重启清掉，见 issue #1）。
+   */
+  reviveAccount?: (id: string) => void
   /** 用量账本快照。省略则卡片不显示用量区块。 */
   usage?: () => UsageSnapshot
   /**
@@ -403,9 +415,13 @@ async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWe
   const accounts = await deps.store.list()
   const cred = await deps.store.current()
   const usage = usageOf(deps)
+  // pi-ai 版本不兼容时模型全不可用，但状态接口本身还能用 —— 原因必须在这里给出去，
+  // 否则用户只看到每条消息一句「本轮运行失败」。
+  const piAi = await probePiAiCompat()
+  const compat = piAi === undefined ? {} : { piAiError: piAi }
 
   if (accounts.length === 0 || cred === undefined) {
-    return { status: 'signed-out', models, accounts, usage }
+    return { status: 'signed-out', models, accounts, usage, ...compat }
   }
   // 只要还有**任意一个**账号能用就算登录中 —— 别的号过期了不影响轮转。
   const usable = accounts.some(accountUsable)
@@ -417,8 +433,8 @@ async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWe
     usage,
   }
   // 没有可用账号时不问积分：凭证都过期了，问了也是白跑一趟（还得等超时）。
-  if (!usable) return { status: 'expired', ...identity }
-  return { status: 'signed-in', ...identity, ...await creditsOf(deps) }
+  if (!usable) return { status: 'expired', ...identity, ...compat }
+  return { status: 'signed-in', ...identity, ...compat, ...await creditsOf(deps) }
 }
 
 /** GET /api/codearts/status */
@@ -535,6 +551,8 @@ function tokenPostHandler(deps: CodeArtsStatusRouteOptions) {
       }
       const label = typeof body?.label === 'string' && body.label.trim() !== '' ? body.label.trim() : undefined
       await deps.store.set(token, label)
+      // 手工 token 也是凭据换新：复活「手工」账号，否则它被禁用后贴新 token 也没用。
+      deps.reviveAccount?.(MANUAL_ACCOUNT_ID)
       json(res, 200, await buildStatus(deps))
     } catch (error: unknown) {
       json(res, 500, { error: safeMessage(error) })
@@ -836,6 +854,10 @@ function loginStartHandler(
             if (identity !== null && id !== identity.userId) {
               await deps.store.adoptIdentity(id, identity)
             }
+            // 凭据已换新：把这个号从禁用/冷却里捞出来（含 adopt 前后的两个键）。
+            // 没有这个，「重新登录」对已被禁用的账号完全无效（issue #1）。
+            deps.reviveAccount?.(id)
+            if (identity !== null && identity.userId !== id) deps.reviveAccount?.(identity.userId)
             recordLoginOutcome(recent, session.url, 'done')
           } catch {
             recordLoginOutcome(recent, session.url, 'error')

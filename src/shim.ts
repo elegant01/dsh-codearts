@@ -18,7 +18,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import type { CodeArtsAccountStore } from './auth.ts'
-import { CodeArtsAccountPool, ERROR_THRESHOLD } from './account-pool.ts'
+import { CodeArtsAccountPool, ERROR_THRESHOLD, type AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog } from './catalog.ts'
 import {
   canonicalModel,
@@ -105,6 +105,40 @@ function queuedMessage(
   const upstream = gate.message.trim()
   const detail = upstream === '' ? `上游排队中：${model} 第 ${gate.position} 位（共 ${gate.length} 条）` : upstream
   return `${detail} 插件没有一直等下去，请稍后重试。`
+}
+
+/**
+ * 「一个账号都选不出来」时的报错：把真实原因说清 —— 是禁用（附最后错误）、冷却
+ * （附剩余秒数），还是本地槽位全满。以前三种都回同一句「没有可用账号」，禁用那
+ * 种还把真因（比如 billion-context 本地拒签的 403）整个吞掉（issue #1）。
+ *
+ * 全部被禁用时回 401（宿主只自动重试 429，401 一次就把「去重新登录」说清）；
+ * 只要还有会自己恢复的（冷却/槽位满）就回 429，宿主重试有概率直接救回来。
+ */
+function noAccountError(accounts: readonly AccountRuntime[]): { status: number; kind: string; message: string } {
+  const now = Date.now()
+  const disabled = accounts.filter(a => a.disabled)
+  const cooling = accounts.filter(a => !a.disabled && now < a.coolUntil)
+  // 健康却没被选中：唯一剩下的原因就是本地槽位满了（pick/acquire 只拦这个）。
+  const busy = accounts.filter(a => !a.disabled && now >= a.coolUntil)
+  const parts: string[] = []
+  if (disabled.length > 0) {
+    const reasons = disabled
+      .map(a => (a.lastError === undefined ? a.id : `${a.id}（${a.lastError.slice(0, 120)}）`))
+      .join('、')
+    parts.push(`${disabled.length} 个被禁用：${reasons}——请到设置卡片重新登录（若在用 billion-context，先检查它的 resign 配置）`)
+  }
+  if (cooling.length > 0) {
+    const secs = Math.max(1, Math.ceil((Math.min(...cooling.map(a => a.coolUntil)) - now) / 1000))
+    parts.push(`${cooling.length} 个在短时冷却中（约 ${secs} 秒后恢复）`)
+  }
+  if (busy.length > 0) {
+    parts.push(`${busy.length} 个的本地并发槽位已满（每账号最多 ${busy[0]?.maxConcurrent ?? 2} 个在飞请求），等几秒再发`)
+  }
+  const message = `codearts 当前没有可用账号：${parts.join('；')}`
+  return disabled.length === accounts.length
+    ? { status: 401, kind: 'session_dead', message }
+    : { status: 429, kind: 'soft_rate', message }
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -549,7 +583,8 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     }
 
     if (lastKind === undefined) {
-      writeOpenAIError(res, 429, 'soft_rate', 'codearts 当前没有可用账号（全部被禁用或冷却中），请稍后重试')
+      const none = noAccountError(pool.list())
+      writeOpenAIError(res, none.status, none.kind, none.message)
       return
     }
     // 排队等过就明说等过多久：否则用户不知道插件已经努力过，只会觉得「又失败了」。

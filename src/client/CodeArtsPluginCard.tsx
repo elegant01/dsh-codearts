@@ -884,6 +884,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       </div>
 
       <div className={styles.body}>
+        {status?.piAiError !== undefined && <p className={styles.error}>{status.piAiError}</p>}
         {signedIn ? (
           <>
             <SegmentedTabs

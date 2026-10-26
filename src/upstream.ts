@@ -442,6 +442,9 @@ export function rateLimitFrame(text: string): { code: string; message: string } 
  * 让人以为是自己配错了。默认分支仍保留原始信息，便于排查。
  */
 export function upstreamErrorMessage(message: string, status = 0): string {
+  if (isResignRefusal(message)) {
+    return '本地代理 billion-context 拦下了这条签名请求（它拿不到 CodeArts 凭据做重签，在本地直接拒了），不是你的账号问题：请在 ~/.config/billion-context/billion-context.json 加上 "resign": { "sdk-hmac-sha256": { "passthrough": true } } 后重启 DSH，或为它配置重签凭据。'
+  }
   if (MODEL_RATE_CODE.test(message) || MODEL_RATE_TEXT.test(message)) {
     return '华为侧该模型当前请求过多（共享 TPM 超限），不是你的账号或插件问题。稍后重试，或临时改用 GLM-5.2 / GLM-5.3。'
   }
@@ -471,8 +474,19 @@ export function isBenefitMissing(code: string, message: string): boolean {
   return code === BENEFIT_MISSING_CODE || message.toLowerCase().includes('benefit not found')
 }
 
+/**
+ * 本地代理「拒签」标记：billion-context 这类宿主层代理拦截出站请求做上下文压缩，
+ * 碰到 SDK-HMAC-SHA256 签名请求要用 CodeArts 凭据重签；找不到凭据时在**本地**回
+ * 403（根本没出网），body 里带这两个标记。这不是凭据失效 —— 归 session_dead 会把
+ * 账号永久禁用（见 issue #1）。
+ */
+export function isResignRefusal(message: string): boolean {
+  return message.includes('signed_request_requires_resign') || message.includes('bili_resign_unavailable')
+}
+
 function classify(status: number, message: string): UpstreamErrorKind {
   const m = message.toLowerCase()
+  if (isResignRefusal(message)) return 'client'
   if (status === 401 || status === 403) return 'session_dead'
   if (status === 402) return 'hard_credit'
   if (status === 429) return 'soft_rate'
@@ -481,6 +495,35 @@ function classify(status: number, message: string): UpstreamErrorKind {
   if (m.includes('not registered') || m.includes('benefit not found')) return 'not_found'
   if (m.includes('tpm') || m.includes('并发')) return 'soft_rate'
   return 'client'
+}
+
+/**
+ * 出网唯一入口：**只把 URL 字符串和普通 init 交给 fetch，绝不把 Request 对象交出去**。
+ *
+ * 邻居插件会换掉 `globalThis.fetch`（例如 IP 池出口路由直接把 undici 模块自带的
+ * fetch 装成全局）。这时 `globalThis.Request` 还是另一份实例，而 undici 的 fetch
+ * 用 `instanceof` 认自己的 Request：不是自己那份就当 URL 字符串处理，报
+ * `Failed to parse URL from [object Request]`，而且是 HTTP 0（根本没出网）。
+ * 所以 Request 只当签名的载体（signer 要读写它的头部），发出去时拆回纯数据。
+ *
+ * 头部按 forEach 展开会全部变成小写名 —— 签名侧本来也按小写规范化，HTTP 头大小写
+ * 不敏感，上游不受影响。
+ *
+ * @param req 已签好名的请求
+ * @param body 原始请求体；GET/DELETE 传 undefined（带空 body 的 GET 会被 fetch 直接拒）
+ * @param signal 中止信号
+ */
+async function dispatch(req: Request, body: BodyInit | undefined, signal?: AbortSignal): Promise<Response> {
+  const headers: Record<string, string> = {}
+  req.headers.forEach((value, key) => {
+    headers[key] = value
+  })
+  return fetch(req.url, {
+    method: req.method,
+    headers,
+    ...(body === undefined ? {} : { body }),
+    ...(signal === undefined ? {} : { signal }),
+  })
 }
 
 const enc = new TextEncoder()
@@ -547,7 +590,7 @@ export async function chatStream(
 
   let resp: Response
   try {
-    resp = await fetch(req, { signal })
+    resp = await dispatch(req, bodyBuf, signal)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     // 用户点「停止生成」会让 fetch 抛 AbortError，它也会走到这里。那不是上游故障，
@@ -764,7 +807,7 @@ export async function signedGet(
   }
   let resp: Response
   try {
-    resp = await fetch(req, { signal })
+    resp = await dispatch(req, undefined, signal)
   } catch (error) {
     return { ok: false, status: 0, message: error instanceof Error ? error.message : String(error) }
   }
@@ -997,7 +1040,7 @@ async function fetchThinkingVariants(
       securityToken: credential.securityToken,
     })
   }
-  const resp = await fetch(req, { signal })
+  const resp = await dispatch(req, bodyBuf, signal)
   if (!resp.ok) {
     const text = await resp.text().catch(() => '')
     throw new Error(`thinking-variants HTTP ${resp.status} ${text.slice(0, 200)}`)
@@ -1061,7 +1104,7 @@ export async function fetchQueueStatus(
       securityToken: credential.securityToken,
     })
   }
-  const resp = await fetch(req, { signal })
+  const resp = await dispatch(req, undefined, signal)
   if (!resp.ok) {
     const text = await resp.text().catch(() => '')
     throw new Error(`queue status HTTP ${resp.status} ${text.slice(0, 200)}`)
@@ -1107,7 +1150,7 @@ export async function clearQueueStatus(
       securityToken: credential.securityToken,
     })
   }
-  const resp = await fetch(req, { signal })
+  const resp = await dispatch(req, undefined, signal)
   if (!resp.ok) {
     const text = await resp.text().catch(() => '')
     throw new Error(`queue clear HTTP ${resp.status} ${text.slice(0, 200)}`)
@@ -1224,7 +1267,7 @@ export async function claimBenefit(credential: CodeArtsResolved, abort?: AbortSi
     securityToken: credential.securityToken,
   }
   signRequest(req, bodyBuf, signCred)
-  const resp = await fetch(req, { signal: abort })
+  const resp = await dispatch(req, bodyBuf, abort)
   const raw = await resp.text().catch(() => '')
   if (!resp.ok) {
     throw new Error(`claim benefit failed: ${resp.status} ${raw.slice(0, 200)}`)
@@ -1340,7 +1383,7 @@ async function welfareRequest(
   }
   let resp: Response
   try {
-    resp = await fetch(req, { signal })
+    resp = await dispatch(req, body === undefined ? undefined : bodyBuf, signal)
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }

@@ -21,6 +21,14 @@ const CAP_BODY = JSON.stringify({
 /** 模型级 TPM 限流：2026-10-21 实测是 HTTP 200 + 流内 error_code（当天真实码是 81114）。 */
 const TPM_FRAME = 'data: {"error_code":"InferHub.ModelArts.81114.429","error_msg":"Too many requests, the rate limit is 50000000 tokens per minute."}\n\n'
 
+/**
+ * 出网走 upstream.ts 的 dispatch：只给「字符串 URL + 普通 init」，头部是键已小写的
+ * 普通对象（不能传 Request —— 邻居插件换了 globalThis.fetch 后会认不出）。
+ */
+function authTokenOf(init: { headers?: unknown } | undefined): string {
+  return ((init?.headers ?? {}) as Record<string, string>)['x-auth-token'] ?? ''
+}
+
 function sseResponse(chunks: readonly string[]): Response {
   const encoder = new TextEncoder()
   const body = new ReadableStream<Uint8Array>({
@@ -109,8 +117,8 @@ function stubUpstream(options: { capTimes?: number; tpmTimes?: number } = {}): v
   let aCalls = 0
   const capTimes = options.capTimes ?? (options.tpmTimes === undefined ? Number.POSITIVE_INFINITY : 0)
   const tpmTimes = options.tpmTimes ?? 0
-  vi.stubGlobal('fetch', vi.fn(async (input: Request) => {
-    const token = input.headers.get('x-auth-token') ?? ''
+  vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { headers?: unknown }) => {
+    const token = authTokenOf(init)
     seenTokens.push(token)
     if (token === TOKEN_A) {
       aCalls += 1
@@ -188,8 +196,8 @@ describe('cross-account failover', () => {
   it('disables an account whose credential is rejected, and uses the other one', async () => {
     ids = ['A', 'B']
     seenTokens = []
-    vi.stubGlobal('fetch', vi.fn(async (input: Request) => {
-      const token = input.headers.get('x-auth-token') ?? ''
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { headers?: unknown }) => {
+      const token = authTokenOf(init)
       seenTokens.push(token)
       if (token === TOKEN_A) {
         return new Response('{"error_code":"401","error_msg":"token invalid"}', {
@@ -317,4 +325,130 @@ describe('cross-account failover', () => {
     expect(a?.coolUntil).toBe(0)
     expect(pool.healthy('A')).toBe(true)
   }, 20_000)
+})
+
+/**
+ * issue #1：billion-context 在宿主层拦截出站请求做压缩，碰到 SDK-HMAC-SHA256
+ * 签名请求要用 CodeArts 凭据重签，找不到凭据就在**本地**回 403（根本没出网）。
+ * 这绝不能被当成凭据失效 —— 否则账号被永久禁用，重启、重新登录都救不回来。
+ */
+describe('local proxy resign refusal (issue #1)', () => {
+  /** billion-context 拒签时的真实响应形状（403 + 这两个标记）。 */
+  const RESIGN_BODY = JSON.stringify({
+    error: {
+      type: 'signed_request_requires_resign',
+      code: 'bili_resign_unavailable',
+      message: 'bili refused to forward this sdk-hmac-sha256-signed request: the signature covers the request body.',
+    },
+  })
+
+  async function startWithUpstream(body: string, status: number): Promise<void> {
+    ids = ['A']
+    seenTokens = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { headers?: unknown }) => {
+      seenTokens.push(authTokenOf(init))
+      return new Response(body, { status, headers: { 'content-type': 'application/json' } })
+    }))
+    pool = new CodeArtsAccountPool([])
+    shim = createCodeArtsShim({
+      store: { ids: async () => ids, resolve: async (id: string) => credentialFor(id) } as never,
+      catalog: { current: () => [] } as never,
+      pool,
+    })
+    await shim.ready
+    port = Number(new URL(shim.baseUrl()).port)
+    bearer = shim.token()
+  }
+
+  it('does not disable the account, and answers 400 with an actionable hint', async () => {
+    await startWithUpstream(RESIGN_BODY, 403)
+    const res = await post(port, bearer)
+
+    // 400 而不是 429：宿主只自动重试 429，400 一次就把真因说清。
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('billion-context')
+    // 账号没坏 —— 是本地代理拒签。禁用它就是 issue #1 里「再也问不动」的根因。
+    const a = pool.get('A')
+    expect(a?.disabled).toBe(false)
+    expect(a?.coolUntil).toBe(0)
+    expect(pool.healthy('A')).toBe(true)
+  })
+
+  // 回归保护：不带拒签标记的真 403 依旧是凭据失效，照样禁用账号。
+  it('a plain 403 still means session_dead and disables the account', async () => {
+    await startWithUpstream('{"error_code":"403","error_msg":"forbidden"}', 403)
+    const res = await post(port, bearer)
+
+    expect(pool.get('A')?.disabled).toBe(true)
+    expect(res.status).toBe(401)
+    expect(res.text).not.toContain('billion-context')
+  })
+})
+
+/**
+ * 一个账号都选不出来时，报错必须说清是哪种「没有」—— 全禁用（附最后错误）、
+ * 冷却中（附剩余秒数），还是本地槽位全满。以前三种都是同一句「没有可用账号」，
+ * 把真因整个吞掉（issue #1）。
+ */
+describe('no-account error message', () => {
+  it('names the disable reason and points at re-login when every account is disabled', async () => {
+    await start(['A'], { capTimes: 0 })
+    pool.sync(['A'])
+    pool.disable('A', 'HTTP 403 signed_request_requires_resign')
+
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(401)
+    expect(res.text).toContain('被禁用')
+    expect(res.text).toContain('signed_request_requires_resign')
+    expect(res.text).toContain('重新登录')
+    // 一个可用账号都没有时绝不能出网。
+    expect(seenTokens.length).toBe(0)
+  })
+
+  it('says the local slots are full when every healthy account is busy', async () => {
+    // 两个在飞请求占满 A 的本地槽位（每账号 2 个），第三个应当立刻拿到
+    // 「槽位已满」而不是笼统的「没有可用账号」。
+    ids = ['A']
+    seenTokens = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => {
+      seenTokens.push(authTokenOf(init as { headers?: unknown }))
+      // 一直挂着，直到客户端断开（模拟在飞的长请求）。
+      await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+      return sseResponse(OK_CHUNKS)
+    }))
+    pool = new CodeArtsAccountPool([])
+    shim = createCodeArtsShim({
+      store: { ids: async () => ids, resolve: async (id: string) => credentialFor(id) } as never,
+      catalog: { current: () => [] } as never,
+      pool,
+    })
+    await shim.ready
+    port = Number(new URL(shim.baseUrl()).port)
+    bearer = shim.token()
+
+    const inflight = [postAbortable(port, bearer, 2_000), postAbortable(port, bearer, 2_000)]
+    // 等两个请求都把槽位占上。
+    await vi.waitFor(() => { expect(seenTokens.length).toBe(2) })
+
+    const res = await post(port, bearer)
+    expect(res.status).toBe(429)
+    expect(res.text).toContain('槽位已满')
+    expect(res.text).not.toContain('被禁用')
+
+    await Promise.all(inflight)
+  })
+
+  it('says how long the cooldown lasts when every account is cooling', async () => {
+    await start(['A'], { capTimes: 0 })
+    pool.sync(['A'])
+    pool.cooldown('A', 30_000, 'upstream 500')
+
+    const res = await post(port, bearer)
+    expect(res.status).toBe(429)
+    expect(res.text).toContain('冷却')
+    expect(seenTokens.length).toBe(0)
+  })
 })

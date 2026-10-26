@@ -38,6 +38,7 @@ import {
   CODEARTS_QUEUE_PATH,
   CODEARTS_REFRESH_MODELS_PATH,
   CODEARTS_STATUS_PATH,
+  CODEARTS_TOKEN_PATH,
   registerCodeArtsStatusRoute,
   summarizeClaims,
   type CodeArtsClaimResult,
@@ -219,6 +220,45 @@ describe('login flow', () => {
 
   it('reports idle for a session that never existed', async () => {
     expect((await poll('https://nope.example/')).body?.status).toBe('idle')
+  })
+
+  // issue #1：账号被禁用后，「重新登录」必须把池里的 disabled 清掉，否则登录也救不回来。
+  it('revives the account in the pool once the login lands', async () => {
+    const revived: string[] = []
+    routes = mountRoutes({ store, models: () => [], reviveAccount: id => revived.push(id) })
+    const outcome = fakeLogin()
+    await call(routes.get(CODEARTS_LOGIN_PATH)!, POST, CODEARTS_LOGIN_PATH)
+    outcome.resolve({
+      securityToken: 'sts', accessKeyId: '', secretAccessKey: '', refreshToken: 'r',
+      clientId: 'c', dpopPrivateKey: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y', d: 'd' },
+      expiration: new Date(Date.now() + 3600_000).toISOString(), userId: 'uid-new', userName: 'tester',
+    } as never)
+
+    // 身份探测被 mock 成 null → 退回 token 里的键；revive 的必须是落库的那个 id。
+    await vi.waitFor(async () => {
+      expect(await store.ids()).toHaveLength(1)
+      expect(revived).toHaveLength(1)
+    })
+    expect(revived).toEqual(await store.ids())
+  })
+})
+
+describe('POST /api/codearts/token', () => {
+  // 手工贴 token 同样是凭据换新：「手工」账号被禁用后，贴新 token 要立刻能用。
+  it('revives the manual account after a token is pasted', async () => {
+    const revived: string[] = []
+    routes = mountRoutes({ store, models: () => [], reviveAccount: id => revived.push(id) })
+
+    const res = await call(
+      routes.get(CODEARTS_TOKEN_PATH)!,
+      POST,
+      CODEARTS_TOKEN_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ token: 'pasted' }),
+    )
+
+    expect(res.status).toBe(200)
+    expect(revived).toEqual(['manual'])
   })
 })
 

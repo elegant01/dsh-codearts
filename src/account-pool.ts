@@ -156,6 +156,23 @@ export class CodeArtsAccountPool {
     account.lastError = reason
   }
 
+  /**
+   * 用户重新登录（凭据已换新）后调用：把账号从禁用/冷却里捞出来。
+   *
+   * `sync()` 只对齐成员、特意保留运行时状态（account-pool 不读凭据文档），所以
+   * 「同一账号重新登录」不会自动清掉 disabled —— 以前只能靠重启（见 issue #1）。
+   * 登录成功的语义就是「这个号现在该能用了」，由登录路径显式调这里复位。
+   */
+  revive(id: string): void {
+    const account = this.accounts.get(id)
+    if (account === undefined) return
+    account.disabled = false
+    account.coolUntil = 0
+    account.cappedUntil = 0
+    account.errorCount = 0
+    account.lastError = undefined
+  }
+
   /** 上游 5xx / 软限流：短时冷却。 */
   cooldown(id: string, ms: number, reason: string): void {
     const account = this.accounts.get(id)

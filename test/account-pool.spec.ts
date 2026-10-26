@@ -121,6 +121,34 @@ describe('health', () => {
     expect(account?.errorCount).toBe(0)
     expect(account?.lastError).toBeUndefined()
   })
+
+  // 重新登录的语义就是「这个号现在该能用了」：凭据换新后把禁用/冷却一并清掉。
+  // 以前 disabled 没有任何清理路径，重新登录也救不回来（issue #1）。
+  it('revive clears disable, cooldown, cap hint and error count', () => {
+    const pool = poolOf(['a'])
+    pool.noteConcurrencyCap('a')
+    pool.noteError('a', 3, 60_000, 'boom')
+    pool.cooldown('a', 60_000, 'boom')
+    pool.disable('a', 'token rejected')
+    expect(pool.healthy('a')).toBe(false)
+
+    pool.revive('a')
+
+    const account = pool.get('a')
+    expect(account?.disabled).toBe(false)
+    expect(account?.coolUntil).toBe(0)
+    expect(account?.cappedUntil).toBe(0)
+    expect(account?.errorCount).toBe(0)
+    expect(account?.lastError).toBeUndefined()
+    expect(pool.healthy('a')).toBe(true)
+  })
+
+  it('revive on an unknown id is a no-op', () => {
+    const pool = poolOf(['a'])
+    pool.revive('nope')
+    expect(pool.get('nope')).toBeUndefined()
+    expect(pool.healthy('a')).toBe(true)
+  })
 })
 
 describe('sync', () => {

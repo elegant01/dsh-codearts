@@ -33,6 +33,7 @@ import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CodeArtsQueueGate } from './queue.ts'
 import { CodeArtsCreditCache } from './credits.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
+import { probePiAiCompat } from './pi-ai-compat.ts'
 import { createCodeArtsShim, recentRequestShapes } from './shim.ts'
 import { registerCodeArtsStatusRoute, summarizeClaims } from './web-status.ts'
 import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult } from './web-status.ts'
@@ -198,6 +199,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
     enabledModels,
     setEnabledModels,
     pool: () => pool.list(),
+    // 重新登录/贴新 token 成功后，把这个号从禁用里捞出来（disabled 不清的话登录也救不回来）。
+    reviveAccount: id => pool.revive(id),
     usage: () => usage.snapshot(),
     queue: () => queue.snapshot(),
     recentRequests: () => recentRequestShapes(),
@@ -328,10 +331,13 @@ export function apply(ctx: Context, rawConfig: Config): void {
   void usage.load().catch(() => {})
 
   void shim.ready
-    .then(() => {
+    .then(async () => {
       if (stopped) return
       // 先让 provider 挂上（用种子目录即可服务），再异步换成真实清单。
       void discover()
+      // 版本不兼容时每条消息都会死在出网之前，所以要在这里说明白（卡片上也显示）。
+      const incompatible = await probePiAiCompat()
+      if (incompatible !== undefined) ctx.logger.error(`dsh-codearts: ${incompatible}`)
       const codearts = createCodeArtsAdapter({
         shim,
         catalog,

@@ -105,10 +105,10 @@ async function startShim(
   chunks: Responder,
   catalogModels: readonly { id: string; contextWindow: number; maxTokens: number }[] = [],
 ): Promise<void> {
-  vi.stubGlobal('fetch', vi.fn(async (input: unknown) => {
-    // chatStream 是 fetch(new Request(url, {body}), {signal}) —— 请求体挂在 Request 上，
-    // 不在第二个参数里，所以这里必须从 input 取。
-    const body = input instanceof Request ? await input.text() : ''
+  vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { body?: unknown }) => {
+    // 出网只传「字符串 URL + 普通 init」（见 upstream.ts 的 dispatch），请求体在 init.body。
+    const raw = init?.body
+    const body = raw === undefined ? '' : Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw)
     return sseResponse(typeof chunks === 'function' ? chunks(body) : chunks)
   }))
   shim = createCodeArtsShim({

@@ -44,10 +44,19 @@ function route(responder: (url: string, method: string, body: string) => Respons
   calls: { url: string; method: string; body: string; headers: Headers }[]
 } {
   const calls: { url: string; method: string; body: string; headers: Headers }[] = []
-  vi.stubGlobal('fetch', vi.fn(async (input: Request) => {
-    const body = input.method === 'GET' ? '' : await input.clone().text()
-    calls.push({ url: input.url, method: input.method, body, headers: input.headers })
-    return responder(input.url, input.method, body)
+  vi.stubGlobal('fetch', vi.fn(async (
+    input: string,
+    init?: { method?: string; body?: unknown; headers?: unknown },
+  ) => {
+    // 出网只传「字符串 URL + 普通 init」（upstream.ts 的 dispatch），不能再假设拿到 Request。
+    const method = init?.method ?? 'GET'
+    const raw = init?.body
+    const body = method === 'GET' || raw === undefined
+      ? ''
+      : Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw)
+    const headers = new Headers(init?.headers as HeadersInit | undefined)
+    calls.push({ url: input, method, body, headers })
+    return responder(input, method, body)
   }))
   return { calls }
 }
@@ -125,8 +134,8 @@ describe('claimDailyWelfare', () => {
   })
 
   it('keeps an upstream business error visible as a failure', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: Request) =>
-      input.url.includes('/ops/claim')
+    vi.stubGlobal('fetch', vi.fn(async (input: string) =>
+      input.includes('/ops/claim')
         ? jsonResponse({ code: 50003, message: 'campaign not open', data: null })
         : jsonResponse(deliveryBody([DAILY_ELIGIBLE]))))
     const outcome = await claimDailyWelfare(credential)
