@@ -54,6 +54,11 @@ export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
 export const CODEARTS_REFRESH_MODELS_PATH = '/api/codearts/refresh-models'
 /** GET /api/codearts/queue — 上游排队位置（只在等开流期间有值，底部积分条旁边展示）。 */
 export const CODEARTS_QUEUE_PATH = '/api/codearts/queue'
+/**
+ * GET/POST /api/codearts/dock — 对话底部那一行的显隐开关。
+ * GET 给当前值与 writable，POST 收 `{credits?, queue?}` 写进 settings。
+ */
+export const CODEARTS_DOCK_PATH = '/api/codearts/dock'
 /** 最近出站请求的**形状**摘要（只有 role 名与计数，不含内容），排障用。 */
 export const CODEARTS_DEBUG_PATH = '/api/codearts/debug'
 
@@ -149,6 +154,22 @@ export interface CodeArtsAccountCredits {
 }
 
 /**
+ * 对话底部那一行的显隐开关。
+ *
+ * 两个字段各管一件事：积分数字是常驻的，排队提示只在等开流时出现。分成两个开关
+ * 是因为「不想常驻一个数字」和「别告诉我为什么在等」是两种完全不同的诉求。
+ */
+export interface CodeArtsDockFlags {
+  /** 剩余积分那一行。 */
+  credits: boolean
+  /** 上游排队位置提示。 */
+  queue: boolean
+}
+
+/** 开关的默认值：没有 settings provider（或老配置没这两个键）时保持原有行为 —— 都显示。 */
+export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = { credits: true, queue: true }
+
+/**
  * 把逐账号的领取结果汇总成一条：HTTP 层只看 ok，卡片看 results 逐号展示。
  * 有一个号失败就算整批 ok=false，但别的号领到的结果照样在 results 里。
  */
@@ -187,6 +208,11 @@ export interface CodeArtsWebStatus {
    * 卡片要按账号展示就必须读这里。
    */
   creditsByAccount?: readonly CodeArtsAccountCredits[]
+  /**
+   * 对话底部那一行的显隐开关。省略 = 都显示（老宿主/老配置保持原有行为）。
+   * 底部条本来就在轮询这个接口，所以开关搭车下发，不用多开一条链路。
+   */
+  dock?: CodeArtsDockFlags
   /**
    * 运行时解析到的 `@earendil-works/pi-ai` 不满足要求时的说明。
    * 有值 = 模型全跑不动（每条消息在出网前就失败），且这是版本装配问题，不是账号或网络。
@@ -274,6 +300,17 @@ export interface CodeArtsStatusRouteOptions {
    * attached, which the card renders as a read-only selection.
    */
   setEnabledModels?: (ids: readonly string[]) => Promise<boolean>
+  /**
+   * 对话底部那一行的显隐开关当前值。省略则 /status 不带 dock 字段（= 都显示）。
+   */
+  dock?: () => CodeArtsDockFlags
+  /** 写入显隐开关。返回 false 表示没接 settings provider，卡片据此把勾选框置灰。 */
+  setDock?: (patch: Partial<CodeArtsDockFlags>) => Promise<boolean>
+  /**
+   * 丢掉积分缓存后重拉一次（弹层上那个「刷新积分」按钮）。
+   * 省略时 `?force=1` 退回普通缓存读取 —— 顶多是不新鲜，不该报错。
+   */
+  refreshCredits?: (signal?: AbortSignal) => Promise<readonly CodeArtsAccountCredits[]>
 }
 
 function json(res: ServerResponse, status: number, body: unknown): void {
@@ -391,11 +428,18 @@ function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
  *
  * 积分是「锦上添花」：拉不到也绝不能把状态接口本身拖垮，所以失败一律降级成
  * `creditsError` 交给卡片显示原因（超时由注入方在自己的闭包里保证）。
+ *
+ * `force` 是给对话底部弹层那个「刷新积分」按钮用的：不强制的话它会命中 60 秒缓存，
+ * 按钮点了数字不动 —— 那还不如不给这个按钮。
  */
-async function creditsOf(deps: CodeArtsStatusRouteOptions): Promise<Partial<CodeArtsWebStatus>> {
-  if (deps.credits === undefined) return {}
+async function creditsOf(
+  deps: CodeArtsStatusRouteOptions,
+  force: boolean,
+): Promise<Partial<CodeArtsWebStatus>> {
+  const load = force ? (deps.refreshCredits ?? deps.credits) : deps.credits
+  if (load === undefined) return {}
   try {
-    const entries = await deps.credits()
+    const entries = await load()
     // credits / creditsError 保留给对话底部的单行积分条：取第一份拿到的快照。
     const primary = entries.find(entry => entry.credits !== undefined) ?? entries[0]
     return {
@@ -410,18 +454,19 @@ async function creditsOf(deps: CodeArtsStatusRouteOptions): Promise<Partial<Code
   }
 }
 
-async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWebStatus> {
+async function buildStatus(deps: CodeArtsStatusRouteOptions, force = false): Promise<CodeArtsWebStatus> {
   const models = deps.models().map(m => ({ id: m.id, name: m.name }))
   const accounts = await deps.store.list()
   const cred = await deps.store.current()
   const usage = usageOf(deps)
+  const dock = deps.dock === undefined ? {} : { dock: deps.dock() }
   // pi-ai 版本不兼容时模型全不可用，但状态接口本身还能用 —— 原因必须在这里给出去，
   // 否则用户只看到每条消息一句「本轮运行失败」。
   const piAi = await probePiAiCompat()
   const compat = piAi === undefined ? {} : { piAiError: piAi }
 
   if (accounts.length === 0 || cred === undefined) {
-    return { status: 'signed-out', models, accounts, usage, ...compat }
+    return { status: 'signed-out', models, accounts, usage, ...dock, ...compat }
   }
   // 只要还有**任意一个**账号能用就算登录中 —— 别的号过期了不影响轮转。
   const usable = accounts.some(accountUsable)
@@ -431,10 +476,11 @@ async function buildStatus(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsWe
     models,
     accounts,
     usage,
+    ...dock,
   }
   // 没有可用账号时不问积分：凭证都过期了，问了也是白跑一趟（还得等超时）。
   if (!usable) return { status: 'expired', ...identity, ...compat }
-  return { status: 'signed-in', ...identity, ...compat, ...await creditsOf(deps) }
+  return { status: 'signed-in', ...identity, ...compat, ...await creditsOf(deps, force) }
 }
 
 /** GET /api/codearts/status */
@@ -449,10 +495,64 @@ function statusHandler(deps: CodeArtsStatusRouteOptions) {
       return
     }
     try {
-      json(res, 200, await buildStatus(deps))
+      const url = new URL(req.url ?? '', 'http://localhost')
+      const force = url.searchParams.get('force') === '1'
+      json(res, 200, await buildStatus(deps, force))
     } catch (error: unknown) {
       json(res, 500, { error: safeMessage(error) })
     }
+  }
+}
+
+/**
+ * GET/POST /api/codearts/dock — 对话底部那一行的显隐开关读写。
+ *
+ * 和 enabled-models 同一套规矩：GET 给当前值 + writable，POST 只收布尔、
+ * 没接 settings provider 时回 403 让卡片把勾选框置灰。
+ */
+function dockHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    const current = deps.dock?.() ?? DEFAULT_DOCK_FLAGS
+    if (req.method === 'GET') {
+      json(res, 200, { dock: current, writable: deps.setDock !== undefined })
+      return
+    }
+    if (req.method === 'POST') {
+      if (deps.setDock === undefined) {
+        json(res, 403, { error: 'dock-not-writable' })
+        return
+      }
+      const type = req.headers['content-type']
+      if (typeof type !== 'string' || !type.trim().toLowerCase().startsWith('application/json')) {
+        json(res, 415, { error: 'content-type must be application/json' })
+        return
+      }
+      try {
+        const body = JSON.parse(await readBody(req)) as { credits?: unknown; queue?: unknown }
+        const keys = ['credits', 'queue'] as const
+        const touched = keys.filter(key => body[key] !== undefined)
+        if (touched.length === 0 || touched.some(key => typeof body[key] !== 'boolean')) {
+          json(res, 400, { error: 'expected {"credits"?: boolean, "queue"?: boolean}' })
+          return
+        }
+        const ok = await deps.setDock(Object.fromEntries(
+          touched.map(key => [key, body[key] as boolean]),
+        ))
+        if (!ok) {
+          json(res, 403, { error: 'dock-not-writable' })
+          return
+        }
+        json(res, 200, { dock: deps.dock?.() ?? DEFAULT_DOCK_FLAGS, writable: true })
+      } catch (error: unknown) {
+        json(res, 500, { error: safeMessage(error) })
+      }
+      return
+    }
+    json(res, 405, { error: 'method not allowed' })
   }
 }
 
@@ -777,6 +877,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_QUEUE_PATH,
       handler: queueHandler(deps),
     })
+    const disposeDock = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_DOCK_PATH,
+      handler: dockHandler(deps),
+    })
     const disposeDebug = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_DEBUG_PATH,
@@ -793,6 +898,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeClaim()
       disposeRefresh()
       disposeQueue()
+      disposeDock()
       disposeDebug()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()

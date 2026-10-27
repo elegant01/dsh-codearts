@@ -83,6 +83,22 @@ export interface CodeArtsSettingsKey {
   creditsNeedSignIn: string
   creditsDock: string
   creditsDockTitle: string
+  creditsDockExpand: string
+  creditsDockPanelTitle: string
+  creditsDockRefresh: string
+  creditsDockRefreshing: string
+  creditsDockColAccount: string
+  creditsDockColBalance: string
+  creditsDockEmpty: string
+  creditsDockExpiring: string
+  creditsDockUpdated: string
+  tabDisplay: string
+  displayTitle: string
+  displayHint: string
+  displayCreditsToggle: string
+  displayQueueToggle: string
+  displayNotWritable: string
+  displayFailed: string
   queueDock: string
   queueDockTitle: string
   claimButton: string
@@ -182,6 +198,22 @@ export const zh: CodeArtsSettingsKey = {
   creditsNeedSignIn: '这个账号需要重新登录',
   creditsDock: '积分 {remain}',
   creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
+  creditsDockExpand: '点开看各账号积分明细',
+  creditsDockPanelTitle: 'CodeArts 积分',
+  creditsDockRefresh: '刷新积分',
+  creditsDockRefreshing: '刷新中…',
+  creditsDockColAccount: '账号',
+  creditsDockColBalance: '剩余积分',
+  creditsDockEmpty: '暂时没有积分数据',
+  creditsDockExpiring: '{account}：{expiring} 积分将在本周期结束时作废',
+  creditsDockUpdated: '最近刷新 {time}',
+  tabDisplay: '显示',
+  displayTitle: '对话底部显示',
+  displayHint: '这两项只管输入框下方那一行，设置卡片里的积分明细不受影响。底部那条每 60 秒读一次设置，所以关掉最多要等一分钟才见效。',
+  displayCreditsToggle: '显示剩余积分（点开可看各账号明细）',
+  displayQueueToggle: '显示上游排队位置',
+  displayNotWritable: '这个宿主没给插件开配置存储，开关只能看不能改。',
+  displayFailed: '保存失败：{message}',
   queueDock: '排队第 {position} 位',
   queueDockTitle: '上游排队：{model} · 第 {position} 位 / 共 {length} 条',
   claimButton: '签到领积分',
@@ -280,6 +312,22 @@ export const en: CodeArtsSettingsKey = {
   creditsNeedSignIn: 'This account needs signing in again',
   creditsDock: 'Credits {remain}',
   creditsDockTitle: 'CodeArts credits left {remain} / {total}',
+  creditsDockExpand: 'Show per-account credit details',
+  creditsDockPanelTitle: 'CodeArts credits',
+  creditsDockRefresh: 'Refresh credits',
+  creditsDockRefreshing: 'Refreshing…',
+  creditsDockColAccount: 'Account',
+  creditsDockColBalance: 'Credits left',
+  creditsDockEmpty: 'No credit data yet',
+  creditsDockExpiring: '{account}: {expiring} credits expire when this cycle ends',
+  creditsDockUpdated: 'Last updated {time}',
+  tabDisplay: 'Display',
+  displayTitle: 'Under the chat input box',
+  displayHint: 'These two only control that line under the input box — the credit details in this card are unaffected. The bar re-reads settings every 60 seconds, so hiding it can take up to a minute.',
+  displayCreditsToggle: 'Show remaining credits (click it for per-account details)',
+  displayQueueToggle: 'Show the upstream queue position',
+  displayNotWritable: 'This host gives the plugin nowhere to persist settings, so the switches are read-only.',
+  displayFailed: 'Failed to save: {message}',
   queueDock: 'Queued #{position}',
   queueDockTitle: 'Upstream queue: {model} · position {position} of {length}',
   claimButton: 'Claim daily credits',

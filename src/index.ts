@@ -36,7 +36,7 @@ import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { probePiAiCompat } from './pi-ai-compat.ts'
 import { createCodeArtsShim, recentRequestShapes } from './shim.ts'
 import { registerCodeArtsStatusRoute, summarizeClaims } from './web-status.ts'
-import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult } from './web-status.ts'
+import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult, CodeArtsDockFlags } from './web-status.ts'
 import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
 
 export { CODEARTS_PROVIDER, createCodeArtsAdapter, type CodeArtsAdapter } from './adapter.ts'
@@ -96,10 +96,14 @@ export const inject = ['llm']
 /** Settings namespace owning the configuration card. */
 export const CODEARTS_SETTINGS_NS = 'codearts' as SettingsNamespace
 
-/** Plugin configuration (MVP: just the model allowlist). */
+/** Plugin configuration. */
 export interface Config {
   /** Allowlist of CodeArts model ids offered in the model pickers. */
   enabledModels?: string[]
+  /** 对话输入框下方那行「积分 N」是否显示。缺省 = 显示（老配置不改行为）。 */
+  showCreditDock?: boolean
+  /** 等上游开流时那行「排队第 N 位」是否显示。缺省 = 显示。 */
+  showQueueDock?: boolean
 }
 
 interface VolatileValue<T> {
@@ -122,6 +126,8 @@ function unwrapConfig(value: unknown): Config {
 
 export const Config: z<Config> = z.object({
   enabledModels: z.array(z.string()).description('Model ids offered in the model pickers (empty means every model)').volatile(),
+  showCreditDock: z.boolean().default(true).description('Show the remaining-credits line under the chat input box').volatile(),
+  showQueueDock: z.boolean().default(true).description('Show the upstream queue position under the chat input box').volatile(),
 }) as unknown as z<Config>
 
 function settingsCompatNamespace(ctx: Context): SettingsNamespace {
@@ -189,6 +195,22 @@ export function apply(ctx: Context, rawConfig: Config): void {
     return true
   }
 
+  // 缺省即显示：老配置没这两个键时不该把已经用惯的那一行变没。
+  const dock = (): CodeArtsDockFlags => ({
+    credits: current().showCreditDock !== false,
+    queue: current().showQueueDock !== false,
+  })
+
+  const setDock = async (patch: Partial<CodeArtsDockFlags>): Promise<boolean> => {
+    const settings = ctx.get('settings')
+    if (settings === undefined) return false
+    await settings.update(settingsCompatNamespace(ctx), {
+      ...patch.credits === undefined ? {} : { showCreditDock: patch.credits },
+      ...patch.queue === undefined ? {} : { showQueueDock: patch.queue },
+    })
+    return true
+  }
+
   // Same-origin status/token routes backing the Plugin-configuration card.
   // 卡片另外读账号池的槽位占用与用量账本：这两个都是本机事实，不涉及令牌。
   /** 手动「刷新模型列表」的预算：三路来源各打一次，比每小时的后台刷新更该给足时间。 */
@@ -205,6 +227,13 @@ export function apply(ctx: Context, rawConfig: Config): void {
     queue: () => queue.snapshot(),
     recentRequests: () => recentRequestShapes(),
     credits: signal => loadCredits(signal),
+    // 弹层上那个「刷新积分」要看见真数字，所以先清缓存再拉 —— 不然点了还是 60 秒前的旧值。
+    refreshCredits: signal => {
+      credits.invalidate()
+      return loadCredits(signal)
+    },
+    dock,
+    setDock,
     claim: async (accountId?: string) => {
       const ids = accountId === undefined ? await store.ids() : [accountId]
       if (ids.length === 0) {

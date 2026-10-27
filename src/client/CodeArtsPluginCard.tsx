@@ -112,7 +112,16 @@ function claimMessagesOf(
 
 type Translate = CodeArtsPluginCardInjected['t']
 
-type CardTab = 'accounts' | 'models' | 'usage'
+type CardTab = 'accounts' | 'models' | 'usage' | 'display'
+
+/** GET/POST /api/codearts/dock 的文档（后端契约见 web-status.ts 的 CodeArtsDockFlags）。 */
+interface DockDoc {
+  dock?: { credits: boolean; queue: boolean }
+  writable?: boolean
+}
+
+/** 开关的兜底值：后端没这条路由（老版本）时按「都显示」渲染，与原有行为一致。 */
+const DOCK_DEFAULT = { credits: true, queue: true }
 
 /** 一个 Tab 面板；未选中的用 hidden 留在 DOM 里，草稿和滚动位置都别丢。 */
 function TabPanel({
@@ -540,6 +549,54 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [manualOpen, setManualOpen] = useState(false)
   const [tab, setTab] = useState<CardTab>('accounts')
   const tabIdBase = useId()
+  /** 对话底部那一行的两个显隐开关（后端 = 插件 settings 里的两个布尔）。 */
+  const [dock, setDock] = useState(DOCK_DEFAULT)
+  const [dockWritable, setDockWritable] = useState(false)
+  const [dockSaving, setDockSaving] = useState(false)
+  const [dockError, setDockError] = useState<string | null>(null)
+
+  async function refreshDock(): Promise<void> {
+    try {
+      const res = await fetch('/api/codearts/dock', { headers: { Accept: 'application/json' } })
+      if (!res.ok) return
+      const data = (await res.json()) as DockDoc
+      if (data.dock !== undefined) setDock(data.dock)
+      setDockWritable(data.writable === true)
+    } catch {
+      // 老后端没这条路由：保持默认（都显示），勾选框置灰，别把整张卡片报成出错。
+    }
+  }
+
+  /**
+   * 改一个开关：先按新值渲染，写失败再退回去。
+   *
+   * 这里不像模型勾选那样攒草稿再点保存 —— 只有两个布尔，攒草稿反而让用户猜
+   * 「我刚才那一下到底生效没有」。
+   */
+  async function toggleDock(key: 'credits' | 'queue', on: boolean): Promise<void> {
+    const previous = dock
+    setDock({ ...dock, [key]: on })
+    setDockSaving(true)
+    setDockError(null)
+    try {
+      const res = await fetch('/api/codearts/dock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ [key]: on }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(typeof data.error === 'string' ? data.error : `HTTP ${res.status}`)
+      }
+      const data = (await res.json()) as DockDoc
+      if (data.dock !== undefined) setDock(data.dock)
+    } catch (error: unknown) {
+      setDock(previous)
+      setDockError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDockSaving(false)
+    }
+  }
 
   /**
    * 领每日签到积分。给 id 就只领那个号，不给就逐个号都领一遍。
@@ -618,6 +675,10 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
 
   useEffect(() => {
     void refreshSelection()
+  }, [])
+
+  useEffect(() => {
+    void refreshDock()
   }, [])
 
   useEffect(() => {
@@ -856,12 +917,19 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       id: tabId('usage'),
       panelId: panelId('usage'),
     },
+    display: {
+      value: 'display',
+      label: t('tabDisplay'),
+      id: tabId('display'),
+      panelId: panelId('display'),
+    },
   }
-  // 登录中至少有账号和模型两页；用量没数据时整页不出现，别给空 Tab。
+  // 登录中至少有账号、模型和显示三页；用量没数据时整页不出现，别给空 Tab。
   const tabs: [SegmentedTab<CardTab>, ...SegmentedTab<CardTab>[]] = [
     tabItems.accounts,
     tabItems.models,
     ...(usageAvailable ? [tabItems.usage] : []),
+    tabItems.display,
   ]
   // 数据变化（比如积分改为不可用）可能让当前页消失，退回答账号页。
   const activeTab: CardTab = tabs.some(item => item.value === tab) ? tab : 'accounts'
@@ -1081,6 +1149,41 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 <UsageSection usage={status.usage} accounts={accounts} t={t} />
               </TabPanel>
             )}
+
+            <TabPanel
+              id={panelId('display')}
+              labelledBy={tabId('display')}
+              active={activeTab === 'display'}
+            >
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displayTitle')}</span>
+                </div>
+                <p className={styles.hint}>{t('displayHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.credits}
+                      disabled={!dockWritable || dockSaving}
+                      onChange={on => void toggleDock('credits', on)}
+                      label={t('displayCreditsToggle')}
+                    />
+                  </div>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.queue}
+                      disabled={!dockWritable || dockSaving}
+                      onChange={on => void toggleDock('queue', on)}
+                      label={t('displayQueueToggle')}
+                    />
+                  </div>
+                </div>
+                {!dockWritable && <p className={styles.hint}>{t('displayNotWritable')}</p>}
+                {dockError !== null && <p className={styles.error}>{t('displayFailed', { message: dockError })}</p>}
+              </div>
+            </TabPanel>
           </>
         ) : (
           <div className={styles.section}>
