@@ -323,6 +323,9 @@ export function apply(ctx: Context, rawConfig: Config): void {
   // 动态模型发现：启动后拉一次真实目录，之后每小时刷新。失败只记日志 —— 目录保留
   // 上一次的结果（冷启动时就是种子清单），不因为上游抖动把模型选择器清空。
   const CATALOG_REFRESH_MS = 60 * 60 * 1000
+  // 目录还是空（启动/热重载后第一次发现正好撞上上游抖动）就每分钟重试，而不是干等
+  // 一小时 —— 空目录期间每条消息都会死在 pi-ai 的 "has no configured model"。
+  const CATALOG_EMPTY_RETRY_MS = 60 * 1000
   const abort = new AbortController()
   const discover = async (): Promise<void> => {
     if (stopped) return
@@ -344,13 +347,19 @@ export function apply(ctx: Context, rawConfig: Config): void {
       ctx.logger.debug('dsh-codearts: model discovery failed; keeping the current catalog', error)
     }
   }
-  ctx.effect(() => {
-    const timer = setInterval(() => void discover(), CATALOG_REFRESH_MS)
-    timer.unref?.()
-    return () => {
-      abort.abort()
-      clearInterval(timer)
-    }
+
+  let discoveryTimer: ReturnType<typeof setTimeout> | undefined
+  /** 自我重排的发现循环：目录为空时加快到每分钟，有货后回到每小时。 */
+  const discoverLoop = async (): Promise<void> => {
+    await discover()
+    if (stopped) return
+    const delay = catalog.current().length === 0 ? CATALOG_EMPTY_RETRY_MS : CATALOG_REFRESH_MS
+    discoveryTimer = setTimeout(() => void discoverLoop(), delay)
+    discoveryTimer.unref?.()
+  }
+  ctx.effect(() => () => {
+    abort.abort()
+    if (discoveryTimer !== undefined) clearTimeout(discoveryTimer)
   })
 
   // Build the loopback shim first; the adapter reads its origin at construction.
@@ -363,7 +372,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     .then(async () => {
       if (stopped) return
       // 先让 provider 挂上（用种子目录即可服务），再异步换成真实清单。
-      void discover()
+      void discoverLoop()
       // 版本不兼容时每条消息都会死在出网之前，所以要在这里说明白（卡片上也显示）。
       const incompatible = await probePiAiCompat()
       if (incompatible !== undefined) ctx.logger.error(`dsh-codearts: ${incompatible}`)

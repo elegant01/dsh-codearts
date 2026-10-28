@@ -1,10 +1,15 @@
 /**
- * 对话底部的积分条 + 点开后的积分弹层。
+ * 对话底部的「模型 + 积分」条，以及点开后的积分弹层。
  *
- * 用户最初的诉求就是「对话底部要显示积分」—— 这一条挂在
- * `conversation.composer.dock` 槽位上（与宿主 session-stats strip 同位）。
- * 只在当前 provider 是 codearts 时才拉取并显示一行「积分 N」，别的 provider 下
- * 完全不渲染，不抢别人的行。
+ * 这一条挂在 `conversation.composer.dock` 槽位上（与宿主 session-stats strip 同位）。
+ * 只在当前 provider 是 codearts 时才渲染，别的 provider 下完全不出现，不抢别人的行。
+ *
+ * 第一段是 `Provider CodeArts · <模型名>`，模型名直接用目录里的 `name`
+ * （`catalog.ts` 的 `modelDisplayName` 已经把倍率写进去了，如
+ * `DeepSeek-V4.1-Flash-1017 · x0.18`），所以这一行自带倍率、不必另算。
+ * 这段是**我们自己的**身份行：邻居插件（如 dsh-codebuddy-cli）对任何 provider
+ * 都会画一行 `Provider <id> · Model <id>`，在 codearts 下那行只有模型 id、没有
+ * 倍率；两边都开就会重复，所以优先我们这条，邻居那条应在它自己的设置里关掉。
  *
  * 那一行是个按钮：点开就是逐号明细（多账号下聚合数字本身没意义，得能看出是哪个号）。
  * 显隐由设置卡片「显示」页那两个开关管着，开关值随 `/status` 一起下发 —— 底部条本来
@@ -18,6 +23,14 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement, type MouseEvent } from 'react'
 import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { CodeArtsDockFlags, CodeArtsWebStatus } from '../web-status.ts'
+import { stripModelSuffixes } from '../catalog.ts'
+import { buildDockLine, DOCK_SEGMENT_SEPARATOR } from './dock-line.ts'
+import {
+  ensureSuppressStyle,
+  markForeignDockEntries,
+  releaseDockEntries,
+  type DockNode,
+} from './dock-suppress.ts'
 
 /** 与 src/adapter.ts 的 CODEARTS_PROVIDER 对齐 —— client 不能 import host 模块。 */
 const CODEARTS_PROVIDER = 'codearts'
@@ -67,6 +80,18 @@ interface Anchor {
   above: boolean
 }
 
+/**
+ * 压掉同一行里**别的插件**条目时用的标记属性。
+ *
+ * 我们只能控制自己，压不了别人的注册 —— 但 `conversation.composer.dock` 是 list
+ * 槽位，宿主把每条注册平铺成 `[data-composer-dock]` 的**直接子节点**，所以我们这条
+ * 的 effect 能拿到兄弟节点。选中 codearts 模型期间给它们打上这个属性、由我们注入的
+ * 一条 CSS 隐藏；切走或卸载时逐个摘掉，不留痕迹。
+ *
+ * 具体规则与「哪些不能碰」都在 `dock-suppress.ts` 里（那边能脱离 DOM 单测）。
+ */
+
+
 export interface CodeArtsCreditDockProps {
   /** 宿主注入的 projection 读取面；省略时 dock 不显示。 */
   useProjection?: (key: string) => unknown
@@ -83,9 +108,12 @@ function readSelection(useProjection: ((key: string) => unknown) | undefined): M
   }
 }
 
+function currentOf(selection: ModelSelection | undefined): ModelSelectionEntry | undefined {
+  return selection?.next ?? selection?.lastUsed
+}
+
 function isCodeArts(selection: ModelSelection | undefined): boolean {
-  const current = selection?.next ?? selection?.lastUsed
-  return current?.provider === CODEARTS_PROVIDER
+  return currentOf(selection)?.provider === CODEARTS_PROVIDER
 }
 
 function formatNumber(value: number): string {
@@ -148,6 +176,13 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
   const [remain, setRemain] = useState<number | null>(null)
   const [total, setTotal] = useState<number>(0)
   const [rows, setRows] = useState<CreditRow[]>([])
+  /**
+   * 模型 id -> 目录条目（显示名 + 已格式化的倍率）。
+   *
+   * 显示名自带 ` · x0.18` 尾巴，倍率单独放一段，所以两个都要拿：
+   * 名字用 `stripModelSuffixes` 剥掉尾巴，倍率直接用服务端算好的 `ratio`。
+   */
+  const [modelInfo, setModelInfo] = useState<Record<string, { name: string; ratio?: string }>>({})
   const [flags, setFlags] = useState<CodeArtsDockFlags>({ credits: true, queue: true })
   const [queued, setQueued] = useState<QueueEntry | null>(null)
   const [anchor, setAnchor] = useState<Anchor | null>(null)
@@ -155,6 +190,8 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
   const mounted = useRef(true)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
+  /** 这一行的根节点 —— 它的 parentElement 就是宿主那条共享 flex 行。 */
+  const rootRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     mounted.current = true
     return () => {
@@ -173,6 +210,10 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
       if (data === undefined || !mounted.current) return
       setFlags(data.dock ?? { credits: true, queue: true })
       setRows(rowsOf(data))
+      setModelInfo(Object.fromEntries((data.models ?? []).map(model => [model.id, {
+        name: model.name,
+        ...model.ratio === undefined ? {} : { ratio: model.ratio },
+      }])))
       // 多账号时把各号余额加在一起：底部条只表达「这台机器上还能用多少」。
       const snapshots = (data.creditsByAccount ?? [])
         .map(entry => entry.credits)
@@ -259,11 +300,62 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
     }
   }, [anchor, close])
 
+  // 选中我们的模型时，把这一行里别人的条目压掉。
+  //
+  // 别人注册什么我们管不了，但宿主把每条注册平铺成 `[data-composer-dock]` 的直接子节点，
+  // 所以「隐藏兄弟节点」是我们在自己这一条里能做到的事：给它们打标记 + 一条我们注入的
+  // CSS。切走（active=false）或卸载时逐个摘掉标记，绝不留下别人的行永久消失。
+  useEffect(() => {
+    if (!active) return
+    const self = rootRef.current
+    // 宿主那行是 `<div data-composer-dock>`，里面先放一个 display:contents 的
+    // `[data-slot="conversation.composer.dock"]` 锚点，所有插件的条目平铺在锚点下。
+    const slot = self?.closest('[data-slot="conversation.composer.dock"]') ?? null
+    if (self === null || slot === null) return
+    const node = slot as unknown as DockNode
+    const me = self as unknown as DockNode
+    const marked = new Set<DockNode>()
+    const sweep = (): void => {
+      for (const found of markForeignDockEntries(node, me)) marked.add(found)
+    }
+    ensureSuppressStyle()
+    sweep()
+    // 邻居可能比我们晚挂载（或整条替换），盯着子节点增删再扫一遍。
+    const observer = new MutationObserver(sweep)
+    observer.observe(slot, { childList: true })
+    return () => {
+      observer.disconnect()
+      releaseDockEntries(marked)
+      marked.clear()
+    }
+  }, [active])
+
   if (!active) return null
 
   const showCredits = flags.credits && remain !== null
   const showQueue = flags.queue && queued !== null
-  if (!showCredits && !showQueue) return null
+
+  // 一行分段，与 dsh-codebuddy-cli 的底栏同构（`积分 1,642 · Provider CodeBuddy ·
+  // Model GLM-5.3 · x0.79`）：积分在最前，然后 provider、模型、倍率，最后是我们的排队段。
+  // 段序与分隔符由 dock-line.ts 的纯函数说了算，这里只负责取数。
+  //
+  // 只有积分那一段是可点击的（点开逐号明细）；模型/倍率/排队是纯文本。别把整行做成
+  // 按钮 —— 那样点模型名也会弹积分面板。
+  const modelId = currentOf(selection)?.model
+  const entry = modelId === undefined ? undefined : modelInfo[modelId]
+  // 名字剥掉 ` · x0.18` 尾巴：倍率要单独成段，否则同一行里会出现两次。
+  const modelLabel = entry === undefined
+    ? modelId ?? ''
+    : stripModelSuffixes(entry.name)
+  const ratio = entry?.ratio
+
+  const line = buildDockLine({
+    ...showCredits ? { credits: t('creditsDock', { remain: formatNumber(remain ?? 0) }) } : {},
+    provider: 'CodeArts',
+    ...modelLabel === '' ? {} : { model: modelLabel },
+    ...ratio === undefined ? {} : { ratio },
+    ...showQueue && queued !== null ? { queue: t('queueDock', { position: queued.position }) } : {},
+  }, t)
 
   const queueTitle = queued === null
     ? undefined
@@ -293,10 +385,13 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
 
   return (
     <div
+      ref={rootRef}
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 6,
+        // 段间距交给 ` · ` 分隔符，不给 flex gap —— 有积分时这一行是
+        // 「按钮 + 分隔符 + 纯文本」三个节点，gap 会在分隔符两侧各加一份空隙。
+        gap: 0,
         color: 'var(--dsw-alias-label-tertiary)',
         fontSize: 'var(--dsh-content-font-size-secondary, 13px)',
         lineHeight: '18px',
@@ -309,35 +404,37 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
       }}
       title={queueTitle ?? creditsTitle}
     >
-      {showQueue && queued !== null && <span>{t('queueDock', { position: queued.position })}</span>}
-      {showCredits && (
-        <button
-          ref={triggerRef}
-          // 输入框那一坨是个表单，button 不写 type 默认 submit —— 点一下就把输入框里的
-          // 草稿当消息发出去了。
-          type="button"
-          aria-expanded={anchor !== null}
-          aria-label={t('creditsDockExpand')}
-          title={creditsTitle}
-          onClick={toggle}
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            margin: 0,
-            padding: 0,
-            border: 0,
-            background: 'none',
-            color: 'inherit',
-            font: 'inherit',
-            lineHeight: 'inherit',
-            cursor: 'pointer',
-          }}
-        >
-          <span>{t('creditsDock', { remain: formatNumber(remain ?? 0) })}</span>
-          <span aria-hidden="true" style={{ opacity: 0.6, fontSize: '0.8em' }}>▾</span>
-        </button>
+      {/*
+        **只有积分那一段**是开弹层的按钮：这是本插件原来的设定，别为了对齐邻居把它
+        扩成整行 —— 那样点模型名/倍率也会弹出积分面板。
+        输入框那一坨是个表单，button 不写 type 默认 submit —— 点一下会把草稿当消息发出去。
+      */}
+      {line.credits !== undefined && (
+        <>
+          <button
+            ref={triggerRef}
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded={anchor !== null}
+            aria-label={t('creditsDockPanelTitle')}
+            title={creditsTitle}
+            onClick={toggle}
+            style={{
+              all: 'unset',
+              cursor: 'pointer',
+              font: 'inherit',
+              color: 'inherit',
+              fontVariantNumeric: 'inherit',
+              lineHeight: 'inherit',
+              whiteSpace: 'inherit',
+            }}
+          >
+            {line.credits}
+          </button>
+          <span aria-hidden="true">{DOCK_SEGMENT_SEPARATOR}</span>
+        </>
       )}
+      <span>{line.rest}</span>
       {anchor !== null && (
         <div
           ref={panelRef}

@@ -179,13 +179,22 @@ export function deploy(options = {}) {
   }
 
   // 2) profile/package.json 的 dependencies + bundles（缺 bundles 则插件不会被激活）
+  //
+  // 关键：**不覆盖已有的版本声明**。本地部署是把 lib/ 直接拷进 node_modules，包并不是
+  // 从 registry 装的；把这里的 specifier 改成仓库里的 `version`，一旦这个版本还没发布，
+  // pnpm 就解析不到它，宿主重载 profile 时整个 bundle 掉线 —— 表现是「插件还在，但模型
+  // 全没了」。只有缺这一条（首次部署）时才补，补的也是仓库版本，因为那时没别的可参考。
   const manifests = {}
   manifests.profilePackage = patchManifest(join(profileDir, 'package.json'), (json) => {
     json.dependencies = json.dependencies ?? {}
-    json.dependencies[pkgName] = pkgVersion
+    if (json.dependencies[pkgName] === undefined) json.dependencies[pkgName] = pkgVersion
     const bundles = json.dsh?.profile?.bundles
     if (Array.isArray(bundles) && !bundles.includes(pkgName)) bundles.push(pkgName)
   })
+  const pinned = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8')).dependencies?.[pkgName]
+  if (pinned !== undefined && pinned !== pkgVersion) {
+    log(`· profile 依赖保持 ${pinned}（仓库版本 ${pkgVersion} 只用于本地产物，发布后再由插件管理器更新）`)
+  }
   log(
     manifests.profilePackage.changed
       ? '✓ profile/package.json dependencies + bundles'

@@ -72,11 +72,13 @@ export interface CodeArtsModelChoice {
   blocked?: boolean
   /** 已格式化的积分倍率（`x0.18`；福利恒为 `x0.00`，上游没给倍率时缺省）。 */
   ratio?: string
+  /** 支持图片输入（卡片据此挂「识图」Tag；纯文本模型缺省）。 */
+  supportsImages?: boolean
 }
 
 /** enabled-models 路由返回的 selection 文档（与 codebuddy 的 shape 对齐）。 */
 export interface CodeArtsModelSelection {
-  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string }[]
+  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean }[]
   /** 已选子集是否小于全集（卡片据此显示不同提示）。 */
   restricted: boolean
   /** 是否可写（无 settings provider 时为 false，卡片只读）。 */
@@ -102,6 +104,7 @@ export function selectionOf(
     benefit: m.benefit,
     blocked: m.blocked,
     ratio: m.ratio,
+    supportsImages: m.supportsImages,
     enabled: restricted ? allowed.has(m.id) : true,
   }))
   return { choices, restricted, writable }
@@ -118,7 +121,21 @@ function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
       benefit,
       blocked: isBenefitBlocked(m.id),
       ...(ratio === undefined ? {} : { ratio }),
+      ...(m.supportsImages === true ? { supportsImages: true } : {}),
     }
+  })
+}
+
+/**
+ * 目录 -> 底栏/卡片用的模型徽章。
+ *
+ * 倍率在这里就算好（`creditRatioLabel`：福利恒为 `x0.00`），客户端拿到的是可以直接
+ * 印出来的字符串 —— 底栏那一行要把它作为独立的一段，所以不能只给带尾巴的名字。
+ */
+function modelBadgesOf(models: readonly CodeArtsModelInfo[]): CodeArtsWebModelBadge[] {
+  return models.map(m => {
+    const ratio = creditRatioLabel(m.ratio, isBenefitModel(m.id))
+    return { id: m.id, name: m.name, ...(ratio === undefined ? {} : { ratio }) }
   })
 }
 
@@ -259,6 +276,14 @@ export interface CodeArtsWebAccountSlot {
 export interface CodeArtsWebModelBadge {
   id: string
   name: string
+  /**
+   * 已格式化的积分倍率（`x0.18`；福利恒为 `x0.00`，上游没给倍率的模型缺省）。
+   *
+   * `name` 里其实已经带了同样的尾巴（见 catalog 的 modelDisplayName），底栏为了让
+   * 倍率成为独立的一段（`Model X · x0.18`，与 dsh-codebuddy-cli 的底栏同构），
+   * 需要把这两件事分开拿，所以这里单列一个字段而不是让客户端去拆名字。
+   */
+  ratio?: string
 }
 
 export interface CodeArtsStatusRouteOptions {
@@ -455,7 +480,7 @@ async function creditsOf(
 }
 
 async function buildStatus(deps: CodeArtsStatusRouteOptions, force = false): Promise<CodeArtsWebStatus> {
-  const models = deps.models().map(m => ({ id: m.id, name: m.name }))
+  const models = modelBadgesOf(deps.models())
   const accounts = await deps.store.list()
   const cred = await deps.store.current()
   const usage = usageOf(deps)
@@ -568,7 +593,7 @@ function modelsHandler(deps: CodeArtsStatusRouteOptions) {
       return
     }
     const offered = filterEnabledModels(deps.models(), deps.enabledModels?.())
-    json(res, 200, { models: offered.map(m => ({ id: m.id, name: m.name })) })
+    json(res, 200, { models: modelBadgesOf(offered) })
   }
 }
 

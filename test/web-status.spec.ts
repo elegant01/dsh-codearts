@@ -330,6 +330,28 @@ describe('GET /api/codearts/status', () => {
     expect((res.body?.accounts as { id: string }[]).map(a => a.id)).toEqual(['uid-a'])
   })
 
+  // 底部那一行要把倍率印成**独立的一段**（`Model X · x0.18`），所以模型条目除了带
+  // 尾巴的名字，还得给一份算好的倍率；福利模型恒为 x0.00，上游没给倍率的则缺席。
+  it('carries a formatted ratio per model for the composer line', async () => {
+    setDiscoveredBenefitModels(['glm-5.3-flash'])
+    const scoped = mountRoutes({
+      store,
+      models: () => [
+        { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash · x0.00 · 福利', contextWindow: 1, maxTokens: 1, supportsImages: false },
+        { id: 'GLM-5.2', name: 'GLM-5.2 · x0.70', contextWindow: 1, maxTokens: 1, supportsImages: false, ratio: '0.7x' },
+        { id: 'Qwen3-VL-235B', name: 'Qwen3-VL-235B', contextWindow: 1, maxTokens: 1, supportsImages: false },
+      ],
+    })
+    const res = await call(scoped.get(CODEARTS_STATUS_PATH)!, 'GET', CODEARTS_STATUS_PATH)
+    expect(res.body?.models).toEqual([
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash · x0.00 · 福利', ratio: 'x0.00' },
+      { id: 'GLM-5.2', name: 'GLM-5.2 · x0.70', ratio: 'x0.70' },
+      { id: 'Qwen3-VL-235B', name: 'Qwen3-VL-235B' },
+    ])
+    clearBenefitBlocked()
+    setDiscoveredBenefitModels([])
+  })
+
   it('reports every account credits separately and keeps one snapshot for the dock', async () => {
     await store.upsert(credential('uid-a'))
     await store.upsert(credential('uid-b'))
@@ -629,10 +651,12 @@ describe('POST /api/codearts/refresh-models', () => {
     expect(refreshModels).toHaveBeenCalledOnce()
     expect(res.status).toBe(200)
     expect(res.body).toMatchObject({ ok: true, models: 2, benefit: 1, refreshed: true })
-    const choices = (res.body?.selection as { choices: { id: string; benefit?: boolean; blocked?: boolean; ratio?: string }[] }).choices
+    const choices = (res.body?.selection as { choices: { id: string; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean }[] }).choices
     // 福利模型不论上游给的 credit，倍率一律是 x0.00；普通模型照抄上游。
     expect(choices.find(c => c.id === 'glm-5.3-flash')).toMatchObject({ benefit: true, blocked: false, ratio: 'x0.00' })
     expect(choices.find(c => c.id === 'GLM-5.2')).toMatchObject({ benefit: false, ratio: 'x0.70' })
+    // 识图能力透传给卡片（挂「识图」Tag 用）。
+    expect(choices.find(c => c.id === 'GLM-5.2')).toMatchObject({ supportsImages: true })
   })
 
   it('still reports the blocked ones when upstream did not answer', async () => {

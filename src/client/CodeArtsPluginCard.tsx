@@ -23,6 +23,8 @@ interface ModelChoice {
   blocked?: boolean
   /** 后端已经格式化好的倍率（`x0.18`，福利为 `x0.00`）。 */
   ratio?: string
+  /** 支持图片输入（挂「识图」Tag；纯文本模型缺省）。 */
+  supportsImages?: boolean
 }
 
 interface ModelSelectionDoc {
@@ -1111,6 +1113,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                           </Tag>
                         )}
                         {choice.ratio !== undefined && <Tag tone="quiet">{choice.ratio}</Tag>}
+                        {choice.supportsImages === true && <Tag tone="quiet">{t('modelImages')}</Tag>}
                       </div>
                     ))}
                   </div>

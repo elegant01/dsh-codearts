@@ -75,7 +75,11 @@ export const FALLBACK_CODEARTS_MODELS: readonly CodeArtsModelInfo[] = [
   { id: 'Qwen3.6-27B-VL', name: 'Qwen3.6-27B-VL', contextWindow: 128_000, maxTokens: 8_000, supportsImages: true },
   { id: 'deepseek-v4-flash-0731', name: 'DeepSeek-V4-Flash (福利)', contextWindow: 131_072, maxTokens: 65_536, supportsImages: true },
   { id: 'deepseek-v4-pro-0813', name: 'DeepSeek-V4-Pro (福利)', contextWindow: 131_072, maxTokens: 65_536, supportsImages: true },
-  { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 131_072, maxTokens: 65_536, supportsImages: true },
+  // 裸别名上游不算多模态：带图直接报 "The request model is not multimodal"（issue #4）。
+  // 带日期的 -1017 才是多模态那个 —— 上游发现接口对它的 supports_images 也给 false，
+  // 但 issue #4 的报告者实测带图可用，按实测为准标 true。
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 131_072, maxTokens: 65_536, supportsImages: false },
+  { id: 'deepseek-v4.1-flash-1017', name: 'DeepSeek-V4.1-Flash-1017', contextWindow: 1_048_576, maxTokens: 65_536, supportsImages: true },
   { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash (福利)', contextWindow: 128_000, maxTokens: 8_000, supportsImages: true },
 ]
 

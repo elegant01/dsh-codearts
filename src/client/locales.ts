@@ -38,6 +38,7 @@ export interface CodeArtsSettingsKey {
   benefit: string
   benefitBlocked: string
   benefitBlockedHint: string
+  modelImages: string
   refreshModels: string
   refreshing: string
   refreshed: string
@@ -83,7 +84,6 @@ export interface CodeArtsSettingsKey {
   creditsNeedSignIn: string
   creditsDock: string
   creditsDockTitle: string
-  creditsDockExpand: string
   creditsDockPanelTitle: string
   creditsDockRefresh: string
   creditsDockRefreshing: string
@@ -92,6 +92,9 @@ export interface CodeArtsSettingsKey {
   creditsDockEmpty: string
   creditsDockExpiring: string
   creditsDockUpdated: string
+  dockProvider: string
+  dockModel: string
+  dockNoModel: string
   tabDisplay: string
   displayTitle: string
   displayHint: string
@@ -153,6 +156,7 @@ export const zh: CodeArtsSettingsKey = {
   benefit: '福利',
   benefitBlocked: '福利今日不可用',
   benefitBlockedHint: '{n} 个福利模型今天被上游判定没有权益（活动领完或渠道未开），发出去会直接报 benefit not found。',
+  modelImages: '识图',
   refreshModels: '刷新模型列表',
   refreshing: '刷新中…',
   refreshed: '已刷新：{n} 个模型，其中 {benefit} 个走福利路由',
@@ -198,7 +202,6 @@ export const zh: CodeArtsSettingsKey = {
   creditsNeedSignIn: '这个账号需要重新登录',
   creditsDock: '积分 {remain}',
   creditsDockTitle: 'CodeArts 剩余积分 {remain} / {total}',
-  creditsDockExpand: '点开看各账号积分明细',
   creditsDockPanelTitle: 'CodeArts 积分',
   creditsDockRefresh: '刷新积分',
   creditsDockRefreshing: '刷新中…',
@@ -207,9 +210,12 @@ export const zh: CodeArtsSettingsKey = {
   creditsDockEmpty: '暂时没有积分数据',
   creditsDockExpiring: '{account}：{expiring} 积分将在本周期结束时作废',
   creditsDockUpdated: '最近刷新 {time}',
+  dockProvider: 'Provider {provider}',
+  dockModel: 'Model {model}',
+  dockNoModel: '未选择模型',
   tabDisplay: '显示',
   displayTitle: '对话底部显示',
-  displayHint: '这两项只管输入框下方那一行，设置卡片里的积分明细不受影响。底部那条每 60 秒读一次设置，所以关掉最多要等一分钟才见效。',
+  displayHint: '这两项只管输入框下方那一行的积分与排队两段；中间那段「Provider CodeArts · Model 模型 · 倍率」一直显示，不受开关影响。底部那条每 60 秒读一次设置，所以关掉最多要等一分钟才见效。',
   displayCreditsToggle: '显示剩余积分（点开可看各账号明细）',
   displayQueueToggle: '显示上游排队位置',
   displayNotWritable: '这个宿主没给插件开配置存储，开关只能看不能改。',
@@ -267,6 +273,7 @@ export const en: CodeArtsSettingsKey = {
   benefit: 'Benefit',
   benefitBlocked: 'Benefit unavailable today',
   benefitBlockedHint: '{n} benefit model(s) were told they have no entitlement today (campaign exhausted or channel not opened); sending to them fails with benefit not found.',
+  modelImages: 'Images',
   refreshModels: 'Refresh models',
   refreshing: 'Refreshing…',
   refreshed: 'Refreshed: {n} models, {benefit} on the benefit route',
@@ -312,7 +319,6 @@ export const en: CodeArtsSettingsKey = {
   creditsNeedSignIn: 'This account needs signing in again',
   creditsDock: 'Credits {remain}',
   creditsDockTitle: 'CodeArts credits left {remain} / {total}',
-  creditsDockExpand: 'Show per-account credit details',
   creditsDockPanelTitle: 'CodeArts credits',
   creditsDockRefresh: 'Refresh credits',
   creditsDockRefreshing: 'Refreshing…',
@@ -321,9 +327,12 @@ export const en: CodeArtsSettingsKey = {
   creditsDockEmpty: 'No credit data yet',
   creditsDockExpiring: '{account}: {expiring} credits expire when this cycle ends',
   creditsDockUpdated: 'Last updated {time}',
+  dockProvider: 'Provider {provider}',
+  dockModel: 'Model {model}',
+  dockNoModel: 'No model selected',
   tabDisplay: 'Display',
   displayTitle: 'Under the chat input box',
-  displayHint: 'These two only control that line under the input box — the credit details in this card are unaffected. The bar re-reads settings every 60 seconds, so hiding it can take up to a minute.',
+  displayHint: 'These two only control the credits and queue segments of that line under the input box; the middle “Provider CodeArts · Model … · rate” segments always show. The bar re-reads settings every 60 seconds, so hiding the rest can take up to a minute.',
   displayCreditsToggle: 'Show remaining credits (click it for per-account details)',
   displayQueueToggle: 'Show the upstream queue position',
   displayNotWritable: 'This host gives the plugin nowhere to persist settings, so the switches are read-only.',

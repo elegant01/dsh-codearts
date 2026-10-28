@@ -3,6 +3,55 @@
 本文件记录本插件的重要改动。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.1] - 2026-10-28
+
+### 新增
+
+- **底部那一行改成段式，与 `dsh-codebuddy-cli` 同构**：`积分 24,091 · Provider CodeArts ·
+  Model DeepSeek-V4.1-Flash-1017 · x0.18`。积分挪到最前，倍率单独成段（不再粘在模型名
+  尾巴上），段与段用 ` · ` 连接，和邻居那一行的观感一致。**只有积分那一段**是开积分弹层
+  的按钮（原来的设定不变）：模型、倍率、排队都是纯文本，点它们不会弹面板。
+  `/api/codearts/status` 与 `/api/codearts/models` 的模型条目因此多了一个 `ratio` 字段
+  （`x0.18`；福利恒为 `x0.00`；上游没给倍率的模型缺席），免得客户端去拆显示名。
+- **对话底部那行先说自己是谁了**：中间是 `Provider CodeArts · Model <模型名> · <倍率>`。
+  这一段**不受**「显示剩余积分 / 显示上游排队位置」两个开关影响，始终出现；
+  开关只管积分与排队两段。
+- 这一行以前是靠邻居插件（`dsh-codebuddy-cli` 的 dock 会替任何 provider 画
+  `Provider <id> · Model <id>`）顺带显示的，但它在 codearts 下只给模型 **id**、
+  给不出倍率，而且受那个插件自己的「切换到其它 provider 时也显示这一行」开关控制
+  （关了整行就消失）。现在身份行由本插件自己负责，不依赖别人。
+- **选中我们的模型时，那一行里别人的条目会暂时消失**：我们改不了别人的注册，但
+  `conversation.composer.dock` 是 list 槽位、每条注册都被宿主平铺成同一个
+  `[data-composer-dock]` 行里的兄弟节点，所以我们这条会认出新出现的**别人**、给它们
+  打上 `data-codearts-dock-suppressed` 属性，由我们注入的一条 CSS 隐藏。切换 provider
+  或卸载时逐个摘掉属性，别人的行立刻回来。**不碰**宿主自己的轮次/token 统计 pill
+  （`data-composer-stat`）和上下文占用格子。规则与边界在 `src/client/dock-suppress.ts`，
+  单测见 `test/dock-suppress.spec.ts`。
+- **模型勾选区标出「识图」**：`/api/codearts/enabled-models` 的 choices 多了
+  `supportsImages`，卡片给支持图片输入的模型挂一个「识图」Tag。声明了 `reasoning` 之外
+  的模型能力本来就该在勾选时看得见，不然只有发了图才知道谁不吃图。
+- **新增 `DeepSeek-V4.1-Flash-1017` 种子条目**（1,048,576 context）。
+
+### 修复
+
+- **`deepseek-v4.1-flash` 带图必报 `The request model is not multimodal`（issue #4）**：
+  这个裸别名在上游不算多模态，种子目录却标了 `supportsImages: true`，于是带图的请求在
+  出网前就被当成合法、到了上游才被拒。现在它标 false；多模态的是带日期的 `-1017`。
+  上游发现接口对 `-1017` 的 `supports_images` 也给 false，但 issue 报告者实测带图可用，
+  按实测为准标 true。
+- **模型目录为空时会干等一小时**：启动/热重载后第一次模型发现如果正好撞上上游抖动，
+  目录会一直空着，期间每条消息都死在 pi-ai 的 `has no configured model`，而重试要等整
+  整 `CATALOG_REFRESH_MS`（1 小时）。现在发现循环自我重排：目录为空时 60 秒后重试，
+  有货后回到每小时。
+
+### 开发
+
+- **`scripts/deploy.mjs` 不再改写 profile 的依赖版本**：它以前把仓库 `version` 无条件写成
+  profile `dependencies` 的值，本地产物先于 npm 发布升版本时，profile 就会依赖一个
+  registry 里不存在的 specifier，宿主重载后整个 bundle 掉线（表现是模型选择器里
+  provider 消失，而 HTTP 路由还活着）。现在只在缺这一条时才补，版本不一致时打一行提示。
+  仍建议**先发布、再升仓库版本**。
+
 ## [1.2.0] - 2026-10-27
 
 ### 新增
