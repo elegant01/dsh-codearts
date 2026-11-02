@@ -46,7 +46,7 @@ const EP_QUEUE_STATUS = '/api/v1/queue/status'
  */
 const EP_CURRENT_USER = '/snap-manager/v1/current/user'
 
-export type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client'
+export type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'iam_stale' | 'not_found' | 'server' | 'client'
 
 export interface ChatResultOk {
   ok: true
@@ -454,6 +454,15 @@ export function upstreamErrorMessage(message: string, status = 0): string {
   if (isBenefitMissing('', message)) {
     return '这个模型属于限时福利，当前福利通道不可用（不是账号问题）。可以刷新模型列表，改用非福利模型。'
   }
+  if (isIamTokenError(message)) {
+    return '上游判定本次登录凭据（IAM token）已失效。插件已尝试自动续期；若反复出现，请到设置卡片重新登录。'
+  }
+  if (isModelNotAccessible(message)) {
+    return '上游说这个模型不存在或当前账号没有权限（可能已下线或改名）。请刷新模型列表后换一个模型；换号没有用，这是模型级的限制。'
+  }
+  if (isNotMultimodal(message)) {
+    return '这个模型不支持图片输入（上游 406）。请移除消息里的图片，或改用支持识图的模型。'
+  }
   if (message.toLowerCase().includes('model is not registered')) {
     return '上游没有注册这个模型，它可能已经下线；请刷新模型列表后重选。'
   }
@@ -475,6 +484,66 @@ export function isBenefitMissing(code: string, message: string): boolean {
 }
 
 /**
+ * 上游判定本次请求的 IAM 凭据无效。
+ *
+ * 2026-11-02 实测：它会以**流内首帧**（HTTP 200）的形式回来，内容只有一句
+ * `invalid_iam_token`，所以既不走 classify() 也不会触发换号 —— 之前只能干等到
+ * 凭证自然过期（距过期不足 5 分钟才刷新），期间每条消息都撞同一堵墙。
+ * 这些写法都见过：IAM 自身 / APIG 网关 / 非法 Token 三条链路各有一套措辞。
+ */
+const IAM_TOKEN_ERROR =
+  /invalid_iam_token|incorrect iam authentication|apig\.0301|iam token is invalid|iam token (?:has )?expired|decrypt token fail/i
+
+export function isIamTokenError(message: string): boolean {
+  return IAM_TOKEN_ERROR.test(message)
+}
+
+/**
+ * 「模型不存在或当前账号没权限」。
+ *
+ * 上游一边把它列进模型发现（`builtin` / `agent` 两路都有），一边在聊天时回
+ * `InferHub.ModelArts.81003.401`。2026-11-02 实测 `deepseek-v4.1-flash`
+ * 当天就是这种状态：列表里有、调用必拒，且换号也一样 —— 所以换号无意义。
+ */
+export function isModelNotAccessible(message: string): boolean {
+  return (
+    message.includes('InferHub.ModelArts.81003.401') ||
+    message.toLowerCase().includes('the model does not exist or you do not have access to it')
+  )
+}
+
+/** 上游实际不吃图（模型级检查，与图片格式无关）。 */
+export function isNotMultimodal(message: string): boolean {
+  return message.includes('InferHub.001001020.406') || message.toLowerCase().includes('the request model is not multimodal')
+}
+
+/**
+ * 从**首帧**（已转成 OpenAI 形状）里取出上游错误码与文本；没有错误返回 undefined。
+ *
+ * 只用于「还没产出任何内容」的判断：此时重发是安全的。帧可能被 TCP 切断，解析
+ * 不出来就当没有错误，绝不影响转发。
+ */
+export function firstFrameError(text: string): { code: string; message: string } | undefined {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const payload = trimmed.slice(5).trim()
+    if (payload === '' || payload === '[DONE]') continue
+    let ev: { error?: { code?: unknown; message?: unknown }; error_code?: unknown; error_msg?: unknown }
+    try {
+      ev = JSON.parse(payload) as typeof ev
+    } catch {
+      continue
+    }
+    const code = String(ev.error?.code ?? ev.error_code ?? '')
+    const message = String(ev.error?.message ?? ev.error_msg ?? '')
+    if (code === '' && message === '') continue
+    return { code, message }
+  }
+  return undefined
+}
+
+/**
  * 本地代理「拒签」标记：billion-context 这类宿主层代理拦截出站请求做上下文压缩，
  * 碰到 SDK-HMAC-SHA256 签名请求要用 CodeArts 凭据重签；找不到凭据时在**本地**回
  * 403（根本没出网），body 里带这两个标记。这不是凭据失效 —— 归 session_dead 会把
@@ -487,6 +556,10 @@ export function isResignRefusal(message: string): boolean {
 function classify(status: number, message: string): UpstreamErrorKind {
   const m = message.toLowerCase()
   if (isResignRefusal(message)) return 'client'
+  // 先认措辞再认状态码：IAM 失效有时挂在 401 上，但它的处置是「强制续期重试」，
+  // 不是「停用账号等重新登录」。
+  if (isIamTokenError(message)) return 'iam_stale'
+  if (isModelNotAccessible(message)) return 'not_found'
   if (status === 401 || status === 403) return 'session_dead'
   if (status === 402) return 'hard_credit'
   if (status === 429) return 'soft_rate'

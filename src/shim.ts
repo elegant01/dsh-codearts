@@ -24,7 +24,11 @@ import {
   canonicalModel,
   chatStream,
   degradeTokenCeiling,
+  firstFrameError,
   isConcurrencyCap,
+  isIamTokenError,
+  isModelNotAccessible,
+  isNotMultimodal,
   isParamInvalidFrame,
   isQueueableRate,
   isTpmLimit,
@@ -74,6 +78,7 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
   soft_rate: 429,
   session_dead: 401,
+  iam_stale: 401,
   not_found: 502,
   server: 502,
   client: 400,
@@ -351,17 +356,35 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       const reader = result.stream.getReader()
       const first = await reader.read()
       const head = first.done ? undefined : first.value
+      const headText = head === undefined ? undefined : new TextDecoder().decode(head)
       // 首帧就是限流错误（TPM 实测是 HTTP 200 + 流内 error_code）：此时一个字都没
       // 吐出来，重发是安全的。必须在这里降级成真正的请求失败，交给下面的排队逻辑；
       // 否则错误会被当成正常流转发，DSH 侧只看到一句英文 PI_AI_ERROR。
-      const rate = head === undefined ? undefined : rateLimitFrame(new TextDecoder().decode(head))
+      const rate = headText === undefined ? undefined : rateLimitFrame(headText)
       if (rate !== undefined) {
         reader.releaseLock()
         await result.stream.cancel().catch(() => {})
         logger?.warn(`dsh-codearts: ${prepared.model} 首帧被判限流（${rate.code}），进入本地排队`)
         return { prepared, result: { ok: false, kind: 'soft_rate', status: 429, message: `${rate.code}: ${rate.message}` } }
       }
-      const shouldHeal = heal < MAX_CEILING_HEALS && head !== undefined && isParamInvalidFrame(new TextDecoder().decode(head))
+      // 凭据失效 / 模型无权限 / 不吃图也都是流内首帧，与限流同样绕过了 classify()。
+      // 必须在转发之前认出来：凭据失效要能强制续期后重发，另外两种要翻成人话。
+      const upstreamError = headText === undefined ? undefined : firstFrameError(headText)
+      if (upstreamError !== undefined) {
+        const detail = `${upstreamError.code}: ${upstreamError.message}`.replace(/^: /, '')
+        if (isIamTokenError(detail) || isModelNotAccessible(detail) || isNotMultimodal(detail)) {
+          reader.releaseLock()
+          await result.stream.cancel().catch(() => {})
+          logger?.warn(`dsh-codearts: ${prepared.model} 首帧报上游错误（${detail.slice(0, 160)}）`)
+          const kind: UpstreamErrorKind = isIamTokenError(detail)
+            ? 'iam_stale'
+            : isModelNotAccessible(detail)
+              ? 'not_found'
+              : 'client'
+          return { prepared, result: { ok: false, kind, status: KIND_STATUS[kind], message: detail } }
+        }
+      }
+      const shouldHeal = heal < MAX_CEILING_HEALS && headText !== undefined && isParamInvalidFrame(headText)
       reader.releaseLock()
       if (!shouldHeal) return { prepared, result, head }
       await result.stream.cancel().catch(() => {})
@@ -463,6 +486,8 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     // 先按账号轮换：某个账号的会话槽位被占（要 ~52s 才释放）就换下一个用，
     // 而不是让用户干等 —— 这正是「打断后重新提问」卡住的根因。
     const tried = new Set<string>()
+    /** 已经为它强制续期过一次的账号：同一个号只重试一次，避免把 refresh_token 连烧。 */
+    const refreshed = new Set<string>()
     let cappedAccount: string | undefined
     let tpmAccount: string | undefined
     let queueWaitedMs = 0
@@ -529,6 +554,22 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           // 账号本身完全健康，不要标记 capped/冷却。
           tpmAccount = id
           break
+        }
+        if (result.kind === 'iam_stale') {
+          // token 可能被提前作废，而 expiration 还写着几小时后：强制续期一次，
+          // 然后让同一个号再试一次。续期失败的话，resolve 会带着 stale 的凭证
+          // 继续失败，下一轮就走冷却/换号。
+          if (!refreshed.has(id)) {
+            refreshed.add(id)
+            logger?.warn(`dsh-codearts: ${id} 的 IAM token 被判失效，强制续期后重试`)
+            const next = await store.forceRefresh(id, credential.token)
+            if (next !== undefined) {
+              tried.delete(id)
+              continue
+            }
+          }
+          pool.cooldown(id, SERVER_COOLDOWN_MS, result.message)
+          continue
         }
         if (result.kind === 'session_dead') {
           // 凭据失效，这个号得重新登录了，换下一个。

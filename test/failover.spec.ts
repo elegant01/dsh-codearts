@@ -452,3 +452,71 @@ describe('no-account error message', () => {
     expect(seenTokens.length).toBe(0)
   })
 })
+
+describe('stream-frame auth errors', () => {
+  /**
+   * IAM 失效是**流内首帧**（HTTP 200），以前会被当成正常流转发，用户只看到一句
+   * invalid_iam_token，而且因为距 expiration 还远、ensureFresh 根本不会续期。
+   * 现在应当在首帧认出它、强制续期一次，并让同一个账号重试。
+   */
+  it('force-refreshes the credential and retries the same account on invalid_iam_token', async () => {
+    const IAM_FRAME = 'data: {"error_code":"invalid_iam_token","error_msg":"invalid_iam_token"}\n\n'
+    const seen: string[] = []
+    let current = 'old-token'
+    let refreshed = 0
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { headers?: unknown }) => {
+      const token = authTokenOf(init)
+      seen.push(token)
+      return token === 'old-token' ? sseResponse([IAM_FRAME]) : sseResponse(OK_CHUNKS)
+    }))
+    shim = createCodeArtsShim({
+      store: {
+        ids: async () => ['A'],
+        resolve: async () => ({ token: current, accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }),
+        forceRefresh: async (_id: string, seenToken?: string) => {
+          expect(seenToken).toBe('old-token')
+          refreshed += 1
+          current = 'new-token'
+          return { token: current }
+        },
+      } as never,
+      catalog: { current: () => [] } as never,
+      pool: new CodeArtsAccountPool([]),
+    })
+    await shim.ready
+    port = Number(new URL(shim.baseUrl()).port)
+    bearer = shim.token()
+
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('来自 B')
+    expect(seen).toEqual(['old-token', 'new-token'])
+    expect(refreshed).toBe(1)
+  })
+
+  it('translates "model does not exist or no access" instead of leaking the raw frame', async () => {
+    await start(['A'], { capTimes: 0 })
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse([
+      'data: {"error_code":"InferHub.ModelArts.81003.401","error_msg":"The model does not exist or you do not have access to it."}\n\n',
+    ])))
+
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(502)
+    expect(res.text).toContain('没有权限')
+    expect(res.text).not.toContain('does not exist')
+  })
+
+  it('translates a real not-multimodal rejection into a Chinese hint', async () => {
+    await start(['A'], { capTimes: 0 })
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse([
+      'data: {"error_code":"InferHub.001001020.406","error_msg":"The request model is not multimodal"}\n\n',
+    ])))
+
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('不支持图片')
+  })
+})
