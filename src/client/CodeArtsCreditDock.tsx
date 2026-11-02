@@ -23,6 +23,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement, type MouseEvent } from 'react'
 import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { CodeArtsDockFlags, CodeArtsWebStatus } from '../web-status.ts'
+import type { UsageTotals } from '../usage.ts'
 import { stripModelSuffixes } from '../catalog.ts'
 import { buildDockLine, DOCK_SEGMENT_SEPARATOR } from './dock-line.ts'
 import {
@@ -68,6 +69,8 @@ interface CreditRow {
   name: string
   remain: number | null
   expiring: number
+  /** 今天经本插件发出的用量（与设置卡片「用量」区块同一份账本）。 */
+  usage?: UsageTotals
   /** 这份快照的抓取时刻（上游返回时间，不是本机渲染时间）。 */
   fetchedAt?: number
   error?: string
@@ -120,6 +123,14 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(Math.round(value))
 }
 
+/** 与设置卡片「用量」区块同一口径：12345 -> 12.3k。 */
+function formatTokens(value: number): string {
+  if (!Number.isFinite(value)) return '0'
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`
+  return String(Math.round(value))
+}
+
 function formatClock(ts: number | undefined): string {
   if (ts === undefined || !Number.isFinite(ts)) return ''
   try {
@@ -148,11 +159,13 @@ function rowsOf(data: CodeArtsWebStatus): CreditRow[] {
         ? { id: account.id, credits: data.credits, creditsError: data.creditsError }
         : undefined)
     const snapshot = entry?.credits
+    const usage = data.usage?.byAccountToday?.[account.id]
     return {
       id: account.id,
       name: accountName(account),
       remain: snapshot?.credits.total.remain ?? null,
       expiring: snapshot?.credits.total.expiring ?? 0,
+      ...(usage === undefined ? {} : { usage }),
       ...snapshot?.credits.fetchedAt === undefined ? {} : { fetchedAt: snapshot.credits.fetchedAt },
       ...entry?.creditsError === undefined ? {} : { error: entry.creditsError },
     }
@@ -475,7 +488,7 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
           <div
             style={{
               display: 'grid',
-              gridTemplateColumns: 'minmax(0, 1fr) auto',
+              gridTemplateColumns: 'minmax(0, 1fr) auto auto',
               gap: '4px 12px',
               alignItems: 'center',
               borderTop: '0.5px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.22))',
@@ -484,36 +497,54 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
             }}
           >
             <span>{t('creditsDockColAccount')}</span>
+            <span style={{ justifySelf: 'end' }}>{t('creditsDockColTokens')}</span>
             <span style={{ justifySelf: 'end' }}>{t('creditsDockColBalance')}</span>
             {rows.length === 0 && (
               <span style={{ gridColumn: '1 / -1' }}>{t('creditsDockEmpty')}</span>
             )}
-            {rows.map(row => (
-              <div
-                key={row.id}
-                style={{
-                  display: 'contents',
-                }}
-              >
-                <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-                  <StateDot state={row.remain === null ? 'warning' : 'done'} />
-                  <span
-                    style={{
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                      color: 'var(--dsw-alias-label-primary)',
-                    }}
-                    title={row.error === undefined ? row.name : row.error}
-                  >
-                    {row.name}
+            {rows.map(row => {
+              const detail = row.usage === undefined
+                ? ''
+                : [
+                    t('usageTokens', {
+                      prompt: formatTokens(row.usage.promptTokens),
+                      completion: formatTokens(row.usage.completionTokens),
+                    }),
+                    t('usageRequestCount', { n: formatNumber(row.usage.requests) }),
+                  ].join(' · ')
+              return (
+                <div
+                  key={row.id}
+                  style={{
+                    display: 'contents',
+                  }}
+                >
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                    <StateDot state={row.remain === null ? 'warning' : 'done'} />
+                    <span
+                      style={{
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        color: 'var(--dsw-alias-label-primary)',
+                      }}
+                      title={row.error === undefined ? row.name : row.error}
+                    >
+                      {row.name}
+                    </span>
                   </span>
-                </span>
-                <span style={{ justifySelf: 'end', fontVariantNumeric: 'tabular-nums' }}>
-                  {row.remain === null ? '—' : formatNumber(row.remain)}
-                </span>
-              </div>
-            ))}
+                  <span
+                    style={{ justifySelf: 'end', fontVariantNumeric: 'tabular-nums' }}
+                    title={row.usage === undefined ? t('creditsDockNoTokens') : detail}
+                  >
+                    {row.usage === undefined ? '—' : formatTokens(row.usage.totalTokens)}
+                  </span>
+                  <span style={{ justifySelf: 'end', fontVariantNumeric: 'tabular-nums' }}>
+                    {row.remain === null ? '—' : formatNumber(row.remain)}
+                  </span>
+                </div>
+              )
+            })}
           </div>
 
           {rows

@@ -25,11 +25,22 @@ export type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { probePiAiCompat } from './pi-ai-compat.ts'
 import {
+  chatStream,
+  firstFrameError,
+  isModelNotAccessible,
+  modelUnavailableReasonText,
+  prepareChatBody,
+  upstreamErrorMessage,
+} from './upstream.ts'
+import {
   clearBenefitBlocked,
   creditRatioLabel,
   filterEnabledModels,
+  forgetModelUnavailable,
   isBenefitBlocked,
   isBenefitModel,
+  markModelUnavailable,
+  modelUnavailableReason,
 } from './catalog.ts'
 import { fetchCallerIdentity, type CallerIdentity, type CodeArtsWelfareState } from './upstream.ts'
 import { startLogin, type LoginSession, type OAuthToken } from './oauth.ts'
@@ -52,6 +63,13 @@ export const CODEARTS_ACCOUNTS_PATH = '/api/codearts/accounts'
 export const CODEARTS_CLAIM_PATH = '/api/codearts/claim'
 /** POST /api/codearts/refresh-models — 立刻重拉一次模型目录，并清掉「福利今日不可用」标记。 */
 export const CODEARTS_REFRESH_MODELS_PATH = '/api/codearts/refresh-models'
+/**
+ * POST /api/codearts/test-model — 用最小请求实测某个模型能不能调通。
+ *
+ * 存在理由：上游的模型清单会列出调不动的模型（`InferHub.ModelArts.81003.401`），
+ * 刷新救不了；只有真发一次请求才知道。成功会清掉该模型的「异常」标记。
+ */
+export const CODEARTS_TEST_MODEL_PATH = '/api/codearts/test-model'
 /** GET /api/codearts/queue — 上游排队位置（只在等开流期间有值，底部积分条旁边展示）。 */
 export const CODEARTS_QUEUE_PATH = '/api/codearts/queue'
 /**
@@ -74,11 +92,17 @@ export interface CodeArtsModelChoice {
   ratio?: string
   /** 支持图片输入（卡片据此挂「识图」Tag；纯文本模型缺省）。 */
   supportsImages?: boolean
+  /**
+   * 上游今天判定该模型不可用（如 `InferHub.ModelArts.81003.401`）的原因。
+   *
+   * 卡片挂一个「异常」Tag，悬浮显示这段原因；**不**替用户取消勾选。
+   */
+  error?: string
 }
 
 /** enabled-models 路由返回的 selection 文档（与 codebuddy 的 shape 对齐）。 */
 export interface CodeArtsModelSelection {
-  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean }[]
+  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; error?: string }[]
   /** 已选子集是否小于全集（卡片据此显示不同提示）。 */
   restricted: boolean
   /** 是否可写（无 settings provider 时为 false，卡片只读）。 */
@@ -105,6 +129,7 @@ export function selectionOf(
     blocked: m.blocked,
     ratio: m.ratio,
     supportsImages: m.supportsImages,
+    ...(m.error === undefined ? {} : { error: m.error }),
     enabled: restricted ? allowed.has(m.id) : true,
   }))
   return { choices, restricted, writable }
@@ -115,6 +140,7 @@ function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
   return deps.models().map(m => {
     const benefit = isBenefitModel(m.id)
     const ratio = creditRatioLabel(m.ratio, benefit)
+    const error = modelUnavailableReason(m.id)
     return {
       id: m.id,
       name: m.name,
@@ -122,6 +148,7 @@ function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
       blocked: isBenefitBlocked(m.id),
       ...(ratio === undefined ? {} : { ratio }),
       ...(m.supportsImages === true ? { supportsImages: true } : {}),
+      ...(error === undefined ? {} : { error }),
     }
   })
 }
@@ -813,6 +840,110 @@ function refreshModelsHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/**
+ * 逐账号发一次最小聊天，验证模型**真的能调用**（清单里有 ≠ 能调）。
+ *
+ * 只发一句 ping、max_tokens 16：目的是让上游过一遍权限与路由检查，不是拿内容。
+ * 必须逐账号试 —— 池里的正常请求也是这么轮的；只测第一个号会把「这个号没权限」
+ * 误报成「模型不可用」。
+ */
+async function probeModel(
+  deps: CodeArtsStatusRouteOptions,
+  id: string,
+  signal: AbortSignal,
+): Promise<{ ok: boolean; message: string; accountId?: string }> {
+  const ids = await deps.store.ids()
+  if (ids.length === 0) return { ok: false, message: '没有已登录的账号，请先在设置卡片登录。' }
+  const raw = JSON.stringify({
+    model: id,
+    stream: true,
+    max_tokens: 16,
+    messages: [{ role: 'user', content: 'ping' }],
+  })
+  let last = '没有可用的账号'
+  for (const accountId of ids.slice(0, 3)) {
+    if (signal.aborted) break
+    const credential = await deps.store.resolve(accountId)
+    if (credential === undefined) {
+      last = '凭据不可用，请重新登录'
+      continue
+    }
+    const result = await chatStream(credential, prepareChatBody(raw), signal)
+    if (!result.ok) {
+      last = upstreamErrorMessage(result.message, result.status)
+      if (result.kind === 'iam_stale') {
+        await deps.store.forceRefresh(accountId, credential.token).catch(() => undefined)
+      }
+      continue
+    }
+    const reader = result.stream.getReader()
+    try {
+      for (let frame = 0; frame < 6; frame += 1) {
+        const next = await reader.read()
+        if (next.done) return { ok: true, message: '上游已响应', accountId }
+        const text = new TextDecoder().decode(next.value)
+        const error = firstFrameError(text)
+        if (error !== undefined) {
+          const detail = `${error.code}: ${error.message}`.replace(/^: /, '')
+          if (isModelNotAccessible(detail)) {
+            markModelUnavailable(id, modelUnavailableReasonText(detail))
+          }
+          return { ok: false, message: upstreamErrorMessage(detail), accountId }
+        }
+        // 拿到第一帧正常数据就够证明「这个号能调通」；剩下的是生成内容，没必要读。
+        if (text.includes('"choices"')) return { ok: true, message: '上游正常响应', accountId }
+      }
+      return { ok: true, message: '上游已开流', accountId }
+    } finally {
+      await reader.cancel().catch(() => undefined)
+    }
+  }
+  return { ok: false, message: last }
+}
+
+/**
+ * POST /api/codearts/test-model — 实测一个模型现在能不能调用。
+ *
+ * 成功会清掉它的「异常」标记（测试就是重新验证一次）；`81003.401` 会重新记上。
+ * 失败也可能只是撞了并发上限/限流，所以除模型级错误外不动标记。
+ */
+function testModelHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    let id = ''
+    try {
+      const body = JSON.parse(await readBody(req)) as { id?: unknown }
+      if (typeof body.id === 'string') id = body.id.trim()
+    } catch {
+      json(res, 400, { error: 'expected {"id": string}' })
+      return
+    }
+    if (id === '') {
+      json(res, 400, { error: 'expected {"id": string}' })
+      return
+    }
+    if (!deps.models().some(model => model.id === id)) {
+      json(res, 404, { error: `unknown model: ${id}` })
+      return
+    }
+    const started = Date.now()
+    try {
+      const result = await probeModel(deps, id, AbortSignal.timeout(45_000))
+      if (result.ok) forgetModelUnavailable(id)
+      json(res, 200, { ...result, ms: Date.now() - started })
+    } catch (error: unknown) {
+      json(res, 200, { ok: false, message: safeMessage(error), ms: Date.now() - started })
+    }
+  }
+}
+
 /** GET /api/codearts/queue — 排队位置快照（无跟踪器/无排队时给空数组）。 */
 function queueHandler(deps: CodeArtsStatusRouteOptions) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -897,6 +1028,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_REFRESH_MODELS_PATH,
       handler: refreshModelsHandler(deps),
     })
+    const disposeTestModel = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_TEST_MODEL_PATH,
+      handler: testModelHandler(deps),
+    })
     const disposeQueue = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_QUEUE_PATH,
@@ -922,6 +1058,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeAccounts()
       disposeClaim()
       disposeRefresh()
+      disposeTestModel()
       disposeQueue()
       disposeDock()
       disposeDebug()

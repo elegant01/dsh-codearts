@@ -2,6 +2,7 @@ import { request as httpRequest } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CodeArtsAccountPool } from '../src/account-pool.ts'
 import { createCodeArtsShim, type CodeArtsShim } from '../src/shim.ts'
+import { clearModelUnavailable, modelUnavailableReason } from '../src/catalog.ts'
 
 /**
  * 多账号轮转的核心行为：一个账号撞上「并发会话数已达上限」时，请求应当**换下一个
@@ -155,6 +156,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.unstubAllGlobals()
+  clearModelUnavailable()
   await shim?.close()
 })
 
@@ -506,6 +508,8 @@ describe('stream-frame auth errors', () => {
     expect(res.status).toBe(502)
     expect(res.text).toContain('没有权限')
     expect(res.text).not.toContain('does not exist')
+    // 卡片据此挂「异常」Tag：原因留在目录里，但**不**替用户取消勾选。
+    expect(modelUnavailableReason('GLM-5.2')).toContain('81003.401')
   })
 
   it('translates a real not-multimodal rejection into a Chinese hint', async () => {

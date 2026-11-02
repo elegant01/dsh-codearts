@@ -237,6 +237,44 @@ export function clearBenefitBlocked(): void {
 }
 
 /**
+ * 今天被上游明确拒绝「模型不存在 / 本账号无权限」的模型（小写 id -> 原因）。
+ *
+ * 判据只有聊天回的 `InferHub.ModelArts.81003.401`。上游的模型发现**照样列出它**
+ * （2026-11-02 实测 `deepseek-v4.1-flash` 两路都在清单里），所以刷新模型列表救不了 ——
+ * 只能等上游修好，或第二天再看。这也是「刷新清单 ≠ 验证可调用」的落点。
+ *
+ * 与福利缺失标记同口径：**只标记，不替用户取消勾选**。多账号下这个错误只有在
+ * 所有号都试过之后才会浮上来，所以按模型记全局（不按账号）。
+ */
+const unavailableModels = new Map<string, { day: string; reason: string }>()
+
+/** 记一次「上游判定这个模型不可用」。 */
+export function markModelUnavailable(id: string, reason: string): void {
+  const key = id.trim().toLowerCase()
+  if (key !== '') unavailableModels.set(key, { day: localDayKey(), reason })
+}
+
+/** 该模型今天是否已被上游判定不可用；是则返回原因（卡片悬浮显示）。 */
+export function modelUnavailableReason(id: string): string | undefined {
+  const key = id.trim().toLowerCase()
+  const entry = unavailableModels.get(key)
+  if (entry === undefined) return undefined
+  if (entry.day === localDayKey()) return entry.reason
+  unavailableModels.delete(key)
+  return undefined
+}
+
+/** 清空上游不可用记录 —— 测试用；日常靠本地日期自然过期。 */
+export function clearModelUnavailable(): void {
+  unavailableModels.clear()
+}
+
+/** 单独清掉一个模型的不可用标记（手动测试成功后调）。 */
+export function forgetModelUnavailable(id: string): void {
+  unavailableModels.delete(id.trim().toLowerCase())
+}
+
+/**
  * 合并多路来源的模型清单（内置 / 限时福利 / agent-center）。
  *
  * 规则对齐 codearts2api 的 `MergeModels`：

@@ -29,7 +29,15 @@ vi.mock('../src/upstream.ts', async importOriginal => {
 })
 
 import { CodeArtsAccountStore, credentialFromOAuth } from '../src/auth.ts'
-import { clearBenefitBlocked, isBenefitBlocked, markBenefitBlocked, setDiscoveredBenefitModels } from '../src/catalog.ts'
+import {
+  clearBenefitBlocked,
+  clearModelUnavailable,
+  isBenefitBlocked,
+  markBenefitBlocked,
+  markModelUnavailable,
+  modelUnavailableReason,
+  setDiscoveredBenefitModels,
+} from '../src/catalog.ts'
 import {
   CODEARTS_ACCOUNTS_PATH,
   CODEARTS_CLAIM_PATH,
@@ -39,6 +47,7 @@ import {
   CODEARTS_REFRESH_MODELS_PATH,
   CODEARTS_STATUS_PATH,
   CODEARTS_DOCK_PATH,
+  CODEARTS_TEST_MODEL_PATH,
   CODEARTS_TOKEN_PATH,
   registerCodeArtsStatusRoute,
   summarizeClaims,
@@ -630,6 +639,7 @@ describe('summarizeClaims', () => {
 describe('POST /api/codearts/refresh-models', () => {
   afterEach(() => {
     clearBenefitBlocked()
+    clearModelUnavailable()
     setDiscoveredBenefitModels([])
   })
 
@@ -646,17 +656,23 @@ describe('POST /api/codearts/refresh-models', () => {
   it('clears today\'s benefit-blocked marks and answers with the fresh selection', async () => {
     setDiscoveredBenefitModels(['glm-5.3-flash'])
     markBenefitBlocked('glm-5.3-flash')
+    // 「上游判定模型不可用」不随刷新清掉：刷新只重拉清单，不会让死模型复活。
+    markModelUnavailable('GLM-5.2', '上游判定该模型当前不可用：InferHub.ModelArts.81003.401')
     const refreshModels = vi.fn(async () => ({ models: 2, benefit: 1, refreshed: true }))
     const res = await call(refreshHandler(refreshModels), POST, CODEARTS_REFRESH_MODELS_PATH)
     expect(refreshModels).toHaveBeenCalledOnce()
     expect(res.status).toBe(200)
     expect(res.body).toMatchObject({ ok: true, models: 2, benefit: 1, refreshed: true })
-    const choices = (res.body?.selection as { choices: { id: string; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean }[] }).choices
+    const choices = (res.body?.selection as { choices: { id: string; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; error?: string }[] }).choices
     // 福利模型不论上游给的 credit，倍率一律是 x0.00；普通模型照抄上游。
     expect(choices.find(c => c.id === 'glm-5.3-flash')).toMatchObject({ benefit: true, blocked: false, ratio: 'x0.00' })
     expect(choices.find(c => c.id === 'GLM-5.2')).toMatchObject({ benefit: false, ratio: 'x0.70' })
     // 识图能力透传给卡片（挂「识图」Tag 用）。
     expect(choices.find(c => c.id === 'GLM-5.2')).toMatchObject({ supportsImages: true })
+    // 异常原因透传给卡片（挂「异常」Tag，悬浮显示）。
+    expect(choices.find(c => c.id === 'GLM-5.2')?.error).toContain('81003.401')
+    expect(isBenefitBlocked('glm-5.3-flash')).toBe(false)
+    expect(modelUnavailableReason('GLM-5.2')).toContain('81003.401')
   })
 
   it('still reports the blocked ones when upstream did not answer', async () => {
@@ -678,6 +694,61 @@ describe('POST /api/codearts/refresh-models', () => {
 
   it('404s when no refresh handler is attached', async () => {
     const res = await call(routes.get(CODEARTS_REFRESH_MODELS_PATH)!, POST, CODEARTS_REFRESH_MODELS_PATH)
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('POST /api/codearts/test-model', () => {
+  const catalog = [{ id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 128_000, maxTokens: 8_000, supportsImages: false }]
+
+  function testHandler(): Handler {
+    return mountRoutes({ store, models: () => catalog }).get(CODEARTS_TEST_MODEL_PATH)!
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    clearModelUnavailable()
+  })
+
+  function sse(body: string): Response {
+    return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }
+
+  it('sends one minimal request and clears the model\'s error mark on success', async () => {
+    await store.upsert(credential('u-test'))
+    markModelUnavailable('GLM-5.2', '上游判定该模型当前不可用：InferHub.ModelArts.81003.401')
+    const bodies: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { body?: unknown }) => {
+      bodies.push(String(init?.body ?? ''))
+      return sse('data: {"choices":[{"index":0,"delta":{"content":"pong"}}]}\n\ndata: [DONE]\n\n')
+    }))
+
+    const res = await call(testHandler(), POST, CODEARTS_TEST_MODEL_PATH, { 'content-type': 'application/json' }, JSON.stringify({ id: 'GLM-5.2' }))
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ ok: true })
+    // 只花一句 ping 的积分：max_tokens 固定很小。
+    expect(JSON.parse(bodies[0] ?? '{}').max_tokens).toBe(16)
+    // 测试通过 = 重新验证过，异常标记必须摘掉。
+    expect(modelUnavailableReason('GLM-5.2')).toBeUndefined()
+  })
+
+  it('records the reason when the probe is rejected with 81003.401', async () => {
+    await store.upsert(credential('u-test'))
+    vi.stubGlobal('fetch', vi.fn(async () => sse(
+      'data: {"error_code":"InferHub.ModelArts.81003.401","error_msg":"The model does not exist or you do not have access to it."}\n\n',
+    )))
+
+    const res = await call(testHandler(), POST, CODEARTS_TEST_MODEL_PATH, { 'content-type': 'application/json' }, JSON.stringify({ id: 'GLM-5.2' }))
+
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ ok: false })
+    expect(String(res.body?.message)).toContain('没有权限')
+    expect(modelUnavailableReason('GLM-5.2')).toContain('81003.401')
+  })
+
+  it('rejects a model that is not in the current catalog', async () => {
+    const res = await call(testHandler(), POST, CODEARTS_TEST_MODEL_PATH, { 'content-type': 'application/json' }, JSON.stringify({ id: 'not-a-model' }))
     expect(res.status).toBe(404)
   })
 })

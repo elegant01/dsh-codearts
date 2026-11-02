@@ -20,6 +20,7 @@ import { Readable } from 'node:stream'
 import type { CodeArtsAccountStore } from './auth.ts'
 import { CodeArtsAccountPool, ERROR_THRESHOLD, type AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog } from './catalog.ts'
+import { markModelUnavailable } from './catalog.ts'
 import {
   canonicalModel,
   chatStream,
@@ -33,6 +34,7 @@ import {
   isQueueableRate,
   isTpmLimit,
   maxTokensCeilingFor,
+  modelUnavailableReasonText,
   prepareChatBody,
   rateLimitFrame,
   upstreamErrorMessage,
@@ -376,6 +378,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           reader.releaseLock()
           await result.stream.cancel().catch(() => {})
           logger?.warn(`dsh-codearts: ${prepared.model} 首帧报上游错误（${detail.slice(0, 160)}）`)
+          if (isModelNotAccessible(detail)) {
+            markModelUnavailable(prepared.model, modelUnavailableReasonText(detail))
+          }
           const kind: UpstreamErrorKind = isIamTokenError(detail)
             ? 'iam_stale'
             : isModelNotAccessible(detail)

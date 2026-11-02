@@ -17,6 +17,7 @@ import {
   backfillParams,
   isBenefitModel,
   markBenefitBlocked,
+  markModelUnavailable,
   mergeModelLists,
   type CodeArtsModelInfo,
 } from './catalog.ts'
@@ -517,6 +518,13 @@ export function isNotMultimodal(message: string): boolean {
   return message.includes('InferHub.001001020.406') || message.toLowerCase().includes('the request model is not multimodal')
 }
 
+/** 记进目录的原因文案（卡片「异常」Tag 的悬浮说明）。 */
+export function modelUnavailableReasonText(detail: string): string {
+  const trimmed = detail.trim()
+  const prefix = '上游判定该模型当前不可用（模型不存在或当前账号没有权限，换号也无效）'
+  return trimmed === '' ? prefix : `${prefix}：${trimmed}`
+}
+
 /**
  * 从**首帧**（已转成 OpenAI 形状）里取出上游错误码与文本；没有错误返回 undefined。
  *
@@ -677,6 +685,7 @@ export async function chatStream(
   if (!resp.ok) {
     const text = await resp.text().catch(() => '')
     if (isBenefitMissing('', text)) markBenefitBlocked(prepared.model)
+    if (isModelNotAccessible(text)) markModelUnavailable(prepared.model, modelUnavailableReasonText(text.slice(0, 200)))
     return { ok: false, kind: classify(resp.status, text), status: resp.status, message: text.slice(0, 400) }
   }
 
@@ -741,6 +750,8 @@ export async function chatStream(
               // 福利权益缺失要落到目录状态里：卡片得把这条模型标成「今日不可用」，
               // 而不是让用户对着裸的 "benefit not found" 猜是自己哪里配错了。
               if (isBenefitMissing(String(ev.error_code), String(ev.error_msg ?? ''))) markBenefitBlocked(model)
+              const errorDetail = `${String(ev.error_code)}: ${String(ev.error_msg ?? 'upstream error')}`
+              if (isModelNotAccessible(errorDetail)) markModelUnavailable(model, modelUnavailableReasonText(errorDetail))
               controller.enqueue(
                 openAIData({
                   choices: [{ delta: { content: '' }, finish_reason: 'stop' }],

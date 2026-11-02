@@ -25,6 +25,8 @@ interface ModelChoice {
   ratio?: string
   /** 支持图片输入（挂「识图」Tag；纯文本模型缺省）。 */
   supportsImages?: boolean
+  /** 上游今天判定该模型不可用的原因（挂「异常」Tag，悬浮显示）。 */
+  error?: string
 }
 
 interface ModelSelectionDoc {
@@ -542,6 +544,10 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [modelError, setModelError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
+  /** 正在实测的模型 id；同一时间只测一个，避免把上游并发槽位占满。 */
+  const [testingId, setTestingId] = useState<string | null>(null)
+  /** 逐模型的测试结果（通过/失败 + 原因）。 */
+  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message: string; ms?: number }>>({})
   /** 正在领取的账号 id；批量领取时是 CLAIM_ALL。null 表示没有在飞。 */
   const [claimingId, setClaimingId] = useState<string | null>(null)
   /** 逐账号的领取结果文案。 */
@@ -766,6 +772,39 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       setModelError(err instanceof Error ? err.message : String(err))
     } finally {
       setSavingModels(false)
+    }
+  }
+
+  /**
+   * 实测某个模型现在能不能调用。
+   *
+   * 上游的清单会列出调不动的模型（81003.401），刷新救不了；只有真发一次最小请求
+   * 才知道。测试成功会清掉后端记的「异常」标记，所以结束后重拉一次 selection。
+   */
+  async function testModel(id: string): Promise<void> {
+    setTestingId(id)
+    setTestResults(current => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+    try {
+      const res = await fetch('/api/codearts/test-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ id }),
+      })
+      const data = (await res.json().catch(() => null)) as { ok?: boolean; message?: string; ms?: number } | null
+      if (!res.ok) throw new Error(data?.message ?? `HTTP ${res.status}`)
+      setTestResults(current => ({ ...current, [id]: { ok: data?.ok === true, message: data?.message ?? '', ms: data?.ms } }))
+      await refreshSelection()
+    } catch (err) {
+      setTestResults(current => ({
+        ...current,
+        [id]: { ok: false, message: err instanceof Error ? err.message : String(err) },
+      }))
+    } finally {
+      setTestingId(null)
     }
   }
 
@@ -1098,24 +1137,47 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                   </p>
                   {blockedCount > 0 && <p className={styles.hint}>{t('benefitBlockedHint', { n: blockedCount })}</p>}
                   <div className={styles.choices}>
-                    {selection.choices.map(choice => (
-                      <div key={choice.id} className={styles.choiceRow}>
-                        <Checkbox
-                          className={styles.check}
-                          checked={draft.includes(choice.id)}
-                          disabled={!selection.writable || savingModels}
-                          onChange={(on) => setModel(choice.id, on)}
-                          label={modelName(choice)}
-                        />
-                        {choice.benefit === true && (
-                          <Tag tone={choice.blocked === true ? 'warning' : 'success'}>
-                            {choice.blocked === true ? t('benefitBlocked') : t('benefit')}
-                          </Tag>
-                        )}
-                        {choice.ratio !== undefined && <Tag tone="quiet">{choice.ratio}</Tag>}
-                        {choice.supportsImages === true && <Tag tone="quiet">{t('modelImages')}</Tag>}
-                      </div>
-                    ))}
+                    {selection.choices.map(choice => {
+                      const result = testResults[choice.id]
+                      return (
+                        <div key={choice.id} className={styles.choiceRow}>
+                          <Checkbox
+                            className={styles.check}
+                            checked={draft.includes(choice.id)}
+                            disabled={!selection.writable || savingModels}
+                            onChange={(on) => setModel(choice.id, on)}
+                            label={modelName(choice)}
+                          />
+                          {choice.benefit === true && (
+                            <Tag tone={choice.blocked === true ? 'warning' : 'success'}>
+                              {choice.blocked === true ? t('benefitBlocked') : t('benefit')}
+                            </Tag>
+                          )}
+                          {choice.error !== undefined && (
+                            <span title={choice.error} style={{ cursor: 'help' }}>
+                              <Tag tone="warning">{t('modelError')}</Tag>
+                            </span>
+                          )}
+                          {choice.ratio !== undefined && <Tag tone="quiet">{choice.ratio}</Tag>}
+                          {choice.supportsImages === true && <Tag tone="quiet">{t('modelImages')}</Tag>}
+                          {draft.includes(choice.id) && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={testingId !== null}
+                              onClick={() => void testModel(choice.id)}
+                            >
+                              {testingId === choice.id ? t('testingModel') : t('testModel')}
+                            </Button>
+                          )}
+                          {result !== undefined && (
+                            <span title={result.ms === undefined ? result.message : `${result.message}（${result.ms} ms）`}>
+                              <Tag tone={result.ok ? 'success' : 'warning'}>{result.ok ? t('testOk') : t('testFailed')}</Tag>
+                            </span>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                   {selection.writable && (
                     <div className={styles.actions}>

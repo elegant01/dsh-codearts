@@ -39,6 +39,11 @@ export interface CodeArtsSettingsKey {
   benefitBlocked: string
   benefitBlockedHint: string
   modelImages: string
+  modelError: string
+  testModel: string
+  testingModel: string
+  testOk: string
+  testFailed: string
   refreshModels: string
   refreshing: string
   refreshed: string
@@ -89,6 +94,8 @@ export interface CodeArtsSettingsKey {
   creditsDockRefreshing: string
   creditsDockColAccount: string
   creditsDockColBalance: string
+  creditsDockColTokens: string
+  creditsDockNoTokens: string
   creditsDockEmpty: string
   creditsDockExpiring: string
   creditsDockUpdated: string
@@ -157,6 +164,11 @@ export const zh: CodeArtsSettingsKey = {
   benefitBlocked: '福利今日不可用',
   benefitBlockedHint: '{n} 个福利模型今天被上游判定没有权益（活动领完或渠道未开），发出去会直接报 benefit not found。',
   modelImages: '识图',
+  modelError: '异常',
+  testModel: '测试',
+  testingModel: '测试中…',
+  testOk: '通过',
+  testFailed: '失败',
   refreshModels: '刷新模型列表',
   refreshing: '刷新中…',
   refreshed: '已刷新：{n} 个模型，其中 {benefit} 个走福利路由',
@@ -207,6 +219,8 @@ export const zh: CodeArtsSettingsKey = {
   creditsDockRefreshing: '刷新中…',
   creditsDockColAccount: '账号',
   creditsDockColBalance: '剩余积分',
+  creditsDockColTokens: '今日 Token',
+  creditsDockNoTokens: '今天还没有经插件发出的请求',
   creditsDockEmpty: '暂时没有积分数据',
   creditsDockExpiring: '{account}：{expiring} 积分将在本周期结束时作废',
   creditsDockUpdated: '最近刷新 {time}',
@@ -274,6 +288,11 @@ export const en: CodeArtsSettingsKey = {
   benefitBlocked: 'Benefit unavailable today',
   benefitBlockedHint: '{n} benefit model(s) were told they have no entitlement today (campaign exhausted or channel not opened); sending to them fails with benefit not found.',
   modelImages: 'Images',
+  modelError: 'Unavailable',
+  testModel: 'Test',
+  testingModel: 'Testing…',
+  testOk: 'Passed',
+  testFailed: 'Failed',
   refreshModels: 'Refresh models',
   refreshing: 'Refreshing…',
   refreshed: 'Refreshed: {n} models, {benefit} on the benefit route',
@@ -324,6 +343,8 @@ export const en: CodeArtsSettingsKey = {
   creditsDockRefreshing: 'Refreshing…',
   creditsDockColAccount: 'Account',
   creditsDockColBalance: 'Credits left',
+  creditsDockColTokens: 'Tokens today',
+  creditsDockNoTokens: 'No requests through the plugin today yet',
   creditsDockEmpty: 'No credit data yet',
   creditsDockExpiring: '{account}: {expiring} credits expire when this cycle ends',
   creditsDockUpdated: 'Last updated {time}',

@@ -3,14 +3,17 @@ import {
   backfillParams,
   benefitBlockedModels,
   clearBenefitBlocked,
+  clearModelUnavailable,
   CodeArtsCatalog,
   creditRatioLabel,
   discoveredBenefitModels,
   isBenefitBlocked,
   isBenefitModel,
   markBenefitBlocked,
+  markModelUnavailable,
   mergeModelLists,
   modelDisplayName,
+  modelUnavailableReason,
   setDiscoveredBenefitModels,
   stripModelSuffixes,
   type CodeArtsModelInfo,
@@ -141,6 +144,28 @@ describe('福利权益缺失（benefit not found）', () => {
     markBenefitBlocked('glm-5.3-flash')
     clearBenefitBlocked()
     expect(isBenefitBlocked('glm-5.3-flash')).toBe(false)
+  })
+})
+
+describe('modelUnavailableReason', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    clearModelUnavailable()
+  })
+
+  it('按小写 id 记住上游给的原因，供卡片悬浮显示', () => {
+    markModelUnavailable('DeepSeek-V4.1-Flash', '上游判定该模型当前不可用：InferHub.ModelArts.81003.401')
+    expect(modelUnavailableReason('deepseek-v4.1-flash')).toContain('81003.401')
+    expect(modelUnavailableReason('glm-5.2')).toBeUndefined()
+  })
+
+  it('过完当天就忘掉 —— 上游恢复后不必等重启', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 10, 2, 10, 0, 0))
+    markModelUnavailable('deepseek-v4.1-flash', '上游判定该模型当前不可用')
+    expect(modelUnavailableReason('deepseek-v4.1-flash')).toBeDefined()
+    vi.setSystemTime(new Date(2026, 10, 3, 0, 5, 0))
+    expect(modelUnavailableReason('deepseek-v4.1-flash')).toBeUndefined()
   })
 })
 
