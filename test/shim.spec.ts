@@ -234,7 +234,14 @@ describe('usage accounting', () => {
       const p = Number(new URL(withUsage.baseUrl()).port)
       await chatAndDrain(usage, p, withUsage.token())
       const snapshot = usage.snapshot()
-      expect(snapshot.today).toEqual({ requests: 1, promptTokens: 12, completionTokens: 3, totalTokens: 15 })
+      expect(snapshot.today).toEqual({
+        requests: 1,
+        promptTokens: 12,
+        completionTokens: 3,
+        totalTokens: 15,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+      })
       expect(snapshot.byAccountToday['acct']?.totalTokens).toBe(15)
       expect(snapshot.byModelToday[0]?.id).toBe('GLM-5.2')
     } finally {

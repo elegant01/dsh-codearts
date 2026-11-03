@@ -58,11 +58,20 @@ declare const styles: {
   readonly "section": string
   readonly "sectionHead": string
   readonly "sectionLabel": string
+  readonly "statCard": string
+  readonly "statGrid": string
+  readonly "statLabel": string
+  readonly "statSub": string
+  readonly "statValue": string
   readonly "statusLine": string
   readonly "tabPanel": string
   readonly "tabs": string
   readonly "updated": string
   readonly "usageBar": string
   readonly "usageFill": string
+  readonly "usageTip": string
+  readonly "usageTipName": string
+  readonly "usageTipRow": string
+  readonly "usageTipSep": string
 }
 export default styles

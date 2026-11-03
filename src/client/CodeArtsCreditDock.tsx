@@ -20,7 +20,7 @@
  * 不会因为这条 dock 让上游多挨一次请求；弹层上那个「刷新积分」是唯一绕缓存的出口。
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactElement, type MouseEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactElement, type MouseEvent } from 'react'
 import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { CodeArtsDockFlags, CodeArtsWebStatus } from '../web-status.ts'
 import type { UsageTotals } from '../usage.ts'
@@ -41,10 +41,24 @@ const QUEUE_PATH = '/api/codearts/queue'
 const REFRESH_INTERVAL_MS = 60_000
 /** 排队位置变得快：官方客户端也是 5 秒一次；这是本机路由，打不疼上游。 */
 const QUEUE_INTERVAL_MS = 5_000
-/** 弹层宽度固定，好算它会不会顶出屏幕右边。 */
-const PANEL_WIDTH = 280
+/**
+ * 弹层宽度：只放「账号 + 积分」两列，所以按同类插件（dsh-connect-trae 的
+ * `min(248px, …)`）取一档窄宽度 —— 这一层回答的是「哪个号还有多少积分」，
+ * 用量数字不该把它撑成一张报表。
+ */
+const PANEL_WIDTH = 260
 /** 弹层与那一行之间的缝隙。 */
 const PANEL_GAP = 8
+/**
+ * 弹层里每行的列模板：账号 | 积分。
+ *
+ * 数字列用 `auto`：它跟着最宽的那个余额自适应，面板不必为「12,600」预留固定宽度。
+ * 输入 / 输出 / 缓存这些用量数字不进表格，收进整行的悬浮提示（{@link usageLine}），
+ * 完整明细在设置卡片里看。
+ */
+const PANEL_ROW_COLUMNS = 'minmax(0, 1fr) auto'
+/** 数字格统一右对齐 + 等宽数字，列才对得齐。 */
+const PANEL_NUM_CELL: CSSProperties = { justifySelf: 'end', fontVariantNumeric: 'tabular-nums' }
 /** 那一行在输入框下方，往上开才够空间；给弹层留的最小高度，不够就翻到下面。 */
 const PANEL_MIN_ABOVE = 260
 
@@ -100,6 +114,15 @@ export interface CodeArtsCreditDockProps {
   useProjection?: (key: string) => unknown
   /** locale 翻译函数。 */
   t: (key: string, params?: Record<string, unknown>) => string
+  /**
+   * 这个实例挂在哪：
+   * - `bar`  = 输入框工具行（权限控制右边），只画积分段和它点开的逐号明细；
+   * - `dock` = 输入框下方那行，只画 Provider / 模型 / 倍率 / 排队。
+   *
+   * 同一份数据、同一套开关，两处各自渲染自己那几段 —— 模型名和倍率在工具行右侧
+   * 已经有 pill 了，再在工具行里写一遍就是重复占宽。
+   */
+  zone?: 'bar' | 'dock'
 }
 
 function readSelection(useProjection: ((key: string) => unknown) | undefined): ModelSelection | undefined {
@@ -140,6 +163,29 @@ function formatClock(ts: number | undefined): string {
   }
 }
 
+/**
+ * 弹层里那行用量：`入 12.3k · 出 697（思 505）· 命中 94% · 37 条`。
+ *
+ * 刻意比设置卡片里的完整版短：面板只有 260px，把「缓存 11.5k」也列上就会折成
+ * 两三行，比原来那个悬浮提示还难看。缓存值本身由命中率表达（它是输入的占比），
+ * 思考 token 也不在这里——它是输出的子集，放在设置卡片的统计块里。上游不给缓存
+ * 字段就不显示命中率：显示成 0% 会被当成「没命中」而不是「没数据」。
+ */
+function usageLine(usage: UsageTotals, t: (key: string, params?: Record<string, unknown>) => string): string {
+  const cached = usage.cachedTokens ?? 0
+  const parts = [
+    t('usageCompact', {
+      prompt: formatTokens(usage.promptTokens),
+      completion: formatTokens(usage.completionTokens),
+    }),
+  ]
+  if (cached > 0 && usage.promptTokens > 0) {
+    parts.push(t('usageCacheHit', { pct: Math.min(100, Math.round((cached / usage.promptTokens) * 100)) }))
+  }
+  parts.push(t('usageRequestCount', { n: formatNumber(usage.requests) }))
+  return parts.join(' · ')
+}
+
 /** 账号名与设置卡片同一套取法：备注 > 用户名 > id。 */
 function accountName(account: { id: string; label?: string; userName?: string }): string {
   return account.label?.trim() || account.userName?.trim() || account.id
@@ -172,22 +218,21 @@ function rowsOf(data: CodeArtsWebStatus): CreditRow[] {
   })
 }
 
-/** 把弹层钉在按钮边上：优先往上开（那一行本来就在输入框下面），放不下就翻到下面。 */
-function anchorOf(rect: DOMRect): Anchor {
-  const above = rect.top > PANEL_MIN_ABOVE
-  const width = Math.min(PANEL_WIDTH, window.innerWidth - 16)
-  return {
-    left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
-    top: above ? rect.top - PANEL_GAP : rect.bottom + PANEL_GAP,
-    above,
-  }
+/**
+ * 弹层往上开还是往下开。
+ *
+ * 位置不在这里算：fixed 元素遇到带 transform / backdrop-filter 的祖先时，坐标会
+ * 相对那个祖先而不是视口（工具行就长在输入框卡片里），所以真实偏移要渲染后实测
+ * （见组件里的 layout effect），这里只决定朝哪边翻。
+ */
+function placeAbove(rect: DOMRect): boolean {
+  return rect.top > PANEL_MIN_ABOVE
 }
 
-export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps): ReactElement | null {
+export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArtsCreditDockProps): ReactElement | null {
   const selection = readSelection(useProjection)
   const active = isCodeArts(selection)
   const [remain, setRemain] = useState<number | null>(null)
-  const [total, setTotal] = useState<number>(0)
   const [rows, setRows] = useState<CreditRow[]>([])
   /**
    * 模型 id -> 目录条目（显示名 + 已格式化的倍率）。
@@ -199,6 +244,15 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
   const [flags, setFlags] = useState<CodeArtsDockFlags>({ credits: true, queue: true })
   const [queued, setQueued] = useState<QueueEntry | null>(null)
   const [anchor, setAnchor] = useState<Anchor | null>(null)
+  /**
+   * 弹层的包含块原点（视口坐标）。
+   *
+   * fixed 只有在祖先没有 transform / backdrop-filter 时才是视口坐标；工具行长在输入框
+   * 卡片里，一旦撞上这类祖先，left/top 就会相对那个祖先算，弹层会飞到窗口外。做法是
+   * 先按 0,0 渲染但不可见，量出面板实际落在哪（就是包含块原点），再把目标坐标减掉它；
+   * 视口情形下量到 (0,0)，等于没动。
+   */
+  const [origin, setOrigin] = useState<{ x: number; y: number } | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const mounted = useRef(true)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
@@ -239,7 +293,6 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
         return
       }
       setRemain(Math.round(pool.reduce((sum, item) => sum + item.credits.total.remain, 0)))
-      setTotal(Math.round(pool.reduce((sum, item) => sum + item.credits.total.total, 0)))
     } catch {
       // 积分是锦上添花，拉不到就别显示 —— 别在对话底部弹错误打扰用户。
     }
@@ -313,6 +366,21 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
     }
   }, [anchor, close])
 
+  // 量一次包含块原点（见 origin 的注释）。渲染时 origin 为空 = 按 0,0 且不可见，
+  // 所以量到的 rect 不会被 translateY(-100%) 这类变换污染。
+  useLayoutEffect(() => {
+    if (anchor === null) {
+      setOrigin(null)
+      return
+    }
+    const el = panelRef.current
+    if (el === null) return
+    const rect = el.getBoundingClientRect()
+    setOrigin(prev => (prev !== null && Math.abs(prev.x - rect.left) < 0.5 && Math.abs(prev.y - rect.top) < 0.5
+      ? prev
+      : { x: rect.left, y: rect.top }))
+  }, [anchor])
+
   // 选中我们的模型时，把这一行里别人的条目压掉。
   //
   // 别人注册什么我们管不了，但宿主把每条注册平铺成 `[data-composer-dock]` 的直接子节点，
@@ -347,6 +415,8 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
 
   const showCredits = flags.credits && remain !== null
   const showQueue = flags.queue && queued !== null
+  // 工具行那个实例没有积分就什么都不画，别留一个零宽的 flex 子节点占位。
+  if (zone === 'bar' && !showCredits) return null
 
   // 一行分段，与 dsh-codebuddy-cli 的底栏同构（`积分 1,642 · Provider CodeBuddy ·
   // Model GLM-5.3 · x0.79`）：积分在最前，然后 provider、模型、倍率，最后是我们的排队段。
@@ -363,19 +433,18 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
   const ratio = entry?.ratio
 
   const line = buildDockLine({
-    ...showCredits ? { credits: t('creditsDock', { remain: formatNumber(remain ?? 0) }) } : {},
+    // 积分只在工具行那一段；其余段留在输入框下方那行。
+    ...zone === 'bar' && showCredits
+      ? { credits: t('creditsDock', { remain: formatNumber(remain ?? 0) }) }
+      : {},
     provider: 'CodeArts',
     ...modelLabel === '' ? {} : { model: modelLabel },
     ...ratio === undefined ? {} : { ratio },
-    ...showQueue && queued !== null ? { queue: t('queueDock', { position: queued.position }) } : {},
+    ...zone === 'dock' && showQueue && queued !== null
+      ? { queue: t('queueDock', { position: queued.position }) }
+      : {},
   }, t)
 
-  const queueTitle = queued === null
-    ? undefined
-    : t('queueDockTitle', { model: queued.model, position: queued.position, length: queued.length })
-  const creditsTitle = showCredits
-    ? t('creditsDockTitle', { remain: remain ?? 0, total })
-    : undefined
   const fetchedAt = rows.reduce((latest, row) => Math.max(latest, row.fetchedAt ?? 0), 0)
   const lastUpdated = fetchedAt > 0 ? formatClock(fetchedAt) : ''
 
@@ -384,7 +453,9 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
       close()
       return
     }
-    setAnchor(anchorOf(event.currentTarget.getBoundingClientRect()))
+    const rect = event.currentTarget.getBoundingClientRect()
+    const above = placeAbove(rect)
+    setAnchor({ left: rect.left, top: above ? rect.top - PANEL_GAP : rect.bottom + PANEL_GAP, above })
   }
 
   const forceRefresh = async (): Promise<void> => {
@@ -415,7 +486,6 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
         flex: '0 0 auto',
         minWidth: 'max-content',
       }}
-      title={queueTitle ?? creditsTitle}
     >
       {/*
         **只有积分那一段**是开弹层的按钮：这是本插件原来的设定，别为了对齐邻居把它
@@ -430,7 +500,6 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
             aria-haspopup="dialog"
             aria-expanded={anchor !== null}
             aria-label={t('creditsDockPanelTitle')}
-            title={creditsTitle}
             onClick={toggle}
             style={{
               all: 'unset',
@@ -444,10 +513,12 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
           >
             {line.credits}
           </button>
-          <span aria-hidden="true">{DOCK_SEGMENT_SEPARATOR}</span>
+          {/* 分隔符只在后面真的还有段时才画：工具行那个实例后面已经没有内容，
+              留着就是一个悬空的 `·`。 */}
+          {zone === 'dock' && <span aria-hidden="true">{DOCK_SEGMENT_SEPARATOR}</span>}
         </>
       )}
-      <span>{line.rest}</span>
+      {zone === 'dock' && <span>{line.rest}</span>}
       {anchor !== null && (
         <div
           ref={panelRef}
@@ -457,9 +528,11 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
             // fixed 而不是 absolute：宿主那一行外面任何一层 overflow:hidden 都会把
             // absolute 的浮层裁掉，fixed 只认视口，不受祖先裁剪。
             position: 'fixed',
-            left: anchor.left,
-            top: anchor.top,
-            transform: anchor.above ? 'translateY(-100%)' : undefined,
+            // origin 为空时按 0,0 不可见地量一次，见上面的 layout effect。
+            left: origin === null ? 0 : anchor.left - origin.x,
+            top: origin === null ? 0 : anchor.top - origin.y,
+            transform: anchor.above && origin !== null ? 'translateY(-100%)' : undefined,
+            visibility: origin === null ? 'hidden' : 'visible',
             width: PANEL_WIDTH,
             maxWidth: 'calc(100vw - 16px)',
             zIndex: 1000,
@@ -487,39 +560,31 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
 
           <div
             style={{
-              display: 'grid',
-              gridTemplateColumns: 'minmax(0, 1fr) auto auto',
-              gap: '4px 12px',
-              alignItems: 'center',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
               borderTop: '0.5px solid var(--dsw-alias-border-l2, rgba(127, 127, 127, 0.22))',
               paddingTop: 8,
+              fontSize: 12,
               color: 'var(--dsw-alias-label-tertiary)',
             }}
           >
-            <span>{t('creditsDockColAccount')}</span>
-            <span style={{ justifySelf: 'end' }}>{t('creditsDockColTokens')}</span>
-            <span style={{ justifySelf: 'end' }}>{t('creditsDockColBalance')}</span>
-            {rows.length === 0 && (
-              <span style={{ gridColumn: '1 / -1' }}>{t('creditsDockEmpty')}</span>
-            )}
-            {rows.map(row => {
-              const detail = row.usage === undefined
-                ? ''
-                : [
-                    t('usageTokens', {
-                      prompt: formatTokens(row.usage.promptTokens),
-                      completion: formatTokens(row.usage.completionTokens),
-                    }),
-                    t('usageRequestCount', { n: formatNumber(row.usage.requests) }),
-                  ].join(' · ')
-              return (
+            {rows.length === 0 && <span>{t('creditsDockEmpty')}</span>}
+
+            {rows.map(row => (
+              // 一行「名 + 余额」、一行灰字用量，但**不带表头**：一旦有「账号 / 积分」
+              // 两列表头，每个号占两行就立刻显得对不齐；名字和余额本身自带语义。
+              <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
                 <div
-                  key={row.id}
                   style={{
-                    display: 'contents',
+                    display: 'grid',
+                    gridTemplateColumns: PANEL_ROW_COLUMNS,
+                    gap: '0 8px',
+                    alignItems: 'center',
+                    minWidth: 0,
                   }}
                 >
-                  <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
                     <StateDot state={row.remain === null ? 'warning' : 'done'} />
                     <span
                       style={{
@@ -533,18 +598,23 @@ export function CodeArtsCreditDock({ useProjection, t }: CodeArtsCreditDockProps
                       {row.name}
                     </span>
                   </span>
-                  <span
-                    style={{ justifySelf: 'end', fontVariantNumeric: 'tabular-nums' }}
-                    title={row.usage === undefined ? t('creditsDockNoTokens') : detail}
-                  >
-                    {row.usage === undefined ? '—' : formatTokens(row.usage.totalTokens)}
-                  </span>
-                  <span style={{ justifySelf: 'end', fontVariantNumeric: 'tabular-nums' }}>
-                    {row.remain === null ? '—' : formatNumber(row.remain)}
-                  </span>
+                  <span style={PANEL_NUM_CELL}>{row.remain === null ? '—' : formatNumber(row.remain)}</span>
                 </div>
-              )
-            })}
+                {/* 左缩进对齐到账号名（圆点 6 + 间隙 5）。 */}
+                <span
+                  style={{
+                    paddingLeft: 11,
+                    fontSize: 11,
+                    lineHeight: '15px',
+                    color: 'var(--dsw-alias-label-tertiary)',
+                  }}
+                >
+                  {row.usage === undefined
+                    ? t('creditsDockNoTokens')
+                    : `${t('usageToday')} ${usageLine(row.usage, t)}`}
+                </span>
+              </div>
+            ))}
           </div>
 
           {rows

@@ -168,6 +168,42 @@ function parseToken(json: any, dpopJWK: DPoPPrivateJWK, clientId: string, prev?:
 }
 
 /**
+ * 华为登录后浏览器落回本机回调的落地页。
+ *
+ * 这一页本身没有任何后续逻辑：`code` 在响应发出的同一时刻就已交给等待队列
+ * （见 startLogin 里的 finish），token 交换完全在服务端做，页面关不关都不影响
+ * 登录结果。它只是 redirect_uri 必然要渲染的一个落点 —— 华为侧没有「登录成功」
+ * 页可停留，成功标志就是这一次 302 到 127.0.0.1。
+ *
+ * 卡片用 `window.open` 打开授权页，所以这个标签页能自己关掉；用户从卡片的
+ * 手动链接打开、或浏览器拦脚本关窗时 close 会失败，1.2s 后把提示换成「可关闭」。
+ */
+const CALLBACK_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CodeArts 登录</title>
+<style>
+  html,body{height:100%}
+  body{margin:0;display:flex;align-items:center;justify-content:center;background:#fff;color:#1f2329;
+    font:15px/1.6 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  p{margin:0;padding:24px;text-align:center}
+</style>
+</head>
+<body>
+<p id="msg">正在返回 DeepSeek Harness…</p>
+<script>
+  setTimeout(function () { try { window.close() } catch (e) {} }, 300)
+  setTimeout(function () {
+    var el = document.getElementById('msg')
+    if (el) el.textContent = 'CodeArts 登录成功，本页可关闭，请回到 DeepSeek Harness。'
+  }, 1200)
+</script>
+</body>
+</html>`
+
+/**
  * 起一个本地回调 server 并完成整段登录。resolve 时 token 已落盘就绪。
  * 桌面版 DSH 下 127.0.0.1 回调一定能落回本机。
  */
@@ -209,8 +245,11 @@ export async function startLogin(cfg: LoginConfig = defaultLoginConfig()): Promi
       }
       finish(code)
       function finish(c?: string | null) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-        res.end('<h3>CodeArts 登录成功，可关闭此页面。</h3>')
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+        })
+        res.end(CALLBACK_HTML)
         if (c) for (const w of waiters.splice(0)) w(c)
       }
     })

@@ -76,9 +76,15 @@ function formatCount(value: number): string {
   return Number.isFinite(value) ? String(Math.round(value)) : '0'
 }
 
+
 /** 积分/token 千分位格式化（2000 → "2,000"）。 */
 function formatCredits(value: number): string {
   return Number.isFinite(value) ? new Intl.NumberFormat().format(Math.round(value)) : '0'
+}
+
+/** 浮层里的明细数字要精确到个位并带千分位，不用 k/M 缩写。 */
+function exactCount(value: number): string {
+  return formatCredits(value)
 }
 
 /** POST /api/codearts/claim 的响应（后端契约见 web-status.ts 的 CodeArtsClaimResult）。 */
@@ -363,6 +369,18 @@ interface UsageBarRow {
 }
 
 /**
+ * 缓存命中率：缓存输入 / 全部输入，钳在 0~100。
+ *
+ * 上游没给缓存字段、或今天压根没有输入时返回 undefined —— 统计块里显示「—」，
+ * 不要把「没有数据」写成「0%」。
+ */
+function hitPercentOf(totals: CodeArtsWebUsage['today']): number | undefined {
+  const cached = totals.cachedTokens ?? 0
+  if (cached <= 0 || totals.promptTokens <= 0) return undefined
+  return Math.min(100, Math.round((cached / totals.promptTokens) * 100))
+}
+
+/**
  * 横向条形列表：名称 / 条 / token / 占比 / 请求数。
  *
  * 条长按「占组内总量的比例」画（不是按最大值归一化），所以几条加起来就是全部。
@@ -375,6 +393,8 @@ function UsageBars({
   rows: readonly UsageBarRow[]
   t: CodeArtsPluginCardInjected['t']
 }): React.ReactElement | null {
+  /** 当前悬停的那一行；卡片浮层只在它上面出现。 */
+  const [hovered, setHovered] = useState<string | null>(null)
   const tokenMode = rows.some(row => row.totals.totalTokens > 0)
   const valueOf = (row: UsageBarRow): number =>
     tokenMode ? row.totals.totalTokens : row.totals.requests
@@ -386,15 +406,24 @@ function UsageBars({
       {top.map(row => {
         const value = valueOf(row)
         const share = sum > 0 ? (value / sum) * 100 : 0
+        const totals = row.totals
+        const cached = totals.cachedTokens
+        const pct = hitPercentOf(totals)
         const detail = [
-          t('usageRequests', { n: formatCount(row.totals.requests) }),
+          t('usageRequests', { n: formatCount(totals.requests) }),
           t('usageTokens', {
-            prompt: formatTokens(row.totals.promptTokens),
-            completion: formatTokens(row.totals.completionTokens),
+            prompt: formatTokens(totals.promptTokens),
+            completion: formatTokens(totals.completionTokens),
           }),
         ].join(' · ')
         return (
-          <div key={row.id} className={styles.modelRow} title={`${row.label} · ${detail}`}>
+          <div
+            key={row.id}
+            className={styles.modelRow}
+            title={`${row.label} · ${detail}`}
+            onMouseEnter={() => setHovered(row.id)}
+            onMouseLeave={() => setHovered(prev => (prev === row.id ? null : prev))}
+          >
             <span className={styles.modelName}>{row.label}</span>
             <span className={styles.modelTrack}>
               <span
@@ -408,8 +437,40 @@ function UsageBars({
             </span>
             <span className={styles.modelShare}>{share.toFixed(1)}%</span>
             <span className={styles.modelRequests}>
-              {t('usageRequestCount', { n: formatCount(row.totals.requests) })}
+              {t('usageRequestCount', { n: formatCount(totals.requests) })}
             </span>
+
+            {hovered === row.id && (
+              <div className={styles.usageTip} role="tooltip">
+                <div className={styles.usageTipName}>{row.label}</div>
+                <div className={styles.usageTipSep} />
+                <div className={styles.usageTipRow}>
+                  <span>{t('usageTipInput')}</span><span>{exactCount(totals.promptTokens)}</span>
+                </div>
+                <div className={styles.usageTipRow}>
+                  <span>{t('usageTipOutput')}</span><span>{exactCount(totals.completionTokens)}</span>
+                </div>
+                {(totals.reasoningTokens ?? 0) > 0 && (
+                  <div className={styles.usageTipRow}>
+                    <span>{t('usageTipReasoning')}</span><span>{exactCount(totals.reasoningTokens ?? 0)}</span>
+                  </div>
+                )}
+                <div className={styles.usageTipRow}>
+                  <span>{t('usageTipCached')}</span>
+                  <span>{cached === undefined ? t('usageTipNoCache') : exactCount(cached)}</span>
+                </div>
+                <div className={styles.usageTipSep} />
+                <div className={styles.usageTipRow}>
+                  <span>{t('usageTipRequests')}</span>
+                  <span>{t('usageRequestCount', { n: formatCount(totals.requests) })}</span>
+                </div>
+                {pct !== undefined && (
+                  <div className={styles.usageTipRow}>
+                    <span>{t('usageTipHit')}</span><span>{pct}%</span>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )
       })}
@@ -433,7 +494,6 @@ function UsageSection({
   accounts: readonly { id: string; label?: string; userName?: string }[]
   t: CodeArtsPluginCardInjected['t']
 }): React.ReactElement {
-  const total = usage.today.requests
   const stateLabel: Record<CodeArtsWebUsage['slots'][number]['state'], string> = {
     ok: t('usageStateOk'),
     capped: t('usageStateCapped'),
@@ -454,40 +514,47 @@ function UsageSection({
     label: entry.id.split(' · ')[0],
     totals: entry.totals,
   }))
-  const hasUsage = usage.allTime.requests > 0 || total > 0
+  const today = usage.today
+  const hasUsage = usage.allTime.requests > 0 || today.requests > 0
+  const hit = hitPercentOf(today)
   return (
     <div className={styles.section}>
       <div className={styles.sectionHead}>
         <span className={styles.sectionLabel}>{t('usageTitle')}</span>
-        <span className={styles.count}>{t('usageRequests', { n: formatCount(total) })}</span>
+        <span className={styles.count}>
+          {t('usageRange', {
+            today: formatCount(today.requests),
+            last30: formatCount(usage.last30.requests),
+          })}
+        </span>
       </div>
 
       {!hasUsage ? (
         <p className={styles.hint}>{t('usageEmpty')}</p>
       ) : (
         <>
-          <div className={styles.choiceRow}>
-            <span className={styles.name}>{t('usageTodayTotal')}</span>
-            <span className={styles.meta}>
-              {t('usageRequests', { n: formatCount(total) })}
-              {' · '}
-              {t('usageTokens', {
-                prompt: formatTokens(usage.today.promptTokens),
-                completion: formatTokens(usage.today.completionTokens),
-              })}
-            </span>
+          <div className={styles.statGrid}>
+            <div className={styles.statCard}>
+              <span className={styles.statLabel}>{t('usageStatTokens')}</span>
+              <span className={styles.statValue}>{formatTokens(today.totalTokens)}</span>
+              <span className={styles.statSub}>
+                {t('usageStatIn', { n: formatTokens(today.promptTokens) })}
+                {/* 思考 token 是输出的子集：不进列里占宽度，挂在这里。 */}
+                {(today.reasoningTokens ?? 0) > 0
+                  ? ` · ${t('usageStatThinking', { n: formatTokens(today.reasoningTokens ?? 0) })}`
+                  : ''}
+              </span>
+            </div>
+            <div className={styles.statCard}>
+              <span className={styles.statLabel}>{t('usageStatHit')}</span>
+              <span className={styles.statValue}>{hit === undefined ? '—' : `${hit}%`}</span>
+            </div>
+            <div className={styles.statCard}>
+              <span className={styles.statLabel}>{t('usageStatRequests')}</span>
+              <span className={styles.statValue}>{formatCount(today.requests)}</span>
+            </div>
           </div>
-          <div className={styles.choiceRow}>
-            <span className={styles.name}>{t('usageLast30')}</span>
-            <span className={styles.meta}>
-              {t('usageRequests', { n: formatCount(usage.last30.requests) })}
-              {' · '}
-              {t('usageTokens', {
-                prompt: formatTokens(usage.last30.promptTokens),
-                completion: formatTokens(usage.last30.completionTokens),
-              })}
-            </span>
-          </div>
+
           {accounts.length > 1 && accountRows.length > 0 && (
             <>
               <p className={styles.hint}>{t('usageByAccount')}</p>

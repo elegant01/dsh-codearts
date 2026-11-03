@@ -405,7 +405,7 @@ describe('GET /api/codearts/status', () => {
 
   // 用量页的四段式要按账号/按近 30 天看数据，这两项必须在契约里透传。
   it('passes per-account and last-30-day usage through to the card', async () => {
-    const totals = { requests: 2, promptTokens: 10, completionTokens: 5, totalTokens: 15 }
+    const totals = { requests: 2, promptTokens: 10, completionTokens: 5, totalTokens: 15, cachedTokens: 4, reasoningTokens: 3 }
     const usageRoutes = mountRoutes({
       store,
       models: () => [],

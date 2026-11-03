@@ -60,12 +60,28 @@ export interface CodeArtsSettingsKey {
   modelsLoading: string
   usageTitle: string
   usageToday: string
-  usageTodayTotal: string
-  usageLast30: string
-  usageByAccount: string
+  usageRange: string
+  usageStatTokens: string
+  usageStatIn: string
+  usageStatThinking: string
+  usageTipInput: string
+  usageTipOutput: string
+  usageTipReasoning: string
+  usageTipCached: string
+  usageTipNoCache: string
+  usageTipRequests: string
+  usageTipHit: string
+  usageStatHit: string
+  usageStatRequests: string
   usageRequests: string
+  usageByAccount: string
   usageRequestCount: string
   usageTokens: string
+  /** 带缓存命中输入的那一版（上游不给缓存字段时仍用 usageTokens）。 */
+  usageCompact: string
+  /** 缓存命中率（`命中 76%`）。 */
+  usageCacheHit: string
+  /** 接在输出数字后面的思考 token（`输出 697（思考 505）`）；没有思考量时不拼。 */
   usageAllTime: string
   usageByModel: string
   usageSlots: string
@@ -92,9 +108,6 @@ export interface CodeArtsSettingsKey {
   creditsDockPanelTitle: string
   creditsDockRefresh: string
   creditsDockRefreshing: string
-  creditsDockColAccount: string
-  creditsDockColBalance: string
-  creditsDockColTokens: string
   creditsDockNoTokens: string
   creditsDockEmpty: string
   creditsDockExpiring: string
@@ -185,12 +198,25 @@ export const zh: CodeArtsSettingsKey = {
   modelsLoading: '模型勾选区加载中…（若长期不出现，请确认已登录且 DSH 已完全重启）',
   usageTitle: '本机用量',
   usageToday: '今日',
-  usageTodayTotal: '今日合计',
-  usageLast30: '近 30 天',
-  usageByAccount: '今日按账号',
+  usageRange: '今日 {today} 条 · 近 30 天 {last30} 条',
+  usageStatTokens: '今日 token',
+  usageStatIn: '输入 {n}',
+  usageStatThinking: '思考 {n}',
+  usageTipInput: '输入',
+  usageTipOutput: '输出',
+  usageTipReasoning: '思考',
+  usageTipCached: '缓存命中',
+  usageTipNoCache: '上游未下发',
+  usageTipRequests: '请求',
+  usageTipHit: '命中率',
+  usageStatHit: '缓存命中',
+  usageStatRequests: '今日请求',
   usageRequests: '{n} 次请求',
+  usageByAccount: '今日按账号',
   usageRequestCount: '{n} 条',
   usageTokens: '输入 {prompt} · 输出 {completion}',
+  usageCompact: '入 {prompt} · 出 {completion}',
+  usageCacheHit: '命中 {pct}%',
   usageAllTime: '累计（{days} 天）',
   usageByModel: '今日按模型',
   usageSlots: '会话槽位',
@@ -217,9 +243,6 @@ export const zh: CodeArtsSettingsKey = {
   creditsDockPanelTitle: 'CodeArts 积分',
   creditsDockRefresh: '刷新积分',
   creditsDockRefreshing: '刷新中…',
-  creditsDockColAccount: '账号',
-  creditsDockColBalance: '剩余积分',
-  creditsDockColTokens: '今日 Token',
   creditsDockNoTokens: '今天还没有经插件发出的请求',
   creditsDockEmpty: '暂时没有积分数据',
   creditsDockExpiring: '{account}：{expiring} 积分将在本周期结束时作废',
@@ -228,9 +251,9 @@ export const zh: CodeArtsSettingsKey = {
   dockModel: 'Model {model}',
   dockNoModel: '未选择模型',
   tabDisplay: '显示',
-  displayTitle: '对话底部显示',
+  displayTitle: '输入框两侧显示',
   displayHint: '这两项只管输入框下方那一行的积分与排队两段；中间那段「Provider CodeArts · Model 模型 · 倍率」一直显示，不受开关影响。底部那条每 60 秒读一次设置，所以关掉最多要等一分钟才见效。',
-  displayCreditsToggle: '显示剩余积分（点开可看各账号明细）',
+  displayCreditsToggle: '在输入框工具行显示剩余积分（点开可看各账号明细）',
   displayQueueToggle: '显示上游排队位置',
   displayNotWritable: '这个宿主没给插件开配置存储，开关只能看不能改。',
   displayFailed: '保存失败：{message}',
@@ -309,12 +332,25 @@ export const en: CodeArtsSettingsKey = {
   modelsLoading: 'Loading model selection… (if it never appears, make sure you are signed in and DSH was fully restarted)',
   usageTitle: 'Local usage',
   usageToday: 'Today',
-  usageTodayTotal: 'Today',
-  usageLast30: 'Last 30 days',
-  usageByAccount: 'Today by account',
+  usageRange: 'Today {today} · last 30 days {last30}',
+  usageStatTokens: 'Today tokens',
+  usageStatIn: 'in {n}',
+  usageStatThinking: 'thinking {n}',
+  usageTipInput: 'Input',
+  usageTipOutput: 'Output',
+  usageTipReasoning: 'Reasoning',
+  usageTipCached: 'Cached',
+  usageTipNoCache: 'not reported',
+  usageTipRequests: 'Requests',
+  usageTipHit: 'Hit rate',
+  usageStatHit: 'Cache hit',
+  usageStatRequests: 'Today requests',
   usageRequests: '{n} request(s)',
+  usageByAccount: 'Today by account',
   usageRequestCount: '{n} reqs',
   usageTokens: 'in {prompt} · out {completion}',
+  usageCompact: 'in {prompt} · out {completion}',
+  usageCacheHit: '{pct}% cached',
   usageAllTime: 'All time ({days} days)',
   usageByModel: 'Today by model',
   usageSlots: 'Session slots',
@@ -341,9 +377,6 @@ export const en: CodeArtsSettingsKey = {
   creditsDockPanelTitle: 'CodeArts credits',
   creditsDockRefresh: 'Refresh credits',
   creditsDockRefreshing: 'Refreshing…',
-  creditsDockColAccount: 'Account',
-  creditsDockColBalance: 'Credits left',
-  creditsDockColTokens: 'Tokens today',
   creditsDockNoTokens: 'No requests through the plugin today yet',
   creditsDockEmpty: 'No credit data yet',
   creditsDockExpiring: '{account}: {expiring} credits expire when this cycle ends',
@@ -352,9 +385,9 @@ export const en: CodeArtsSettingsKey = {
   dockModel: 'Model {model}',
   dockNoModel: 'No model selected',
   tabDisplay: 'Display',
-  displayTitle: 'Under the chat input box',
+  displayTitle: 'Around the chat input box',
   displayHint: 'These two only control the credits and queue segments of that line under the input box; the middle “Provider CodeArts · Model … · rate” segments always show. The bar re-reads settings every 60 seconds, so hiding the rest can take up to a minute.',
-  displayCreditsToggle: 'Show remaining credits (click it for per-account details)',
+  displayCreditsToggle: 'Show remaining credits in the composer tool row (click for per-account details)',
   displayQueueToggle: 'Show the upstream queue position',
   displayNotWritable: 'This host gives the plugin nowhere to persist settings, so the switches are read-only.',
   displayFailed: 'Failed to save: {message}',

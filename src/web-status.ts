@@ -347,6 +347,8 @@ export interface CodeArtsStatusRouteOptions {
   queue?: () => readonly CodeArtsQueueEntry[]
   /** 最近几次出站请求的形状摘要（`/api/codearts/debug`）。 */
   recentRequests?: () => readonly unknown[]
+  /** 最近几帧 usage 的原样内容（`/api/codearts/debug`），用来确认上游是否下发缓存字段。 */
+  recentUsages?: () => readonly unknown[]
   /**
    * Persist a new allowlist. Resolves false when no settings provider is
    * attached, which the card renders as a read-only selection.
@@ -462,7 +464,14 @@ function slotsOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebAccountSlot[] {
 /** 用量账本 -> 卡片文档；没有账本（未注入）时给一份空壳，卡片就不会瞎显示。 */
 function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
   const snapshot: UsageSnapshot | undefined = deps.usage?.()
-  const noTotals: UsageTotals = { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+  const noTotals: UsageTotals = {
+    requests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    cachedTokens: 0,
+    reasoningTokens: 0,
+  }
   return {
     today: snapshot?.today ?? noTotals,
     allTime: snapshot?.allTime ?? noTotals,
@@ -970,7 +979,10 @@ function debugHandler(deps: CodeArtsStatusRouteOptions) {
       json(res, 403, { error: 'request-not-trusted' })
       return
     }
-    json(res, 200, { requests: deps.recentRequests?.() ?? [] })
+    json(res, 200, {
+      requests: deps.recentRequests?.() ?? [],
+      usages: deps.recentUsages?.() ?? [],
+    })
   }
 }
 

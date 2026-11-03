@@ -34,6 +34,24 @@ export interface UsageTotals {
   promptTokens: number
   completionTokens: number
   totalTokens: number
+  /**
+   * 命中上游 prompt 缓存的输入 token（OpenAI 兼容口径）。
+   *
+   * 上游若在 usage 帧里带 `prompt_tokens_details.cached_tokens`（也有平铺成
+   * `cached_tokens` / `cache_tokens` / `prompt_cache_hit_tokens` 的），这里才可能
+   * 是正数；不给就恒为 0。UI 据此决定显不显示「缓存」那一段 —— 不臆造。
+   * 它是 `promptTokens` 的**子集**，不是额外的输入量。
+   */
+  cachedTokens: number
+  /**
+   * 其中属于「思考」的输出 token（OpenAI 兼容口径：`completion_tokens_details.reasoning_tokens`，
+   * 平铺成顶层 `reasoning_tokens` 的也认）。
+   *
+   * 推理模型（deepseek-v4.1-flash 这类）会把它单列出来，通常照样计费；不单独记就
+   * 只能看见一个偏大的「输出」。它是 `completionTokens` 的**子集**，不是额外的输出量。
+   * 上游不给就恒为 0。
+   */
+  reasoningTokens: number
 }
 
 /** 一天之内按模型 / 按账号的累计。 */
@@ -57,6 +75,16 @@ export interface RawUsage {
   prompt_tokens?: unknown
   completion_tokens?: unknown
   total_tokens?: unknown
+  /** OpenAI 兼容的嵌套写法：`prompt_tokens_details: { cached_tokens }`。 */
+  prompt_tokens_details?: unknown
+  /** 平铺写法，几家兼容层各用各的名字，都认。 */
+  cached_tokens?: unknown
+  cache_tokens?: unknown
+  prompt_cache_hit_tokens?: unknown
+  /** 推理模型的嵌套写法：`completion_tokens_details: { reasoning_tokens }`。 */
+  completion_tokens_details?: unknown
+  /** 平铺的思考 token 别名。 */
+  reasoning_tokens?: unknown
 }
 
 export interface UsageSnapshot {
@@ -77,7 +105,14 @@ export interface UsageSnapshot {
 }
 
 export function emptyTotals(): UsageTotals {
-  return { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+  return {
+    requests: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+    cachedTokens: 0,
+    reasoningTokens: 0,
+  }
 }
 
 function addTotals(into: UsageTotals, add: Partial<UsageTotals>): void {
@@ -85,6 +120,8 @@ function addTotals(into: UsageTotals, add: Partial<UsageTotals>): void {
   into.promptTokens += add.promptTokens ?? 0
   into.completionTokens += add.completionTokens ?? 0
   into.totalTokens += add.totalTokens ?? 0
+  into.cachedTokens += add.cachedTokens ?? 0
+  into.reasoningTokens += add.reasoningTokens ?? 0
 }
 
 function mergeTotals(into: UsageTotals, from: UsageTotals): void {
@@ -102,9 +139,45 @@ function positiveInt(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
 }
 
-/** 从上游 usage 帧里取三个计数字段（缺哪个算 0，total 缺失时用 prompt+completion 兜底）。 */
+/**
+ * 从上游 usage 帧里取缓存命中数。
+ *
+ * 位置见过两种：OpenAI 的 `prompt_tokens_details.cached_tokens`，以及兼容层直接
+ * 平铺在顶层的几种别名。取第一个能读到的。缓存输入必然是输入的子集，所以比
+ * `promptTokens` 还大的脏数据直接钳掉 —— 否则界面上会出现 >100% 的命中率。
+ */
+function cachedTokensOf(raw: RawUsage, promptTokens: number): number {
+  if (promptTokens <= 0) return 0
+  const nested = nestedField(raw.prompt_tokens_details, 'cached_tokens')
+  const cached = positiveInt(nested ?? raw.cached_tokens ?? raw.cache_tokens ?? raw.prompt_cache_hit_tokens)
+  return Math.min(cached, promptTokens)
+}
+
+/**
+ * 从上游 usage 帧里取思考 token。
+ *
+ * 口径与 {@link cachedTokensOf} 对称：嵌套 `completion_tokens_details.reasoning_tokens`
+ * 优先，顶层 `reasoning_tokens` 兜底，超过输出总量就钳掉（它含在输出里）。
+ */
+function reasoningTokensOf(raw: RawUsage, completionTokens: number): number {
+  if (completionTokens <= 0) return 0
+  const nested = nestedField(raw.completion_tokens_details, 'reasoning_tokens')
+  const reasoning = positiveInt(nested ?? raw.reasoning_tokens)
+  return Math.min(reasoning, completionTokens)
+}
+
+/** 读 `*_tokens_details` 这类嵌套对象里的一个字段；不是对象（或缺字段）给 undefined。 */
+function nestedField(details: unknown, key: string): unknown {
+  return typeof details === 'object' && details !== null
+    ? (details as Record<string, unknown>)[key]
+    : undefined
+}
+
+/** 从上游 usage 帧里取计数（缺哪个算 0，total 缺失时用 prompt+completion 兜底）。 */
 export function normalizeUsage(raw: RawUsage | undefined): Omit<UsageTotals, 'requests'> {
-  if (raw === undefined) return { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+  if (raw === undefined) {
+    return { promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, reasoningTokens: 0 }
+  }
   const promptTokens = positiveInt(raw.prompt_tokens)
   const completionTokens = positiveInt(raw.completion_tokens)
   const total = positiveInt(raw.total_tokens)
@@ -112,7 +185,31 @@ export function normalizeUsage(raw: RawUsage | undefined): Omit<UsageTotals, 're
     promptTokens,
     completionTokens,
     totalTokens: total > 0 ? total : promptTokens + completionTokens,
+    cachedTokens: cachedTokensOf(raw, promptTokens),
+    reasoningTokens: reasoningTokensOf(raw, completionTokens),
   }
+}
+
+/** 读一项累计值，缺字段（旧账本没有 cachedTokens / reasoningTokens）就按 0 补齐。 */
+function normalizeTotals(raw: Partial<UsageTotals> | undefined): UsageTotals {
+  return {
+    requests: positiveInt(raw?.requests),
+    promptTokens: positiveInt(raw?.promptTokens),
+    completionTokens: positiveInt(raw?.completionTokens),
+    totalTokens: positiveInt(raw?.totalTokens),
+    cachedTokens: positiveInt(raw?.cachedTokens),
+    reasoningTokens: positiveInt(raw?.reasoningTokens),
+  }
+}
+
+/** 整张「模型/账号 -> 累计」表补齐字段。 */
+function normalizeStore(store: Record<string, Partial<UsageTotals>> | undefined): Record<string, UsageTotals> {
+  const out: Record<string, UsageTotals> = {}
+  for (const [key, totals] of Object.entries(store ?? {})) {
+    if (typeof totals !== 'object' || totals === null) continue
+    out[key] = normalizeTotals(totals)
+  }
+  return out
 }
 
 export interface UsageTrackerOptions {
@@ -166,8 +263,8 @@ export class CodeArtsUsageTracker {
       if (parsed.version !== 1 || typeof parsed.days !== 'object' || parsed.days === null) return
       for (const [date, day] of Object.entries(parsed.days)) {
         if (typeof day !== 'object' || day === null) continue
-        const models = (day as UsageDay).models ?? {}
-        const accounts = (day as UsageDay).accounts ?? {}
+        const models = normalizeStore((day as UsageDay).models)
+        const accounts = normalizeStore((day as UsageDay).accounts)
         this.days.set(date, { models, accounts })
       }
       this.prune(this.now())

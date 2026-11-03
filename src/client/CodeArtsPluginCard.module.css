@@ -385,7 +385,44 @@
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
-/* 今日按模型：名称 | 横条 | token | 占比 | 请求数，条长就是占今日总量的比例。 */
+/* 用量页顶部三个数字块：今日 token / 缓存命中 / 今日请求。 */
+.statGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0 14px;
+}
+
+.statCard {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+}
+
+.statLabel {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.statValue {
+  color: var(--dsw-alias-label-primary);
+  font-size: 15px;
+  line-height: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.statSub {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 今日按模型 / 按账号：名称 | 横条 | token | 占比 | 请求数，条长就是占今日总量的比例。 */
 .modelChart {
   display: flex;
   flex-direction: column;
@@ -403,6 +440,63 @@
   gap: 8px;
   padding: 4px 0;
   font-variant-numeric: tabular-nums;
+  /* 悬停浮层的定位基准。 */
+  position: relative;
+  border-radius: 6px;
+}
+
+.modelRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/*
+ * 悬停明细（照 agent-acta 的 .tok-tip）：名称打头、分隔线分段、数字等宽右对齐。
+ * pointer-events:none 是关键：卡片探出行的范围，能接住指针的话会立刻触发
+ * mouseleave，浮层就会一闪一闪。
+ */
+.usageTip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 5;
+  min-width: 180px;
+  max-width: 260px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-3);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 1.9;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.usageTipName {
+  max-width: 240px;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usageTipSep {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--dsw-alias-border-l2);
+}
+
+.usageTipRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.usageTipRow span:last-child {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
 }
 
 .modelName {

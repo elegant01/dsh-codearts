@@ -46,14 +46,27 @@ export function apply(ctx: ClientContext): void {
       locale: namespace,
     }, () => <CodeArtsPluginCard t={t} />))
 
-    // 对话底部的积分条（conversation.composer.dock）—— 用户原始诉求就是
-    // 「对话底部要显示积分」。只在 codearts provider 下显示一行，别的不抢行。
+    // 积分条挂在输入框工具行、权限控制右边（conversation.input.left，宿主契约原文
+    // 「Compact controls at the left of the composer tool row」）。
+    //
+    // 原先整条都挂在输入框下方的 conversation.composer.dock：那里还挤着宿主自己的
+    // tok/s、缓存命中、上下文圆环，模型名一长（DeepSeek-V4.1-Flash-20261017）整条就
+    // 压不住。现在拆成两个实例：积分进工具行，Provider / 模型 / 倍率 / 排队留在原处。
+    // 模型名和倍率在工具行右侧本来就有 pill，搬过去只会重复占宽。
+    ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
+      name: 'conversation.input.left',
+      id: 'codearts-credits-bar',
+      order: 20,
+      locale: namespace,
+      inject: () => ({ t, zone: 'bar' as const }),
+    }, CodeArtsCreditDock))
+
     ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
       name: 'conversation.composer.dock',
       id: 'codearts-credits',
       order: 20,
       locale: namespace,
-      inject: () => ({ t }),
+      inject: () => ({ t, zone: 'dock' as const }),
     }, CodeArtsCreditDock))
   } catch (error: unknown) {
     console.error('[dsh-codearts] client card failed to load (host provider unaffected):', error)

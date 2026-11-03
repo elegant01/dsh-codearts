@@ -34,7 +34,7 @@ import { CodeArtsQueueGate } from './queue.ts'
 import { CodeArtsCreditCache } from './credits.ts'
 import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { probePiAiCompat } from './pi-ai-compat.ts'
-import { createCodeArtsShim, recentRequestShapes } from './shim.ts'
+import { createCodeArtsShim, recentRequestShapes, recentUsageShapes } from './shim.ts'
 import { registerCodeArtsStatusRoute, summarizeClaims } from './web-status.ts'
 import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult, CodeArtsDockFlags } from './web-status.ts'
 import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
@@ -226,6 +226,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     usage: () => usage.snapshot(),
     queue: () => queue.snapshot(),
     recentRequests: () => recentRequestShapes(),
+    recentUsages: () => recentUsageShapes(),
     credits: signal => loadCredits(signal),
     // 弹层上那个「刷新积分」要看见真数字，所以先清缓存再拉 —— 不然点了还是 60 秒前的旧值。
     refreshCredits: signal => {

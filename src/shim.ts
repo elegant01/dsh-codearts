@@ -214,6 +214,30 @@ export function recentRequestShapes(): readonly RequestShapeSummary[] {
   return [...recentShapes].reverse()
 }
 
+/**
+ * 最近几帧 usage 的**原始内容**，最新在前。
+ *
+ * 存这个不是为了统计，而是为了回答一个只能靠证据回答的问题：上游到底给没给缓存
+ * 字段、叫什么名字。账本里的 `cachedTokens` 恒为 0 有两种可能 —— 没命中，或者上游
+ * 压根没这个字段 —— 界面分不出来，只有把原帧摊开看才知道。走 `/api/codearts/debug`
+ * 读，重启即清；只保留最近几帧，不落盘。
+ */
+export interface UsageShapeSummary {
+  at: number
+  accountId: string
+  model: string
+  usage: Record<string, unknown>
+}
+
+const recentUsages: UsageShapeSummary[] = []
+/** 探针只留最近 5 帧：够看形状，又不至于把内存堆成日志。 */
+const USAGE_PROBE_LIMIT = 5
+
+/** 最近的 usage 原帧，最新在前。 */
+export function recentUsageShapes(): readonly UsageShapeSummary[] {
+  return [...recentUsages].reverse()
+}
+
 function noteRequestShape(raw: string, model: string): void {
   let parsed: unknown
   try {
@@ -726,6 +750,14 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         const parsed = JSON.parse(payload) as { usage?: Record<string, unknown> }
         if (parsed.usage !== undefined && parsed.usage !== null) {
           usage.noteUsage(attribution.accountId, attribution.model, parsed.usage)
+          // 留一份原样副本给 /debug：字段名就是答案，只留最近几帧。
+          recentUsages.push({
+            at: Date.now(),
+            accountId: attribution.accountId,
+            model: attribution.model,
+            usage: parsed.usage,
+          })
+          while (recentUsages.length > USAGE_PROBE_LIMIT) recentUsages.shift()
         }
       } catch {
         // 半帧/非 JSON：忽略

@@ -29,6 +29,83 @@ describe('normalizeUsage', () => {
       promptTokens: 10,
       completionTokens: 5,
       totalTokens: 15,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+    })
+  })
+
+  // 缓存输入是输入的子集：上游有的用嵌套 details，有的直接平铺几个别名。
+  it('reads cached prompt tokens from the nested or flat shape', () => {
+    expect(normalizeUsage({
+      prompt_tokens: 100,
+      completion_tokens: 10,
+      prompt_tokens_details: { cached_tokens: 40 },
+    })).toEqual({
+      promptTokens: 100,
+      completionTokens: 10,
+      totalTokens: 110,
+      cachedTokens: 40,
+      reasoningTokens: 0,
+    })
+    expect(normalizeUsage({ prompt_tokens: 100, completion_tokens: 10, cached_tokens: 30 }).cachedTokens).toBe(30)
+    expect(normalizeUsage({ prompt_tokens: 100, completion_tokens: 10, cache_tokens: 20 }).cachedTokens).toBe(20)
+    expect(normalizeUsage({ prompt_tokens: 100, completion_tokens: 10, prompt_cache_hit_tokens: 60 }).cachedTokens).toBe(60)
+  })
+
+  // 嵌套写法优先；缓存超过输入是脏数据（命中率会 >100%），钳掉。
+  it('never reports more cached tokens than the prompt itself', () => {
+    expect(normalizeUsage({
+      prompt_tokens: 100,
+      completion_tokens: 1,
+      prompt_tokens_details: { cached_tokens: 120 },
+    }).cachedTokens).toBe(100)
+    expect(normalizeUsage({
+      prompt_tokens: 100,
+      completion_tokens: 1,
+      prompt_tokens_details: { cached_tokens: 70 },
+      prompt_cache_hit_tokens: 90,
+    }).cachedTokens).toBe(70)
+    // 没有 prompt 就没有缓存可言。
+    expect(normalizeUsage({ completion_tokens: 5, cached_tokens: 9 }).cachedTokens).toBe(0)
+  })
+
+  // 思考 token 含在输出里：嵌套 details 优先，平铺别名兜底，超过输出就钳掉。
+  it('reads reasoning tokens and never lets them exceed the completion itself', () => {
+    expect(normalizeUsage({
+      prompt_tokens: 100,
+      completion_tokens: 20,
+      completion_tokens_details: { reasoning_tokens: 12 },
+    })).toEqual({
+      promptTokens: 100,
+      completionTokens: 20,
+      totalTokens: 120,
+      cachedTokens: 0,
+      reasoningTokens: 12,
+    })
+    expect(normalizeUsage({ prompt_tokens: 1, completion_tokens: 20, reasoning_tokens: 7 }).reasoningTokens).toBe(7)
+    expect(normalizeUsage({
+      prompt_tokens: 1,
+      completion_tokens: 20,
+      completion_tokens_details: { reasoning_tokens: 40 },
+    }).reasoningTokens).toBe(20)
+    // 没有输出就没有思考可言。
+    expect(normalizeUsage({ prompt_tokens: 5, reasoning_tokens: 3 }).reasoningTokens).toBe(0)
+  })
+
+  // 按华为实测的帧形状钉住：两个 details 是并存的（见 /api/codearts/debug 的 usages）。
+  it('parses the frame shape the upstream actually sends', () => {
+    expect(normalizeUsage({
+      prompt_tokens: 76_988,
+      completion_tokens: 697,
+      total_tokens: 77_685,
+      prompt_tokens_details: { cached_tokens: 73_728 },
+      completion_tokens_details: { reasoning_tokens: 505 },
+    })).toEqual({
+      promptTokens: 76_988,
+      completionTokens: 697,
+      totalTokens: 77_685,
+      cachedTokens: 73_728,
+      reasoningTokens: 505,
     })
   })
 
@@ -37,8 +114,16 @@ describe('normalizeUsage', () => {
       promptTokens: 0,
       completionTokens: 0,
       totalTokens: 7,
+      cachedTokens: 0,
+      reasoningTokens: 0,
     })
-    expect(normalizeUsage(undefined)).toEqual({ promptTokens: 0, completionTokens: 0, totalTokens: 0 })
+    expect(normalizeUsage(undefined)).toEqual({
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+    })
   })
 })
 
@@ -51,7 +136,14 @@ describe('CodeArtsUsageTracker', () => {
     tracker.noteUsage('acct-2', 'deepseek-v4.1-flash', { prompt_tokens: 50, completion_tokens: 10 })
 
     const snapshot = tracker.snapshot()
-    expect(snapshot.today).toEqual({ requests: 2, promptTokens: 150, completionTokens: 30, totalTokens: 180 })
+    expect(snapshot.today).toEqual({
+      requests: 2,
+      promptTokens: 150,
+      completionTokens: 30,
+      totalTokens: 180,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+    })
     expect(snapshot.allTime.totalTokens).toBe(180)
     expect(snapshot.byAccountToday['acct-1']?.requests).toBe(1)
     expect(snapshot.byAccountToday['acct-2']?.totalTokens).toBe(60)
@@ -62,7 +154,32 @@ describe('CodeArtsUsageTracker', () => {
   it('counts a request even when no usage frame ever arrives', () => {
     const tracker = new CodeArtsUsageTracker()
     tracker.noteRequest('acct-1', 'GLM-5.2') // 例如用户中途点了停止生成
-    expect(tracker.snapshot().today).toEqual({ requests: 1, promptTokens: 0, completionTokens: 0, totalTokens: 0 })
+    expect(tracker.snapshot().today).toEqual({
+      requests: 1,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+    })
+  })
+
+  // 缓存与思考都要按「模型 × 账号」两个桶各记一份，否则卡片和弹层对不上。
+  it('accumulates cached and reasoning tokens per model and per account', () => {
+    const tracker = new CodeArtsUsageTracker()
+    tracker.noteUsage('acct-1', 'GLM-5.2', {
+      prompt_tokens: 100,
+      completion_tokens: 20,
+      total_tokens: 120,
+      prompt_tokens_details: { cached_tokens: 40 },
+      completion_tokens_details: { reasoning_tokens: 12 },
+    })
+
+    const snapshot = tracker.snapshot()
+    expect(snapshot.today.cachedTokens).toBe(40)
+    expect(snapshot.today.reasoningTokens).toBe(12)
+    expect(snapshot.byAccountToday['acct-1']?.reasoningTokens).toBe(12)
+    expect(snapshot.byModelToday[0]?.totals.reasoningTokens).toBe(12)
   })
 
   it('ignores an all-zero usage frame (no phantom record)', () => {
@@ -124,6 +241,31 @@ describe('CodeArtsUsageTracker', () => {
     await tracker.load()
     tracker.noteRequest('acct-1', 'GLM-5.2')
     expect(tracker.snapshot().today.requests).toBe(1)
+  })
+
+  // 旧账本没有 cachedTokens / reasoningTokens，读进来按 0 补齐，别让 NaN 漏进界面。
+  it('backfills the newer total fields of a ledger written by an older version', async () => {
+    const path = join(dir, '.codearts-usage.json')
+    await writeFile(path, JSON.stringify({
+      version: 1,
+      days: {
+        [localDateKey()]: {
+          models: { 'GLM-5.2': { requests: 2, promptTokens: 100, completionTokens: 10, totalTokens: 110 } },
+          accounts: { 'acct-1': { requests: 2, promptTokens: 100, completionTokens: 10, totalTokens: 110 } },
+        },
+      },
+    }), 'utf8')
+
+    const tracker = new CodeArtsUsageTracker({ path })
+    await tracker.load()
+    expect(tracker.snapshot().today).toEqual({
+      requests: 2,
+      promptTokens: 100,
+      completionTokens: 10,
+      totalTokens: 110,
+      cachedTokens: 0,
+      reasoningTokens: 0,
+    })
   })
 
   it('drops days past the retention window', async () => {
