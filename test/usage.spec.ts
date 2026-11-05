@@ -299,27 +299,26 @@ describe('CodeArtsUsageTracker', () => {
   })
 })
 
-// 趋势曲线：卡片按天画 7 根、按小时画 24 根柱，横轴必须定长（缺的补 0），否则
+// 趋势热力图：卡片按天铺 5 周格子、按小时铺 24 格，横轴必须定长（缺的补 0），否则
 // 「那天没跑」和「那天没记」在图上长得一模一样。
 describe('trend series', () => {
   const at = (day: number, hour = 12): number => new Date(2026, 8, day, hour, 0, 0).getTime()
 
-  it('reports seven ascending days ending today, zero-filling gaps', () => {
+  it('reports five ascending weeks ending today, zero-filling gaps', () => {
     const tracker = new CodeArtsUsageTracker()
     tracker.noteUsage('acct-1', 'GLM-5.2', { total_tokens: 100 }, at(26))
     tracker.noteUsage('acct-1', 'GLM-5.2', { total_tokens: 40 }, at(30, 9))
 
     const { recentDays } = tracker.snapshot(at(30, 9))
-    expect(recentDays.map(day => day.date)).toEqual([
-      '2026-09-24',
-      '2026-09-25',
-      '2026-09-26',
-      '2026-09-27',
-      '2026-09-28',
-      '2026-09-29',
-      '2026-09-30',
-    ])
-    expect(recentDays.map(day => day.totals.totalTokens)).toEqual([0, 0, 100, 0, 0, 0, 40])
+    expect(recentDays).toHaveLength(35)
+    expect(recentDays[0]?.date).toBe('2026-08-27')
+    expect(recentDays.at(-1)?.date).toBe('2026-09-30')
+    const dates = recentDays.map(day => day.date)
+    expect(dates).toEqual([...dates].sort())
+    const byDate = new Map(recentDays.map(day => [day.date, day.totals.totalTokens]))
+    expect(byDate.get('2026-09-26')).toBe(100)
+    expect(byDate.get('2026-09-30')).toBe(40)
+    expect(recentDays.filter(day => day.totals.totalTokens > 0)).toHaveLength(2)
   })
 
   it('buckets today by local hour and leaves the hours not reached yet empty', () => {

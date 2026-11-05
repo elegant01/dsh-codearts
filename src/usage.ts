@@ -78,8 +78,8 @@ interface UsageFile {
 /** 保留多少天（更早的丢掉，文件不会无限长）。 */
 export const RETENTION_DAYS = 60
 
-/** 「最近 N 天」趋势里的天数（含今天）。 */
-export const TREND_DAYS = 7
+/** 「最近 N 天」热力图里的天数（含今天）。5 周 = 35 天，正好铺满一屏月历的 7 列格子。 */
+export const TREND_DAYS = 35
 
 /** 逐小时桶保留几天：今天 + 昨天，够画「今天按小时」和「跟昨天同一时刻比」。 */
 export const HOUR_RETENTION_DAYS = 2

@@ -489,65 +489,146 @@ function UsageBars({
   )
 }
 
+/** 一格 token 量在整组里的深浅档：0 是空格，其余按相对最大值分 5 档。 */
+function toneOf(volume: number, max: number): string {
+  if (volume <= 0 || max <= 0) return 'empty'
+  const ratio = volume / max
+  if (ratio < 0.15) return 'lv1'
+  if (ratio < 0.35) return 'lv2'
+  if (ratio < 0.6) return 'lv3'
+  if (ratio < 0.85) return 'lv4'
+  return 'lv5'
+}
+
+/** 「YYYY-MM-DD」是本地日历日，不能丢给 `new Date(string)`（会被当成 UTC）。返回周一=0…周日=6。 */
+function weekdayOf(date: string): number {
+  const [year, month, day] = date.split('-').map(Number) as [number, number, number]
+  return (new Date(year, month - 1, day).getDay() + 6) % 7
+}
+
 /**
- * 趋势柱：近 7 天按天、今天按小时。
+ * 当月的每日热力图：7 列是周一到周日，格子里的数字是「几号」，底色深浅是那天的 token 量。
  *
- * 两张图共用一套柱子，但编码不同，因为要看的问题不同：
- *  - `hit`：柱高就是命中率，颜色分档 —— 命中率一掉就能看见，这是诊断「系统提示词
- *    前缀变了 / 上下文突然变长」最直接的信号；
- *  - `volume`：柱高按组内最大值归一化 —— 只用来看「什么时候在跑」，绝对值看悬停。
- *
- * 悬停柱子时下面那行换成该格明细，移开回到提示语。轴标签只画整数倍格，24 格全画会挤成一片。
+ * 画整月而不是「最近 N 天」：日历是熟人界面，缺的格子一眼就知道是「还没到」还是「没用量」；
+ * 颜色用 agent-acta 那套绿阶。精确数字（输入 / 缓存 / 命中率 / 条数）全放进悬停提示。
  */
-function UsageTrend({
-  points,
-  mode,
-  axisEvery,
-  hint,
+function UsageHeat({
+  days,
   t,
 }: {
-  points: readonly { key: string; label: string; totals: CodeArtsWebUsage['today'] }[]
-  mode: 'hit' | 'volume'
-  axisEvery: number
-  hint: string
+  days: readonly { date: string; totals: CodeArtsWebUsage['today'] }[]
   t: CodeArtsPluginCardInjected['t']
 }): React.ReactElement {
-  const [hovered, setHovered] = useState<number | null>(null)
-  const max = points.reduce((peak, point) => Math.max(peak, point.totals.totalTokens), 0)
-  const shown = hovered === null ? undefined : points[hovered]
+  const [hovered, setHovered] = useState<string | null>(null)
+  const last = days.at(-1)
+  const month = last?.date.slice(0, 7) ?? ''
+  const inMonth = days.filter(day => day.date.startsWith(month))
+  const max = inMonth.reduce((peak, day) => Math.max(peak, day.totals.totalTokens), 0)
+  const [year, monthNo] = month.split('-').map(Number) as [number, number]
+  const span = month === '' ? [] : Array.from({ length: new Date(year, monthNo, 0).getDate() }, (_, index) => {
+    const day = index + 1
+    const date = `${month}-${String(day).padStart(2, '0')}`
+    const found = inMonth.find(entry => entry.date === date)
+    return { date, day, totals: found?.totals, future: last !== undefined && date > last.date }
+  })
+  // 1 号要落在它自己的星期列上，前面补透明格。
+  const offset = month === '' ? 0 : weekdayOf(`${month}-01`)
+  const shown = span.find(entry => entry.date === hovered)
   return (
     <>
-      <div className={styles.trendBars}>
-        {points.map((point, index) => {
-          const pct = hitPercentOf(point.totals)
-          const share = mode === 'hit'
-            ? pct === undefined ? 0 : Math.max(pct, 2)
-            : max === 0 ? 0 : (point.totals.totalTokens / max) * 100
-          const tone = mode === 'hit'
-            ? pct === undefined ? 'empty' : pct >= 80 ? 'ok' : pct >= 50 ? 'mid' : 'low'
-            : point.totals.totalTokens === 0 ? 'empty' : 'ok'
+      <div className={styles.heatGrid}>
+        {t('usageHeatWeekdays').split(' ').map(label => (
+          <span key={label} className={styles.heatWeekday}>
+            {label}
+          </span>
+        ))}
+        {Array.from({ length: offset }, (_, index) => (
+          <span key={`pad-${String(index)}`} className={styles.heatCell} data-tone="pad" />
+        ))}
+        {span.map(entry => {
+          // 未来的日子、以及账本窗口外的日子只画日期，不给颜色也不给悬停。
+          const tone = entry.totals === undefined
+            ? 'out'
+            : toneOf(entry.totals.totalTokens, max)
           return (
             <span
-              key={point.key}
-              className={styles.trendSlot}
-              title={`${point.label} · ${trendDetail(point.totals, t)}`}
-              onMouseEnter={() => setHovered(index)}
-              onMouseLeave={() => setHovered(null)}
+              key={entry.date}
+              className={styles.heatCell}
+              data-tone={tone}
+              data-today={entry.date === last?.date ? 'true' : undefined}
+              title={entry.totals === undefined ? undefined : `${entry.date} · ${trendDetail(entry.totals, t)}`}
+              onMouseEnter={entry.totals === undefined ? undefined : () => {
+                setHovered(entry.date)
+              }}
+              onMouseLeave={entry.totals === undefined ? undefined : () => {
+                setHovered(null)
+              }}
             >
-              <span className={styles.trendBar} data-tone={tone} style={{ height: `${share}%` }} />
+              {entry.day}
             </span>
           )
         })}
       </div>
-      <div className={styles.trendAxis}>
-        {points.map((point, index) => (
-          <span key={point.key} className={styles.trendAxisSlot}>
-            {index % axisEvery === 0 ? point.label : ''}
+      <div className={styles.heatLegend}>
+        <span>{t('usageHeatLess')}</span>
+        {['lv1', 'lv2', 'lv3', 'lv4', 'lv5'].map(tone => (
+          <span key={tone} className={styles.heatLegendChip} data-tone={tone} />
+        ))}
+        <span>{t('usageHeatMore')}</span>
+      </div>
+      <p className={styles.trendTip}>
+        {shown?.totals === undefined
+          ? t('usageTrendHint')
+          : `${shown.date} · ${trendDetail(shown.totals, t)}`}
+      </p>
+    </>
+  )
+}
+
+/**
+ * 今天逐小时：一行 24 格，深浅同样是相对最大值的档位，轴标签每 6 格画一个。
+ *
+ * 只在有真实小时桶时画 —— 功能上线前的小时没有回填，全画成空格会被误读成「跑了但没用量」。
+ */
+function UsageHours({
+  hours,
+  t,
+}: {
+  hours: readonly { hour: number; totals: CodeArtsWebUsage['today'] }[]
+  t: CodeArtsPluginCardInjected['t']
+}): React.ReactElement {
+  const [hovered, setHovered] = useState<number | null>(null)
+  const max = hours.reduce((peak, hour) => Math.max(peak, hour.totals.totalTokens), 0)
+  const shown = hovered === null ? undefined : hours.find(entry => entry.hour === hovered)
+  return (
+    <>
+      <div className={styles.heatHours}>
+        {hours.map(entry => (
+          <span
+            key={entry.hour}
+            className={styles.heatHourCell}
+            data-tone={toneOf(entry.totals.totalTokens, max)}
+            title={`${String(entry.hour)}:00 · ${trendDetail(entry.totals, t)}`}
+            onMouseEnter={() => {
+              setHovered(entry.hour)
+            }}
+            onMouseLeave={() => {
+              setHovered(null)
+            }}
+          />
+        ))}
+      </div>
+      <div className={styles.heatAxis}>
+        {hours.map(entry => (
+          <span key={entry.hour} className={styles.heatAxisSlot}>
+            {entry.hour % 6 === 0 ? entry.hour : ''}
           </span>
         ))}
       </div>
       <p className={styles.trendTip}>
-        {shown === undefined ? hint : `${shown.label} · ${trendDetail(shown.totals, t)}`}
+        {shown === undefined
+          ? t('usageTrendHint')
+          : `${String(shown.hour).padStart(2, '0')}:00 · ${trendDetail(shown.totals, t)}`}
       </p>
     </>
   )
@@ -645,17 +726,7 @@ function UsageSection({
           {(usage.recentDays ?? []).length > 0 && (
             <>
               <p className={styles.hint}>{t('usageTrendWeek')}</p>
-              <UsageTrend
-                mode="hit"
-                axisEvery={1}
-                hint={t('usageTrendHint')}
-                points={(usage.recentDays ?? []).map(day => ({
-                  key: day.date,
-                  label: day.date.slice(5),
-                  totals: day.totals,
-                }))}
-                t={t}
-              />
+              <UsageHeat days={usage.recentDays ?? []} t={t} />
             </>
           )}
           {(usage.todayByHour ?? []).length > 0 && (
@@ -663,17 +734,7 @@ function UsageSection({
               <p className={styles.hint}>{t('usageTrendHour')}</p>
               {/* 逐小时是这次才有的口径：启用前的小时没有回填，别画成「跑了但没用量」。 */}
               {(usage.todayByHour ?? []).some(entry => entry.totals.requests > 0) ? (
-                <UsageTrend
-                  mode="volume"
-                  axisEvery={6}
-                  hint={t('usageTrendHint')}
-                  points={(usage.todayByHour ?? []).map(entry => ({
-                    key: String(entry.hour),
-                    label: String(entry.hour),
-                    totals: entry.totals,
-                  }))}
-                  t={t}
-                />
+                <UsageHours hours={usage.todayByHour ?? []} t={t} />
               ) : (
                 <p className={styles.trendTip}>{t('usageTrendHourEmpty')}</p>
               )}

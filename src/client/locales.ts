@@ -87,6 +87,11 @@ export interface CodeArtsSettingsKey {
   usageTrendHint: string
   /** 逐小时是本次新增口径，启用前的小时不回填。 */
   usageTrendHourEmpty: string
+  /** 热力图顶上的星期行（周一…周日，空格分隔，前端 split(' ') 成 7 列）。 */
+  usageHeatWeekdays: string
+  /** 热力图档位图例的两端：少 ▢▢▢▢▢ 多。 */
+  usageHeatLess: string
+  usageHeatMore: string
   usageRequests: string
   usageByAccount: string
   usageRequestCount: string
@@ -236,10 +241,13 @@ export const zh: CodeArtsSettingsKey = {
   usageStatHit: '缓存命中',
   usageStatRequests: '今日请求',
   usageRequests: '{n} 次请求',
-  usageTrendWeek: '近 7 天 · 缓存命中率',
+  usageTrendWeek: '本月 · 每日 token',
   usageTrendHour: '今天 · 逐小时 token',
-  usageTrendHint: '悬停柱子看那一格明细',
+  usageTrendHint: '悬停格子看那一格明细',
   usageTrendHourEmpty: '今天还没有逐小时数据（启用前的小时不回填）',
+  usageHeatWeekdays: '一 二 三 四 五 六 日',
+  usageHeatLess: '少',
+  usageHeatMore: '多',
   usageByAccount: '今日按账号',
   usageRequestCount: '{n} 条',
   usageTokens: '输入 {prompt} · 输出 {completion}',
@@ -384,10 +392,13 @@ export const en: CodeArtsSettingsKey = {
   usageStatHit: 'Cache hit',
   usageStatRequests: 'Today requests',
   usageRequests: '{n} request(s)',
-  usageTrendWeek: 'Last 7 days · cache hit rate',
+  usageTrendWeek: 'This month · tokens per day',
   usageTrendHour: 'Today · tokens by hour',
-  usageTrendHint: 'Hover a bar for that slot',
+  usageTrendHint: 'Hover a cell for that day',
   usageTrendHourEmpty: 'No hourly data yet today (hours before this feature are not backfilled)',
+  usageHeatWeekdays: 'Mo Tu We Th Fr Sa Su',
+  usageHeatLess: 'Less',
+  usageHeatMore: 'More',
   usageByAccount: 'Today by account',
   usageRequestCount: '{n} reqs',
   usageTokens: 'in {prompt} · out {completion}',

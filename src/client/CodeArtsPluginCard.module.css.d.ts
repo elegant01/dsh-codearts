@@ -40,6 +40,15 @@ declare const styles: {
   readonly "fieldLabel": string
   readonly "headText": string
   readonly "header": string
+  readonly "heatAxis": string
+  readonly "heatAxisSlot": string
+  readonly "heatCell": string
+  readonly "heatGrid": string
+  readonly "heatHourCell": string
+  readonly "heatHours": string
+  readonly "heatLegend": string
+  readonly "heatLegendChip": string
+  readonly "heatWeekday": string
   readonly "hint": string
   readonly "link": string
   readonly "manual": string
@@ -69,11 +78,6 @@ declare const styles: {
   readonly "statusLine": string
   readonly "tabPanel": string
   readonly "tabs": string
-  readonly "trendAxis": string
-  readonly "trendAxisSlot": string
-  readonly "trendBar": string
-  readonly "trendBars": string
-  readonly "trendSlot": string
   readonly "trendTip": string
   readonly "updated": string
   readonly "usageBar": string
