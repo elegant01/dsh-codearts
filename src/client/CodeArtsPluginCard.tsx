@@ -536,6 +536,13 @@ function UsageHeat({
   const shown = span.find(entry => entry.date === hovered)
   return (
     <>
+      <div className={styles.heatLegend}>
+        <span>{t('usageHeatLess')}</span>
+        {['lv1', 'lv2', 'lv3', 'lv4', 'lv5'].map(tone => (
+          <span key={tone} className={styles.heatLegendChip} data-tone={tone} />
+        ))}
+        <span>{t('usageHeatMore')}</span>
+      </div>
       <div className={styles.heatGrid}>
         {t('usageHeatWeekdays').split(' ').map(label => (
           <span key={label} className={styles.heatWeekday}>
@@ -546,10 +553,12 @@ function UsageHeat({
           <span key={`pad-${String(index)}`} className={styles.heatCell} data-tone="pad" />
         ))}
         {span.map(entry => {
-          // 未来的日子、以及账本窗口外的日子只画日期，不给颜色也不给悬停。
-          const tone = entry.totals === undefined
+          // 未来的日子只留日期；本月里已经过去却没有记录的日子是浅底空格，不参与深浅编码。
+          const tone = entry.future
             ? 'out'
-            : toneOf(entry.totals.totalTokens, max)
+            : entry.totals === undefined
+              ? 'empty'
+              : toneOf(entry.totals.totalTokens, max)
           return (
             <span
               key={entry.date}
@@ -568,13 +577,6 @@ function UsageHeat({
             </span>
           )
         })}
-      </div>
-      <div className={styles.heatLegend}>
-        <span>{t('usageHeatLess')}</span>
-        {['lv1', 'lv2', 'lv3', 'lv4', 'lv5'].map(tone => (
-          <span key={tone} className={styles.heatLegendChip} data-tone={tone} />
-        ))}
-        <span>{t('usageHeatMore')}</span>
       </div>
       <p className={styles.trendTip}>
         {shown?.totals === undefined
