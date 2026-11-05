@@ -16,25 +16,27 @@ export function CodeArtsPanelIcon({ size }: { size?: number }): React.ReactEleme
       focusable="false"
     >
       {/*
-       * 尖括号夹一道斜杠 = 「写代码」，这是代码编辑器里最通用的那个符号。
-       * 之前画的是铅笔，和宿主自带的 IconEditOutline（编辑）撞脸，侧边栏里
-       * 看着像「编辑这一页」而不是「CodeArts 入口」。
+       * 一张「纸」—— 左上缺角、右下收口 —— 中间一道斜杠。纸代表产出物，斜杠代表
+       * 「写代码」这个动作，合起来是「用代码生成的产物」。
+       * 之前画的是铅笔，和宿主自带的 IconEditOutline（编辑）撞脸，侧边栏里看着像
+       * 「编辑这一页」而不是「CodeArts 入口」。
+       * 16px 下只能容纳这么多笔画：试过在原稿里再塞一对尖括号和一条曲线，会糊成一团。
        */}
       <path
-        d="M5.1 3.9 1.9 8l3.2 4.1"
+        d="M6 2.6h6.5A1.5 1.5 0 0 1 14 4.1V10.8"
         stroke="currentColor"
         strokeWidth="1"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
       <path
-        d="M10.9 3.9 14.1 8l-3.2 4.1"
+        d="M2 6.2v6.1a1.5 1.5 0 0 0 1.5 1.5h6.1"
         stroke="currentColor"
         strokeWidth="1"
         strokeLinecap="round"
         strokeLinejoin="round"
       />
-      <path d="M9 3.2 7 12.8" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+      <path d="M9.3 5.9 6.7 10.9" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
     </svg>
   )
 }
