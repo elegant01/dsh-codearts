@@ -104,6 +104,13 @@ export interface Config {
   showCreditDock?: boolean
   /** 等上游开流时那行「排队第 N 位」是否显示。缺省 = 显示。 */
   showQueueDock?: boolean
+  /**
+   * 是否在 DSH 侧边栏的图标列里加一个 CodeArts 图标（点开在中间列显示整页版卡片）。
+   *
+   * 缺省 = **不显示**：图标列是全宿主共用的资源，每个插件都默认占一格很快就会挤满，
+   * 而「设置 → 插件」里本来就能看到同一张卡片，所以这一格交给用户自己决定要不要。
+   */
+  showSidebarPanel?: boolean
 }
 
 interface VolatileValue<T> {
@@ -128,6 +135,7 @@ export const Config: z<Config> = z.object({
   enabledModels: z.array(z.string()).description('Model ids offered in the model pickers (empty means every model)').volatile(),
   showCreditDock: z.boolean().default(true).description('Show the remaining-credits line under the chat input box').volatile(),
   showQueueDock: z.boolean().default(true).description('Show the upstream queue position under the chat input box').volatile(),
+  showSidebarPanel: z.boolean().default(false).description('Show a CodeArts icon in the DSH sidebar icon column, opening this page in the middle column').volatile(),
 }) as unknown as z<Config>
 
 function settingsCompatNamespace(ctx: Context): SettingsNamespace {
@@ -196,9 +204,11 @@ export function apply(ctx: Context, rawConfig: Config): void {
   }
 
   // 缺省即显示：老配置没这两个键时不该把已经用惯的那一行变没。
+  // 侧边栏入口相反 —— 缺省关闭，没写过就是不要。
   const dock = (): CodeArtsDockFlags => ({
     credits: current().showCreditDock !== false,
     queue: current().showQueueDock !== false,
+    sidebar: current().showSidebarPanel === true,
   })
 
   const setDock = async (patch: Partial<CodeArtsDockFlags>): Promise<boolean> => {
@@ -207,6 +217,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     await settings.update(settingsCompatNamespace(ctx), {
       ...patch.credits === undefined ? {} : { showCreditDock: patch.credits },
       ...patch.queue === undefined ? {} : { showQueueDock: patch.queue },
+      ...patch.sidebar === undefined ? {} : { showSidebarPanel: patch.sidebar },
     })
     return true
   }

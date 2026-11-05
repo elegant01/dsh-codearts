@@ -27,6 +27,10 @@ Brings Huawei Cloud CodeArts into DeepSeek Harness (DSH), so the models CodeArts
   which is exactly why a turn had to wait. CodeArts exposes no quota API, so these are the
   requests this machine sent through the plugin; the card links to the official usage page.
 - **Image input**: models with vision support accept pasted or dropped images in a chat.
+- **Sidebar icon**: optional. Tick it on the card’s Display tab and a CodeArts icon joins
+  the DSH icon column, opening the full-page version of the settings card in the middle
+  column (config `showSidebarPanel`; off by default, since that column is shared by the
+  whole host).
 - **Fallback path**: you can also paste a bare security token in the card, for scripts or
   troubleshooting.
 - **CLI**: `status` / `models` / `usage` / `identity` / `doctor` / `logout` for checking

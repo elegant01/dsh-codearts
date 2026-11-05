@@ -241,7 +241,7 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
    * 名字用 `stripModelSuffixes` 剥掉尾巴，倍率直接用服务端算好的 `ratio`。
    */
   const [modelInfo, setModelInfo] = useState<Record<string, { name: string; ratio?: string }>>({})
-  const [flags, setFlags] = useState<CodeArtsDockFlags>({ credits: true, queue: true })
+  const [flags, setFlags] = useState<CodeArtsDockFlags>({ credits: true, queue: true, sidebar: false })
   const [queued, setQueued] = useState<QueueEntry | null>(null)
   const [anchor, setAnchor] = useState<Anchor | null>(null)
   /**
@@ -275,7 +275,7 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
       if (!res.ok) return
       const data = (await res.json().catch(() => undefined)) as CodeArtsWebStatus | undefined
       if (data === undefined || !mounted.current) return
-      setFlags(data.dock ?? { credits: true, queue: true })
+      setFlags(data.dock ?? { credits: true, queue: true, sidebar: false })
       setRows(rowsOf(data))
       setModelInfo(Object.fromEntries((data.models ?? []).map(model => [model.id, {
         name: model.name,

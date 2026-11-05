@@ -39,6 +39,7 @@ dify-*.md
 
 # Local docs / scratch.
 .chrome-cdp/
+_chrome_rescue/
 
 # PowerShell redirection strays.
 $null

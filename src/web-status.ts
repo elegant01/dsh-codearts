@@ -198,20 +198,26 @@ export interface CodeArtsAccountCredits {
 }
 
 /**
- * 对话底部那一行的显隐开关。
+ * 对话底部那一行的显隐开关，外加侧边栏入口。
  *
  * 两个字段各管一件事：积分数字是常驻的，排队提示只在等开流时出现。分成两个开关
  * 是因为「不想常驻一个数字」和「别告诉我为什么在等」是两种完全不同的诉求。
+ * `sidebar` 是第三件事：要不要在 DSH 侧边栏占一格（点开是整页版卡片）。
  */
 export interface CodeArtsDockFlags {
   /** 剩余积分那一行。 */
   credits: boolean
   /** 上游排队位置提示。 */
   queue: boolean
+  /** DSH 侧边栏里的 CodeArts 入口。 */
+  sidebar: boolean
 }
 
-/** 开关的默认值：没有 settings provider（或老配置没这两个键）时保持原有行为 —— 都显示。 */
-export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = { credits: true, queue: true }
+/**
+ * 开关的默认值：没有 settings provider（或老配置没这两个键）时保持原有行为 ——
+ * 底部两行都显示；侧边栏相反，缺省不开（那一格是所有插件共用的全局座位）。
+ */
+export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = { credits: true, queue: true, sidebar: false }
 
 /**
  * 把逐账号的领取结果汇总成一条：HTTP 层只看 ok，卡片看 results 逐号展示。
@@ -593,11 +599,11 @@ function dockHandler(deps: CodeArtsStatusRouteOptions) {
         return
       }
       try {
-        const body = JSON.parse(await readBody(req)) as { credits?: unknown; queue?: unknown }
-        const keys = ['credits', 'queue'] as const
+        const body = JSON.parse(await readBody(req)) as { credits?: unknown; queue?: unknown; sidebar?: unknown }
+        const keys = ['credits', 'queue', 'sidebar'] as const
         const touched = keys.filter(key => body[key] !== undefined)
         if (touched.length === 0 || touched.some(key => typeof body[key] !== 'boolean')) {
-          json(res, 400, { error: 'expected {"credits"?: boolean, "queue"?: boolean}' })
+          json(res, 400, { error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean}' })
           return
         }
         const ok = await deps.setDock(Object.fromEntries(

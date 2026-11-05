@@ -3,6 +3,7 @@ import { Button, Checkbox, Input, SegmentedTabs, StateDot, Tag } from '@deepseek
 import type { SegmentedTab, StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { CodeArtsWebStatus, CodeArtsWebUsage, CodeArtsCreditSnapshot, CodeArtsWelfareState } from '../web-status.ts'
 import { stripModelSuffixes } from '../catalog.ts'
+import { setSidebarPanelWanted } from './panel-switch.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
 export interface CodeArtsPluginCardInjected {
@@ -126,12 +127,15 @@ type CardTab = 'accounts' | 'models' | 'usage' | 'display'
 
 /** GET/POST /api/codearts/dock 的文档（后端契约见 web-status.ts 的 CodeArtsDockFlags）。 */
 interface DockDoc {
-  dock?: { credits: boolean; queue: boolean }
+  dock?: { credits: boolean; queue: boolean; sidebar?: boolean }
   writable?: boolean
 }
 
-/** 开关的兜底值：后端没这条路由（老版本）时按「都显示」渲染，与原有行为一致。 */
-const DOCK_DEFAULT = { credits: true, queue: true }
+/**
+ * 开关的兜底值：后端没这条路由（老版本）时按「都显示」渲染，与原有行为一致。
+ * 侧边栏那一格相反 —— 缺省关闭。
+ */
+const DOCK_DEFAULT = { credits: true, queue: true, sidebar: false }
 
 /** 一个 Tab 面板；未选中的用 hidden 留在 DOM 里，草稿和滚动位置都别丢。 */
 function TabPanel({
@@ -635,24 +639,31 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       const res = await fetch('/api/codearts/dock', { headers: { Accept: 'application/json' } })
       if (!res.ok) return
       const data = (await res.json()) as DockDoc
-      if (data.dock !== undefined) setDock(data.dock)
+      if (data.dock !== undefined) {
+        // 老后端只回 credits/queue：缺的键用兜底值补齐，别把 undefined 塞进 state。
+        const next = { ...DOCK_DEFAULT, ...data.dock }
+        setDock(next)
+        setSidebarPanelWanted(next.sidebar)
+      }
       setDockWritable(data.writable === true)
     } catch {
-      // 老后端没这条路由：保持默认（都显示），勾选框置灰，别把整张卡片报成出错。
+      // 老后端没这条路由：保持默认（都显示 / 侧边栏关闭），勾选框置灰，别把整张卡片报成出错。
     }
   }
 
   /**
    * 改一个开关：先按新值渲染，写失败再退回去。
    *
-   * 这里不像模型勾选那样攒草稿再点保存 —— 只有两个布尔，攒草稿反而让用户猜
+   * 这里不像模型勾选那样攒草稿再点保存 —— 只有几个布尔，攒草稿反而让用户猜
    * 「我刚才那一下到底生效没有」。
    */
-  async function toggleDock(key: 'credits' | 'queue', on: boolean): Promise<void> {
+  async function toggleDock(key: 'credits' | 'queue' | 'sidebar', on: boolean): Promise<void> {
     const previous = dock
     setDock({ ...dock, [key]: on })
     setDockSaving(true)
     setDockError(null)
+    // 侧边栏开关要立刻反映到导航行上，不等 POST 回来（乐观更新，失败再退回去）。
+    if (key === 'sidebar') setSidebarPanelWanted(on)
     try {
       const res = await fetch('/api/codearts/dock', {
         method: 'POST',
@@ -664,9 +675,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         throw new Error(typeof data.error === 'string' ? data.error : `HTTP ${res.status}`)
       }
       const data = (await res.json()) as DockDoc
-      if (data.dock !== undefined) setDock(data.dock)
+      if (data.dock !== undefined) {
+        const next = { ...DOCK_DEFAULT, ...data.dock }
+        setDock(next)
+        setSidebarPanelWanted(next.sidebar)
+      }
     } catch (error: unknown) {
       setDock(previous)
+      if (key === 'sidebar') setSidebarPanelWanted(previous.sidebar)
       setDockError(error instanceof Error ? error.message : String(error))
     } finally {
       setDockSaving(false)
@@ -1314,6 +1330,28 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 </div>
                 {!dockWritable && <p className={styles.hint}>{t('displayNotWritable')}</p>}
                 {dockError !== null && <p className={styles.error}>{t('displayFailed', { message: dockError })}</p>}
+              </div>
+
+              {/*
+                侧边栏图标单独一段：它和上面两个「对话里的行」不是同一类东西 ——
+                占的是全宿主共用的图标列，所以默认关闭，且说明白它做什么。
+              */}
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displaySidebarTitle')}</span>
+                </div>
+                <p className={styles.hint}>{t('displaySidebarHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.sidebar}
+                      disabled={!dockWritable || dockSaving}
+                      onChange={on => void toggleDock('sidebar', on)}
+                      label={t('displaySidebarToggle')}
+                    />
+                  </div>
+                </div>
               </div>
             </TabPanel>
           </>

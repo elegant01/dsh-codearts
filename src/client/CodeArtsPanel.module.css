@@ -1,0 +1,91 @@
+/*
+ * 侧边栏入口页的壳。跟 CodeArtsPluginCard.module.css 一样，只用宿主 theme 里
+ * 真实存在的 --dsw-alias-* / --dsw-radius-* 令牌，不自己造名字。
+ *
+ * 两点是宿主强制的：
+ * 1. main 面板占满中间列，自己不滚就溢出 —— 所以 page 自己是滚动容器。
+ * 2. 桌面端顶部有一条 48px 的系统标题栏（--dsh-frame-top-clearance），
+ *    内容必须让开，否则被压在标题栏底下。
+ */
+
+.page {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: calc(28px + var(--dsh-frame-top-clearance, 0px)) clamp(24px, 4vw, 48px) 48px;
+  color: var(--dsw-alias-label-primary);
+}
+
+.head {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.back {
+  appearance: none;
+  font: inherit;
+  cursor: pointer;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 5px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.back:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+/*
+ * 返回箭头用 CSS 画。宿主 primitives 的 icon 名字在不同 rc 之间变过，
+ * 引一个不存在的名字只会静默留白，不如自己画。
+ */
+.backCaret {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-left: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: rotate(45deg);
+}
+
+.title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.body {
+  width: 100%;
+  max-width: 860px;
+  margin: 20px auto 0;
+}
+
+/* 侧边栏按钮里那个 glyph：宿主在 currentColor 主题格里渲染，尺寸由 size 决定。 */
+.icon {
+  display: block;
+  flex: none;
+}

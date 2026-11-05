@@ -122,6 +122,9 @@ export interface CodeArtsSettingsKey {
   displayQueueToggle: string
   displayNotWritable: string
   displayFailed: string
+  displaySidebarTitle: string
+  displaySidebarHint: string
+  displaySidebarToggle: string
   queueDock: string
   queueDockTitle: string
   claimButton: string
@@ -133,6 +136,8 @@ export interface CodeArtsSettingsKey {
   claimAlready: string
   claimUnavailable: string
   claimFailed: string
+  panelBack: string
+  panelDesc: string
   [key: string]: string
 }
 
@@ -257,6 +262,9 @@ export const zh: CodeArtsSettingsKey = {
   displayQueueToggle: '显示上游排队位置',
   displayNotWritable: '这个宿主没给插件开配置存储，开关只能看不能改。',
   displayFailed: '保存失败：{message}',
+  displaySidebarTitle: '侧边栏图标',
+  displaySidebarHint: '勾上以后，DSH 左侧那一列图标里会多一个 CodeArts，点它直接在中间列打开当前这一页，不必每次都绕进设置。默认不勾：这列图标是全宿主共用的，每个插件都来占一格很快就挤满了。改完立刻生效，没有保存步骤。',
+  displaySidebarToggle: '在侧边栏图标列显示 CodeArts',
   queueDock: '排队第 {position} 位',
   queueDockTitle: '上游排队：{model} · 第 {position} 位 / 共 {length} 条',
   claimButton: '签到领积分',
@@ -268,6 +276,8 @@ export const zh: CodeArtsSettingsKey = {
   claimAlready: '今日已领，明天再来',
   claimUnavailable: '这个账号当前没有可领的签到活动',
   claimFailed: '领取失败：{message}',
+  panelBack: '返回对话',
+  panelDesc: '账号、模型开关与用量都在这一页里管，和设置 → 插件里那张卡片是同一份状态。',
 }
 
 export const en: CodeArtsSettingsKey = {
@@ -391,6 +401,9 @@ export const en: CodeArtsSettingsKey = {
   displayQueueToggle: 'Show the upstream queue position',
   displayNotWritable: 'This host gives the plugin nowhere to persist settings, so the switches are read-only.',
   displayFailed: 'Failed to save: {message}',
+  displaySidebarTitle: 'Sidebar icon',
+  displaySidebarHint: 'Once checked, a CodeArts icon joins the icon column on the left of DSH and opens this very page in the middle column, so you do not have to go through Settings each time. Off by default: that column is shared by the whole host, and it fills up quickly if every plugin claims a slot. Takes effect immediately — there is nothing to save.',
+  displaySidebarToggle: 'Show CodeArts in the sidebar icon column',
   queueDock: 'Queued #{position}',
   queueDockTitle: 'Upstream queue: {model} · position {position} of {length}',
   claimButton: 'Claim daily credits',
@@ -402,4 +415,6 @@ export const en: CodeArtsSettingsKey = {
   claimAlready: 'Already claimed today — come back tomorrow',
   claimUnavailable: 'No check-in campaign available for this account',
   claimFailed: 'Claim failed: {message}',
+  panelBack: 'Back to chat',
+  panelDesc: 'Manage accounts, model switches and usage here — same state as the card under Settings → Plugins.',
 }

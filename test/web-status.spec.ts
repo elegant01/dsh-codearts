@@ -433,9 +433,9 @@ describe('GET /api/codearts/status', () => {
   // 底部积分条靠这一份开关决定画不画，所以它必须搭 /status 的车 —— 为两个布尔
   // 多开一条轮询链路没道理。没接 settings 的宿主上 deps.dock 缺席，字段就该整个没有。
   it('carries the dock visibility flags so the composer bar does not need its own poll', async () => {
-    const scoped = mountRoutes({ store, models: () => [], dock: () => ({ credits: false, queue: true }) })
+    const scoped = mountRoutes({ store, models: () => [], dock: () => ({ credits: false, queue: true, sidebar: false }) })
     const res = await call(scoped.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)
-    expect(res.body?.dock).toEqual({ credits: false, queue: true })
+    expect(res.body?.dock).toEqual({ credits: false, queue: true, sidebar: false })
     expect((await call(routes.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)).body?.dock).toBeUndefined()
   })
 
@@ -456,18 +456,18 @@ describe('GET /api/codearts/status', () => {
 
 describe('/api/codearts/dock', () => {
   it('answers the current flags and reports writability', async () => {
-    const scoped = mountRoutes({ store, models: () => [], dock: () => ({ credits: true, queue: false }) })
+    const scoped = mountRoutes({ store, models: () => [], dock: () => ({ credits: true, queue: false, sidebar: true }) })
     const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, GET, CODEARTS_DOCK_PATH)
-    expect(res.body?.dock).toEqual({ credits: true, queue: false })
+    expect(res.body?.dock).toEqual({ credits: true, queue: false, sidebar: true })
     expect(res.body?.writable).toBe(false)
-    // 没接 dock 读取面的老注入方：按原有行为给「都显示」。
+    // 没接 dock 读取面的老注入方：底部两行按原有行为「都显示」，侧边栏缺省不开。
     expect((await call(routes.get(CODEARTS_DOCK_PATH)!, GET, CODEARTS_DOCK_PATH)).body?.dock)
-      .toEqual({ credits: true, queue: true })
+      .toEqual({ credits: true, queue: true, sidebar: false })
   })
 
-  it('writes one flag without touching the other', async () => {
-    let flags = { credits: true, queue: true }
-    const patches: Partial<{ credits: boolean; queue: boolean }>[] = []
+  it('writes one flag without touching the others', async () => {
+    let flags = { credits: true, queue: true, sidebar: false }
+    const patches: Partial<{ credits: boolean; queue: boolean; sidebar: boolean }>[] = []
     const scoped = mountRoutes({
       store,
       models: () => [],
@@ -483,7 +483,26 @@ describe('/api/codearts/dock', () => {
     }, JSON.stringify({ credits: false }))
     expect(res.status).toBe(200)
     expect(patches).toEqual([{ credits: false }])
-    expect(res.body?.dock).toEqual({ credits: false, queue: true })
+    expect(res.body?.dock).toEqual({ credits: false, queue: true, sidebar: false })
+  })
+
+  // 侧边栏入口走同一把开关：写成功必须回读到新值，卡片据此挂/拆导航行。
+  it('writes the sidebar flag', async () => {
+    let flags = { credits: true, queue: true, sidebar: false }
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      dock: () => flags,
+      setDock: async patch => {
+        flags = { ...flags, ...patch }
+        return true
+      },
+    })
+    const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, POST, CODEARTS_DOCK_PATH, {
+      'content-type': 'application/json',
+    }, JSON.stringify({ sidebar: true }))
+    expect(res.status).toBe(200)
+    expect(res.body?.dock).toEqual({ credits: true, queue: true, sidebar: true })
   })
 
   it('refuses to write when no settings provider is attached', async () => {
@@ -495,7 +514,7 @@ describe('/api/codearts/dock', () => {
 
   it('rejects an empty or non-boolean body', async () => {
     const scoped = mountRoutes({ store, models: () => [], setDock: async () => true })
-    for (const body of ['{}', '{"credits":"no"}', '{"queue":1}']) {
+    for (const body of ['{}', '{"credits":"no"}', '{"queue":1}', '{"sidebar":"yes"}']) {
       const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, POST, CODEARTS_DOCK_PATH, {
         'content-type': 'application/json',
       }, body)
