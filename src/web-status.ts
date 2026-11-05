@@ -290,6 +290,15 @@ export interface CodeArtsWebUsage {
   byAccountToday: Record<string, UsageTotals>
   /** 账本覆盖天数。 */
   days: number
+  /**
+   * 最近 7 天（含今天，按日期升序）的每日合计，没账目的日子补 0。
+   *
+   * 卡片用它画「近 7 天 · 缓存命中率」的柱子 —— 命中率掉下来通常意味着系统提示词
+   * 前缀变了或上下文变长，比只看总量更有诊断价值。
+   */
+  recentDays: readonly { date: string; totals: UsageTotals }[]
+  /** 今天 0..23 点的逐小时合计（没到的小时补 0）。 */
+  todayByHour: readonly { hour: number; totals: UsageTotals }[]
   lastAt?: number
   /** 每个账号的会话槽位占用与池状态 —— 这是「为什么刚才要等」的直接答案。 */
   slots: readonly CodeArtsWebAccountSlot[]
@@ -485,6 +494,8 @@ function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
     byModelToday: snapshot?.byModelToday ?? [],
     byAccountToday: snapshot?.byAccountToday ?? {},
     days: snapshot?.days ?? 0,
+    recentDays: snapshot?.recentDays ?? [],
+    todayByHour: snapshot?.todayByHour ?? [],
     ...snapshot?.lastAt === undefined ? {} : { lastAt: snapshot.lastAt },
     slots: slotsOf(deps),
   }

@@ -538,6 +538,71 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* 趋势柱：近 7 天按天、今天按小时的竖柱。柱子高度就是那个格的归一化数值。 */
+.trendBars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 44px;
+  margin: 8px 0 2px;
+}
+
+.trendSlot {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+/* 命中率 / 量再小也留 2% 的顶，否则「有数据但接近 0」看起来像没画。 */
+.trendBar {
+  border-radius: 2px 2px 0 0;
+  background: var(--dsw-alias-brand-primary);
+  min-height: 2px;
+  transition: height 160ms ease, background 160ms ease;
+}
+
+.trendBar[data-tone='mid'] {
+  background: var(--dsw-alias-state-warn-label);
+}
+
+/* DSH 没有 --dsw-alias-state-danger-label（只有 state-warn-label 这一档「label」色），
+ * 直接用 error-primary；再往下兜一层 warn，总比和「中」同色看不出区别强。 */
+.trendBar[data-tone='low'] {
+  background: var(--dsw-alias-state-error-primary, var(--dsw-alias-state-warn-label));
+}
+
+.trendBar[data-tone='empty'] {
+  background: var(--dsw-alias-border-l2);
+}
+
+.trendAxis {
+  display: flex;
+  gap: 3px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  line-height: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.trendAxisSlot {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.trendTip {
+  margin: 2px 0 0;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Checkbox 自己带 <label><input><span>，这里只负责让它在行里撑开并省略号。 */
 .check {
   flex: 1;
@@ -610,4 +675,39 @@
 .area:focus {
   outline: none;
   border-color: var(--dsw-alias-state-business-primary);
+}
+
+/*
+ * 首次读取状态的骨架。做成长条而不是转圈：这个卡片的内容本来就是几段横排信息，
+ * 长条能提前占住高度，数据回来时不会整页往下跳。
+ */
+.skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.skeletonRow {
+  height: 12px;
+  border-radius: var(--dsw-radius-sm, 4px);
+  background: var(--dsw-alias-border-l2);
+  animation: skeletonBreath 1.4s ease-in-out infinite;
+}
+
+.skeletonRow:nth-child(2) {
+  width: 72%;
+}
+
+.skeletonRow:nth-child(3) {
+  width: 46%;
+}
+
+@keyframes skeletonBreath {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 0.9; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeletonRow { animation: none; }
 }

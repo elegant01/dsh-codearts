@@ -10,6 +10,14 @@ export interface CodeArtsSettingsKey {
   statusExpired: string
   descSignedIn: string
   descSignedOut: string
+  /** 首次读取状态期间不能说「未登录」，用一个中立词。 */
+  statusLoading: string
+  /** 状态接口整个失败（服务没起 / 路由 404）时的标题栏文案。 */
+  statusUnavailable: string
+  descLoading: string
+  /** {message} 是底层错误（HTTP 500 / Failed to fetch 之类）。 */
+  loadFailed: string
+  retry: string
   storedMeta: string
   storedMetaNoLabel: string
   refresh: string
@@ -73,6 +81,12 @@ export interface CodeArtsSettingsKey {
   usageTipHit: string
   usageStatHit: string
   usageStatRequests: string
+  /** 趋势两张图的标题与悬停提示（近 7 天命中率 / 今天逐小时）。 */
+  usageTrendWeek: string
+  usageTrendHour: string
+  usageTrendHint: string
+  /** 逐小时是本次新增口径，启用前的小时不回填。 */
+  usageTrendHourEmpty: string
   usageRequests: string
   usageByAccount: string
   usageRequestCount: string
@@ -153,6 +167,11 @@ export const zh: CodeArtsSettingsKey = {
   statusExpired: '凭证已过期',
   descSignedIn: '凭证已就绪，勾选的模型会出现在模型选择器里。',
   descSignedOut: '用华为云账号登录，或手动粘贴一个 CodeArts cloud_dragon_token。',
+  statusLoading: '加载中…',
+  statusUnavailable: '状态读取失败',
+  descLoading: '正在读取账号、模型与用量…',
+  loadFailed: '读不到插件状态（{message}）',
+  retry: '重试',
   storedMeta: '{label} · 存于 {time}',
   storedMetaNoLabel: '存于 {time}',
   refresh: '刷新',
@@ -217,6 +236,10 @@ export const zh: CodeArtsSettingsKey = {
   usageStatHit: '缓存命中',
   usageStatRequests: '今日请求',
   usageRequests: '{n} 次请求',
+  usageTrendWeek: '近 7 天 · 缓存命中率',
+  usageTrendHour: '今天 · 逐小时 token',
+  usageTrendHint: '悬停柱子看那一格明细',
+  usageTrendHourEmpty: '今天还没有逐小时数据（启用前的小时不回填）',
   usageByAccount: '今日按账号',
   usageRequestCount: '{n} 条',
   usageTokens: '输入 {prompt} · 输出 {completion}',
@@ -292,6 +315,11 @@ export const en: CodeArtsSettingsKey = {
   statusExpired: 'Credential expired',
   descSignedIn: 'Credential is ready. Checked models show up in the model picker.',
   descSignedOut: 'Sign in with your Huawei Cloud account, or paste a CodeArts cloud_dragon_token.',
+  statusLoading: 'Loading…',
+  statusUnavailable: 'Status unavailable',
+  descLoading: 'Reading accounts, models and usage…',
+  loadFailed: 'Could not read plugin status ({message})',
+  retry: 'Retry',
   storedMeta: '{label} · stored {time}',
   storedMetaNoLabel: 'stored {time}',
   refresh: 'Refresh',
@@ -356,6 +384,10 @@ export const en: CodeArtsSettingsKey = {
   usageStatHit: 'Cache hit',
   usageStatRequests: 'Today requests',
   usageRequests: '{n} request(s)',
+  usageTrendWeek: 'Last 7 days · cache hit rate',
+  usageTrendHour: 'Today · tokens by hour',
+  usageTrendHint: 'Hover a bar for that slot',
+  usageTrendHourEmpty: 'No hourly data yet today (hours before this feature are not backfilled)',
   usageByAccount: 'Today by account',
   usageRequestCount: '{n} reqs',
   usageTokens: 'in {prompt} · out {completion}',

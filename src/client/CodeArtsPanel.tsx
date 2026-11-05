@@ -15,14 +15,26 @@ export function CodeArtsPanelIcon({ size }: { size?: number }): React.ReactEleme
       aria-hidden="true"
       focusable="false"
     >
-      {/* 一支笔：CodeArts 的主题是写代码，比抽象几何块好认。 */}
+      {/*
+       * 尖括号夹一道斜杠 = 「写代码」，这是代码编辑器里最通用的那个符号。
+       * 之前画的是铅笔，和宿主自带的 IconEditOutline（编辑）撞脸，侧边栏里
+       * 看着像「编辑这一页」而不是「CodeArts 入口」。
+       */}
       <path
-        d="M9.9 2.6a1.4 1.4 0 0 1 2 0l1.5 1.5a1.4 1.4 0 0 1 0 2l-6.4 6.4-3.6.9a.6.6 0 0 1-.7-.7l.9-3.6 6.3-6.5Z"
+        d="M5.1 3.9 1.9 8l3.2 4.1"
         stroke="currentColor"
-        strokeWidth="1.2"
+        strokeWidth="1"
+        strokeLinecap="round"
         strokeLinejoin="round"
       />
-      <path d="M8.9 3.6 12.4 7.1" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+      <path
+        d="M10.9 3.9 14.1 8l-3.2 4.1"
+        stroke="currentColor"
+        strokeWidth="1"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M9 3.2 7 12.8" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
     </svg>
   )
 }

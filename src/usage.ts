@@ -54,12 +54,20 @@ export interface UsageTotals {
   reasoningTokens: number
 }
 
-/** 一天之内按模型 / 按账号的累计。 */
+/** 一天之内按模型 / 按账号 / 按小时的累计。 */
 export interface UsageDay {
   /** 模型 id -> 累计。 */
   models: Record<string, UsageTotals>
   /** 账号 id -> 累计。 */
   accounts: Record<string, UsageTotals>
+  /**
+   * 钟点（两位本地小时，`00`..`23`）-> 累计。
+   *
+   * 只用来画「今天按小时」的曲线，所以只保留最近 `HOUR_RETENTION_DAYS` 天
+   * （见 {@link CodeArtsUsageTracker.prune}）—— 60 天 × 24 格会把账本撑大一个量级，
+   * 而超过两天的逐小时数据没人看。老账本没有这个键，读的时候当空表。
+   */
+  hours?: Record<string, UsageTotals>
 }
 
 interface UsageFile {
@@ -69,6 +77,12 @@ interface UsageFile {
 
 /** 保留多少天（更早的丢掉，文件不会无限长）。 */
 export const RETENTION_DAYS = 60
+
+/** 「最近 N 天」趋势里的天数（含今天）。 */
+export const TREND_DAYS = 7
+
+/** 逐小时桶保留几天：今天 + 昨天，够画「今天按小时」和「跟昨天同一时刻比」。 */
+export const HOUR_RETENTION_DAYS = 2
 
 /** 上游 usage 帧里我们关心的字段。 */
 export interface RawUsage {
@@ -100,6 +114,18 @@ export interface UsageSnapshot {
   byAccountToday: Record<string, UsageTotals>
   /** 账本覆盖的天数（便于「数据从哪天开始」的说明）。 */
   days: number
+  /**
+   * 最近 {@link TREND_DAYS} 天（含今天，按日期升序）的每日合计；没账目的日子补 0。
+   *
+   * 补 0 而不是跳过：横轴要固定 7 格，否则「昨天没跑」和「昨天丢了」看不出区别。
+   */
+  recentDays: { date: string; totals: UsageTotals }[]
+  /**
+   * 今天 0 点到 23 点的逐小时合计（固定 24 项，还没到的钟点补 0）。
+   *
+   * 命中率曲线用它 —— 一次长会话把命中率拉低、隔一小时又回来，按天的粒度看不见。
+   */
+  todayByHour: { hour: number; totals: UsageTotals }[]
   /** 最近一次记账时间（epoch ms）。 */
   lastAt?: number
 }
@@ -133,6 +159,16 @@ export function localDateKey(at: number = Date.now()): string {
   const d = new Date(at)
   const p = (n: number): string => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** 本地小时键 `00`..`23`（同样按本地时间切，跨零点的那一小时不会错位）。 */
+export function localHourKey(at: number = Date.now()): string {
+  return localHourKeyOfHour(new Date(at).getHours())
+}
+
+/** 0..23 -> `00`..`23`（小时桶的键）。 */
+function localHourKeyOfHour(hour: number): string {
+  return String(hour).padStart(2, '0')
 }
 
 function positiveInt(value: unknown): number {
@@ -265,7 +301,10 @@ export class CodeArtsUsageTracker {
         if (typeof day !== 'object' || day === null) continue
         const models = normalizeStore((day as UsageDay).models)
         const accounts = normalizeStore((day as UsageDay).accounts)
-        this.days.set(date, { models, accounts })
+        const hours = (day as UsageDay).hours
+        this.days.set(date, hours === undefined
+          ? { models, accounts }
+          : { models, accounts, hours: normalizeStore(hours) })
       }
       this.prune(this.now())
     } catch {
@@ -299,6 +338,7 @@ export class CodeArtsUsageTracker {
     const day = this.day(localDateKey(at))
     addTotals(this.bucket(day.models, model), { requests: 1 })
     addTotals(this.bucket(day.accounts, accountId), { requests: 1 })
+    addTotals(this.bucket(this.hoursOf(day), localHourKey(at)), { requests: 1 })
     this.lastAt = at
     this.prune(at) // 常驻进程也能自然淘汰旧数据，不必等下次重启
     this.scheduleSave()
@@ -311,17 +351,34 @@ export class CodeArtsUsageTracker {
     const day = this.day(localDateKey(at))
     addTotals(this.bucket(day.models, model), usage)
     addTotals(this.bucket(day.accounts, accountId), usage)
+    addTotals(this.bucket(this.hoursOf(day), localHourKey(at)), usage)
     this.lastAt = at
     this.prune(at)
     this.scheduleSave()
   }
 
-  /** 丢弃保留期之外的天（按日期键比较即可，YYYY-MM-DD 是字典序）。 */
+  /** 一天里的逐小时桶，第一次写的时候才建（老账本没有这个键）。 */
+  private hoursOf(day: UsageDay): Record<string, UsageTotals> {
+    day.hours ??= {}
+    return day.hours
+  }
+
+  /**
+   * 丢弃保留期之外的天（按日期键比较即可，YYYY-MM-DD 是字典序）。
+   *
+   * 顺带把两天之前的**小时桶**清掉：逐小时数据只有「今天按小时」在画，留着只是
+   * 让 60 天的账本多出一个数量级的体积。
+   */
   private prune(at: number): void {
     if (this.days.size === 0) return
     const cutoff = localDateKey(at - RETENTION_DAYS * 86_400_000)
-    for (const date of [...this.days.keys()]) {
-      if (date < cutoff) this.days.delete(date)
+    const hourCutoff = localDateKey(at - HOUR_RETENTION_DAYS * 86_400_000)
+    for (const [date, day] of [...this.days.entries()]) {
+      if (date < cutoff) {
+        this.days.delete(date)
+      } else if (date < hourCutoff && day.hours !== undefined) {
+        delete day.hours
+      }
     }
   }
 
@@ -350,8 +407,35 @@ export class CodeArtsUsageTracker {
         Object.entries(today?.accounts ?? {}).map(([id, totals]) => [id, { ...totals }]),
       ),
       days: this.days.size,
+      recentDays: this.recentDaysOf(at),
+      todayByHour: this.todayByHourOf(today, at),
       ...(this.lastAt === undefined ? {} : { lastAt: this.lastAt }),
     }
+  }
+
+  /** 最近 TREND_DAYS 天的每日合计（按日期升序，缺账目的日子补 0）。 */
+  private recentDaysOf(at: number): UsageSnapshot['recentDays'] {
+    const out: UsageSnapshot['recentDays'] = []
+    for (let back = TREND_DAYS - 1; back >= 0; back -= 1) {
+      const date = localDateKey(at - back * 86_400_000)
+      const day = this.days.get(date)
+      out.push({ date, totals: day === undefined ? emptyTotals() : sumOf(day.models) })
+    }
+    return out
+  }
+
+  /** 今天 0 点起的 24 个钟点（还没到的小时补 0，横轴才有固定的 24 格）。 */
+  private todayByHourOf(today: UsageDay | undefined, at: number): UsageSnapshot['todayByHour'] {
+    const hours = today?.hours ?? {}
+    const currentHour = new Date(at).getHours()
+    return Array.from({ length: 24 }, (_, hour) => {
+      const totals = hours[localHourKeyOfHour(hour)]
+      return {
+        hour,
+        // 未来的钟点连空桶都不给：那是「还没发生」，不是「发生了但为 0」。
+        totals: hour > currentHour || totals === undefined ? emptyTotals() : { ...totals },
+      }
+    })
   }
 
   private scheduleSave(): void {

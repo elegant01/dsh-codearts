@@ -137,6 +137,13 @@ interface DockDoc {
  */
 const DOCK_DEFAULT = { credits: true, queue: true, sidebar: false }
 
+/**
+ * 上一次读到的状态。`/api/codearts/status` 会顺带去上游拉积分（有 TTL 缓存），
+ * 冷的时候要等近一秒；模块级留一份快照，再进这一页就能立刻按旧值画出来，
+ * 后台再刷新 —— 比每次都先闪骨架舒服，也不会把「还没读到」误判成未登录。
+ */
+let lastStatusSnapshot: LocalStatus | null = null
+
 /** 一个 Tab 面板；未选中的用 hidden 留在 DOM 里，草稿和滚动位置都别丢。 */
 function TabPanel({
   id,
@@ -483,6 +490,82 @@ function UsageBars({
 }
 
 /**
+ * 趋势柱：近 7 天按天、今天按小时。
+ *
+ * 两张图共用一套柱子，但编码不同，因为要看的问题不同：
+ *  - `hit`：柱高就是命中率，颜色分档 —— 命中率一掉就能看见，这是诊断「系统提示词
+ *    前缀变了 / 上下文突然变长」最直接的信号；
+ *  - `volume`：柱高按组内最大值归一化 —— 只用来看「什么时候在跑」，绝对值看悬停。
+ *
+ * 悬停柱子时下面那行换成该格明细，移开回到提示语。轴标签只画整数倍格，24 格全画会挤成一片。
+ */
+function UsageTrend({
+  points,
+  mode,
+  axisEvery,
+  hint,
+  t,
+}: {
+  points: readonly { key: string; label: string; totals: CodeArtsWebUsage['today'] }[]
+  mode: 'hit' | 'volume'
+  axisEvery: number
+  hint: string
+  t: CodeArtsPluginCardInjected['t']
+}): React.ReactElement {
+  const [hovered, setHovered] = useState<number | null>(null)
+  const max = points.reduce((peak, point) => Math.max(peak, point.totals.totalTokens), 0)
+  const shown = hovered === null ? undefined : points[hovered]
+  return (
+    <>
+      <div className={styles.trendBars}>
+        {points.map((point, index) => {
+          const pct = hitPercentOf(point.totals)
+          const share = mode === 'hit'
+            ? pct === undefined ? 0 : Math.max(pct, 2)
+            : max === 0 ? 0 : (point.totals.totalTokens / max) * 100
+          const tone = mode === 'hit'
+            ? pct === undefined ? 'empty' : pct >= 80 ? 'ok' : pct >= 50 ? 'mid' : 'low'
+            : point.totals.totalTokens === 0 ? 'empty' : 'ok'
+          return (
+            <span
+              key={point.key}
+              className={styles.trendSlot}
+              title={`${point.label} · ${trendDetail(point.totals, t)}`}
+              onMouseEnter={() => setHovered(index)}
+              onMouseLeave={() => setHovered(null)}
+            >
+              <span className={styles.trendBar} data-tone={tone} style={{ height: `${share}%` }} />
+            </span>
+          )
+        })}
+      </div>
+      <div className={styles.trendAxis}>
+        {points.map((point, index) => (
+          <span key={point.key} className={styles.trendAxisSlot}>
+            {index % axisEvery === 0 ? point.label : ''}
+          </span>
+        ))}
+      </div>
+      <p className={styles.trendTip}>
+        {shown === undefined ? hint : `${shown.label} · ${trendDetail(shown.totals, t)}`}
+      </p>
+    </>
+  )
+}
+
+/** 一格趋势的明细文案：输入 / 缓存 / 命中率 / 请求数（输出与思考在明细卡里看）。 */
+function trendDetail(totals: CodeArtsWebUsage['today'], t: CodeArtsPluginCardInjected['t']): string {
+  const pct = hitPercentOf(totals)
+  const parts = [
+    t('usageStatIn', { n: formatTokens(totals.promptTokens) }),
+    `${t('usageTipCached')} ${formatTokens(totals.cachedTokens ?? 0)}`,
+    `${t('usageTipHit')} ${pct === undefined ? '—' : `${pct}%`}`,
+    t('usageRequestCount', { n: formatCount(totals.requests) }),
+  ]
+  return parts.join(' · ')
+}
+
+/**
  * 用量区块。
  *
  * 只展示**本机经插件发出**的请求（不等于账号总额度 —— 账号额度见上方积分区块）；
@@ -559,6 +642,44 @@ function UsageSection({
             </div>
           </div>
 
+          {(usage.recentDays ?? []).length > 0 && (
+            <>
+              <p className={styles.hint}>{t('usageTrendWeek')}</p>
+              <UsageTrend
+                mode="hit"
+                axisEvery={1}
+                hint={t('usageTrendHint')}
+                points={(usage.recentDays ?? []).map(day => ({
+                  key: day.date,
+                  label: day.date.slice(5),
+                  totals: day.totals,
+                }))}
+                t={t}
+              />
+            </>
+          )}
+          {(usage.todayByHour ?? []).length > 0 && (
+            <>
+              <p className={styles.hint}>{t('usageTrendHour')}</p>
+              {/* 逐小时是这次才有的口径：启用前的小时没有回填，别画成「跑了但没用量」。 */}
+              {(usage.todayByHour ?? []).some(entry => entry.totals.requests > 0) ? (
+                <UsageTrend
+                  mode="volume"
+                  axisEvery={6}
+                  hint={t('usageTrendHint')}
+                  points={(usage.todayByHour ?? []).map(entry => ({
+                    key: String(entry.hour),
+                    label: String(entry.hour),
+                    totals: entry.totals,
+                  }))}
+                  t={t}
+                />
+              ) : (
+                <p className={styles.trendTip}>{t('usageTrendHourEmpty')}</p>
+              )}
+            </>
+          )}
+
           {accounts.length > 1 && accountRows.length > 0 && (
             <>
               <p className={styles.hint}>{t('usageByAccount')}</p>
@@ -601,7 +722,8 @@ function UsageSection({
   )
 }
 
-export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.ReactElement {  const [status, setStatus] = useState<LocalStatus | null>(null)
+export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.ReactElement {
+  const [status, setStatus] = useState<LocalStatus | null>(lastStatusSnapshot)
   const [token, setToken] = useState('')
   const [label, setLabel] = useState('')
   const [busy, setBusy] = useState(false)
@@ -633,6 +755,15 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [dockWritable, setDockWritable] = useState(false)
   const [dockSaving, setDockSaving] = useState(false)
   const [dockError, setDockError] = useState<string | null>(null)
+  /**
+   * 首次读取状态的三态。为什么要单独记：`status === null` 只说明「还没读到」，
+   * 直接按它画就会先闪一下「未登录」，等数据回来再翻成「已登录」—— 看起来像
+   * 掉线又自己好了。只有服务端明确回 signed-out 才允许画登录框。
+   */
+  const [statusPhase, setStatusPhase] = useState<'loading' | 'ready' | 'failed'>(
+    lastStatusSnapshot === null ? 'loading' : 'ready',
+  )
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   async function refreshDock(): Promise<void> {
     try {
@@ -741,10 +872,16 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   async function refresh(): Promise<void> {
     try {
       const res = await fetch('/api/codearts/status', { headers: { Accept: 'application/json' } })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = (await res.json()) as LocalStatus
+      lastStatusSnapshot = data
       setStatus(data)
-    } catch {
-      setStatus({ status: 'signed-out', models: [], accounts: [] })
+      setLoadError(null)
+      setStatusPhase('ready')
+    } catch (error: unknown) {
+      // 拉不到 ≠ 没登录。首次失败停在「重试」页，已经读到过数据就静默保留旧值。
+      setLoadError(error instanceof Error ? error.message : String(error))
+      setStatusPhase(phase => (phase === 'ready' ? 'ready' : 'failed'))
     }
   }
 
@@ -979,6 +1116,10 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
 
   const signedIn = status?.status === 'signed-in'
   const expired = status?.status === 'expired'
+  /** 首次数据还没回来：标题栏说「加载中」，正文放骨架，别画登录框。 */
+  const loading = statusPhase === 'loading'
+  /** 连状态都读不到（服务没起 / 路由 404）：给错误和重试，不要假装没登录。 */
+  const failed = statusPhase === 'failed' && status === null
   const accounts = status?.accounts ?? []
   const accountName = (account: { label?: string; userName?: string; id: string }): string =>
     account.label?.trim() || account.userName?.trim() || account.id
@@ -998,8 +1139,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     }
     return parts.join(' · ')
   }
-  const dotState: StateDotState = signedIn ? 'done' : expired ? 'warning' : 'idle'
-  const statusText = signedIn ? t('statusSignedIn') : expired ? t('statusExpired') : t('statusSignedOut')
+  const dotState: StateDotState = !loading && signedIn ? 'done' : !loading && expired ? 'warning' : 'idle'
+  const statusText = loading
+    ? t('statusLoading')
+    : failed
+      ? t('statusUnavailable')
+      : signedIn ? t('statusSignedIn') : expired ? t('statusExpired') : t('statusSignedOut')
+  /** 读不到状态时别在下面写「去登录」—— 用户可能已经登录了，只是接口没起来。 */
+  const descText = loading ? t('descLoading') : failed ? null : signedIn ? t('descSignedIn') : t('descSignedOut')
   const storedTime = formatStored(status?.storedAt)
   const storedLabel = status?.label?.trim() ?? ''
   const meta = !signedIn || storedTime === ''
@@ -1068,16 +1215,31 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
             {statusText}
           </span>
           {meta !== '' && <span className={styles.meta}>{meta}</span>}
-          <span className={styles.desc}>{signedIn ? t('descSignedIn') : t('descSignedOut')}</span>
+          {descText !== null && <span className={styles.desc}>{descText}</span>}
         </div>
-        <Button variant="outline" size="sm" disabled={busy} onClick={() => void refresh()}>
+        <Button variant="outline" size="sm" disabled={busy || loading} onClick={() => void refresh()}>
           {t('refresh')}
         </Button>
       </div>
 
       <div className={styles.body}>
         {status?.piAiError !== undefined && <p className={styles.error}>{status.piAiError}</p>}
-        {signedIn ? (
+        {failed ? (
+          <div className={styles.section}>
+            <p className={styles.error}>{t('loadFailed', { message: loadError ?? '' })}</p>
+            <div className={styles.actions}>
+              <Button variant="outline" size="sm" disabled={busy} onClick={() => void refresh()}>
+                {t('retry')}
+              </Button>
+            </div>
+          </div>
+        ) : loading ? (
+          <div className={styles.skeleton} aria-busy="true" aria-label={t('statusLoading')}>
+            <span className={styles.skeletonRow} />
+            <span className={styles.skeletonRow} />
+            <span className={styles.skeletonRow} />
+          </div>
+        ) : signedIn ? (
           <>
             <SegmentedTabs
               className={styles.tabs}

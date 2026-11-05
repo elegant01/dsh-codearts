@@ -416,12 +416,17 @@ describe('GET /api/codearts/status', () => {
         byModelToday: [{ id: 'GLM-5.2', totals }],
         byAccountToday: { 'uid-a': totals },
         days: 1,
+        recentDays: [{ date: '2026-11-03', totals }],
+        todayByHour: [{ hour: 13, totals }],
       }),
     })
     const res = await call(usageRoutes.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)
     const usage = res.body?.usage as Record<string, unknown>
     expect(usage.last30).toEqual(totals)
     expect((usage.byAccountToday as Record<string, Record<string, number>>)['uid-a']?.totalTokens).toBe(15)
+    // 趋势曲线靠这两个序列：日期轴固定 7 格、钟点轴固定 24 格，缺了卡片就画不出来。
+    expect(usage.recentDays).toEqual([{ date: '2026-11-03', totals }])
+    expect(usage.todayByHour).toEqual([{ hour: 13, totals }])
   })
 
   it('reports expired when every account is stale', async () => {

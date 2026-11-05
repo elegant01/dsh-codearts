@@ -299,6 +299,121 @@ describe('CodeArtsUsageTracker', () => {
   })
 })
 
+// 趋势曲线：卡片按天画 7 根、按小时画 24 根柱，横轴必须定长（缺的补 0），否则
+// 「那天没跑」和「那天没记」在图上长得一模一样。
+describe('trend series', () => {
+  const at = (day: number, hour = 12): number => new Date(2026, 8, day, hour, 0, 0).getTime()
+
+  it('reports seven ascending days ending today, zero-filling gaps', () => {
+    const tracker = new CodeArtsUsageTracker()
+    tracker.noteUsage('acct-1', 'GLM-5.2', { total_tokens: 100 }, at(26))
+    tracker.noteUsage('acct-1', 'GLM-5.2', { total_tokens: 40 }, at(30, 9))
+
+    const { recentDays } = tracker.snapshot(at(30, 9))
+    expect(recentDays.map(day => day.date)).toEqual([
+      '2026-09-24',
+      '2026-09-25',
+      '2026-09-26',
+      '2026-09-27',
+      '2026-09-28',
+      '2026-09-29',
+      '2026-09-30',
+    ])
+    expect(recentDays.map(day => day.totals.totalTokens)).toEqual([0, 0, 100, 0, 0, 0, 40])
+  })
+
+  it('buckets today by local hour and leaves the hours not reached yet empty', () => {
+    const tracker = new CodeArtsUsageTracker()
+    tracker.noteRequest('acct-1', 'GLM-5.2', at(30, 9))
+    tracker.noteUsage('acct-1', 'GLM-5.2', {
+      prompt_tokens: 100,
+      completion_tokens: 10,
+      total_tokens: 110,
+      prompt_tokens_details: { cached_tokens: 80 },
+    }, at(30, 9))
+
+    const { todayByHour } = tracker.snapshot(at(30, 9))
+    expect(todayByHour).toHaveLength(24)
+    expect(todayByHour.map(entry => entry.hour)).toEqual(Array.from({ length: 24 }, (_, hour) => hour))
+    expect(todayByHour[9]?.totals).toEqual({
+      requests: 1,
+      promptTokens: 100,
+      completionTokens: 10,
+      totalTokens: 110,
+      cachedTokens: 80,
+      reasoningTokens: 0,
+    })
+    // 10 点和 23 点都还没到：只能是空桶，不能把「未来的 0」画成「跑过但没用量」。
+    expect(todayByHour[10]?.totals.totalTokens).toBe(0)
+    expect(todayByHour[23]?.totals.requests).toBe(0)
+  })
+
+  it('drops hour buckets after two days but keeps the daily rollup', async () => {
+    const path = join(dir, '.codearts-usage.json')
+    const now = at(30)
+    const stale = localDateKey(now - 5 * 86_400_000)
+    const yesterday = localDateKey(now - 86_400_000)
+    const totals = {
+      requests: 1,
+      promptTokens: 10,
+      completionTokens: 1,
+      totalTokens: 11,
+      cachedTokens: 5,
+      reasoningTokens: 0,
+    }
+    await writeFile(path, JSON.stringify({
+      version: 1,
+      days: {
+        [stale]: { models: { 'GLM-5.2': totals }, accounts: {}, hours: { '09': totals } },
+        [yesterday]: { models: { 'GLM-5.2': totals }, accounts: {}, hours: { '09': totals } },
+      },
+    }), 'utf8')
+
+    const tracker = new CodeArtsUsageTracker({ path, saveDebounceMs: 0, now: () => now })
+    await tracker.load()
+    await tracker.flush()
+
+    const doc = JSON.parse(await readFile(path, 'utf8')) as {
+      days: Record<string, { hours?: Record<string, unknown> }>
+    }
+    expect(doc.days[stale]?.hours).toBeUndefined()
+    expect(doc.days[yesterday]?.hours).toEqual({ '09': totals })
+    // 丢的只是逐小时那一层：整天的汇总照旧留着（60 天）。
+    expect(tracker.snapshot().allTime.totalTokens).toBe(22)
+  })
+
+  it('treats a ledger written before hour buckets existed as an empty hour axis', async () => {
+    const path = join(dir, '.codearts-usage.json')
+    const now = at(30)
+    const today = localDateKey(now)
+    await writeFile(path, JSON.stringify({
+      version: 1,
+      days: {
+        [today]: {
+          models: {
+            'GLM-5.2': {
+              requests: 3,
+              promptTokens: 30,
+              completionTokens: 3,
+              totalTokens: 33,
+              cachedTokens: 0,
+              reasoningTokens: 0,
+            },
+          },
+          accounts: {},
+        },
+      },
+    }), 'utf8')
+
+    const tracker = new CodeArtsUsageTracker({ path, now: () => now })
+    await tracker.load()
+    const snapshot = tracker.snapshot()
+    expect(snapshot.today.totalTokens).toBe(33)
+    // 老账本没有 hours 键：24 格全空，但不能因此把「今日合计」也清零。
+    expect(snapshot.todayByHour.every(entry => entry.totals.totalTokens === 0)).toBe(true)
+  })
+})
+
 describe('codeartsUsagePath', () => {
   it('lives next to the account document under DSH_HOME', () => {
     expect(codeartsUsagePath('/tmp/home')).toBe(join('/tmp/home', '.codearts-usage.json'))

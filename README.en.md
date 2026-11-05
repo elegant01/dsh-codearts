@@ -26,6 +26,11 @@ Brings Huawei Cloud CodeArts into DeepSeek Harness (DSH), so the models CodeArts
   token counts (per model, per account), plus each account’s **session-slot occupancy** —
   which is exactly why a turn had to wait. CodeArts exposes no quota API, so these are the
   requests this machine sent through the plugin; the card links to the official usage page.
+- **Usage trends**: two charts on top of the Usage tab — a bar per day for the last seven
+  days showing the **cache-hit rate** (three colour bands; a dip means the system-prompt
+  prefix changed or the context grew), plus today’s token volume bucketed by hour. Hourly
+  buckets start with this version and are not backfilled; hosts that do not return the two
+  series simply skip the charts.
 - **Image input**: models with vision support accept pasted or dropped images in a chat.
 - **Sidebar icon**: optional. Tick it on the card’s Display tab and a CodeArts icon joins
   the DSH icon column, opening the full-page version of the settings card in the middle

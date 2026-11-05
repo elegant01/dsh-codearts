@@ -58,6 +58,9 @@ declare const styles: {
   readonly "section": string
   readonly "sectionHead": string
   readonly "sectionLabel": string
+  readonly "skeleton": string
+  readonly "skeletonBreath": string
+  readonly "skeletonRow": string
   readonly "statCard": string
   readonly "statGrid": string
   readonly "statLabel": string
@@ -66,6 +69,12 @@ declare const styles: {
   readonly "statusLine": string
   readonly "tabPanel": string
   readonly "tabs": string
+  readonly "trendAxis": string
+  readonly "trendAxisSlot": string
+  readonly "trendBar": string
+  readonly "trendBars": string
+  readonly "trendSlot": string
+  readonly "trendTip": string
   readonly "updated": string
   readonly "usageBar": string
   readonly "usageFill": string
