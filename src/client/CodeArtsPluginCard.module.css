@@ -474,6 +474,14 @@
   pointer-events: none;
 }
 
+.usageTip[data-float='true'] {
+  /* 热力图格子太窄，卡片不锚格子、改锚指针：所以是 fixed，坐标由内联 left/top 给。 */
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  z-index: 40;
+}
+
 .usageTipName {
   max-width: 240px;
   overflow: hidden;

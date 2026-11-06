@@ -392,6 +392,68 @@ function hitPercentOf(totals: CodeArtsWebUsage['today']): number | undefined {
 }
 
 /**
+ * 悬停明细卡的正文：标题（账号 / 模型 / 日期 / 钟点）+ 输入 / 输出 / 思考 / 缓存 /
+ * 请求 / 命中率。用量条和热力图格子共用这一份，改文案或加字段只需动这里。
+ */
+function UsageTipBody({
+  label,
+  totals,
+  t,
+}: {
+  label: string
+  totals: CodeArtsWebUsage['today']
+  t: CodeArtsPluginCardInjected['t']
+}): React.ReactElement {
+  const cached = totals.cachedTokens
+  const pct = hitPercentOf(totals)
+  return (
+    <>
+      <div className={styles.usageTipName}>{label}</div>
+      <div className={styles.usageTipSep} />
+      <div className={styles.usageTipRow}>
+        <span>{t('usageTipInput')}</span><span>{exactCount(totals.promptTokens)}</span>
+      </div>
+      <div className={styles.usageTipRow}>
+        <span>{t('usageTipOutput')}</span><span>{exactCount(totals.completionTokens)}</span>
+      </div>
+      {(totals.reasoningTokens ?? 0) > 0 && (
+        <div className={styles.usageTipRow}>
+          <span>{t('usageTipReasoning')}</span><span>{exactCount(totals.reasoningTokens ?? 0)}</span>
+        </div>
+      )}
+      <div className={styles.usageTipRow}>
+        <span>{t('usageTipCached')}</span>
+        <span>{cached === undefined ? t('usageTipNoCache') : exactCount(cached)}</span>
+      </div>
+      <div className={styles.usageTipSep} />
+      <div className={styles.usageTipRow}>
+        <span>{t('usageTipRequests')}</span>
+        <span>{t('usageRequestCount', { n: formatCount(totals.requests) })}</span>
+      </div>
+      {pct !== undefined && (
+        <div className={styles.usageTipRow}>
+          <span>{t('usageTipHit')}</span><span>{pct}%</span>
+        </div>
+      )}
+    </>
+  )
+}
+
+/**
+ * 悬停卡贴着指针画：热力图格子只有 36px 宽，卡片锚在格子上会横穿整张卡片，
+ * 所以和 agent-acta 一样用 fixed + 指针坐标，靠近右下边界时翻到另一侧。
+ */
+function tipPointStyle(point: { x: number; y: number }): React.CSSProperties {
+  const width = 230
+  const height = 190
+  const viewWidth = typeof window === 'undefined' ? 0 : window.innerWidth
+  const viewHeight = typeof window === 'undefined' ? 0 : window.innerHeight
+  const left = viewWidth > 0 && point.x + 16 + width > viewWidth ? point.x - 16 - width : point.x + 16
+  const top = viewHeight > 0 && point.y + 16 + height > viewHeight ? point.y - 16 - height : point.y + 16
+  return { left: Math.max(8, left), top: Math.max(8, top) }
+}
+
+/**
  * 横向条形列表：名称 / 条 / token / 占比 / 请求数。
  *
  * 条长按「占组内总量的比例」画（不是按最大值归一化），所以几条加起来就是全部。
@@ -418,8 +480,6 @@ function UsageBars({
         const value = valueOf(row)
         const share = sum > 0 ? (value / sum) * 100 : 0
         const totals = row.totals
-        const cached = totals.cachedTokens
-        const pct = hitPercentOf(totals)
         const detail = [
           t('usageRequests', { n: formatCount(totals.requests) }),
           t('usageTokens', {
@@ -453,33 +513,7 @@ function UsageBars({
 
             {hovered === row.id && (
               <div className={styles.usageTip} role="tooltip">
-                <div className={styles.usageTipName}>{row.label}</div>
-                <div className={styles.usageTipSep} />
-                <div className={styles.usageTipRow}>
-                  <span>{t('usageTipInput')}</span><span>{exactCount(totals.promptTokens)}</span>
-                </div>
-                <div className={styles.usageTipRow}>
-                  <span>{t('usageTipOutput')}</span><span>{exactCount(totals.completionTokens)}</span>
-                </div>
-                {(totals.reasoningTokens ?? 0) > 0 && (
-                  <div className={styles.usageTipRow}>
-                    <span>{t('usageTipReasoning')}</span><span>{exactCount(totals.reasoningTokens ?? 0)}</span>
-                  </div>
-                )}
-                <div className={styles.usageTipRow}>
-                  <span>{t('usageTipCached')}</span>
-                  <span>{cached === undefined ? t('usageTipNoCache') : exactCount(cached)}</span>
-                </div>
-                <div className={styles.usageTipSep} />
-                <div className={styles.usageTipRow}>
-                  <span>{t('usageTipRequests')}</span>
-                  <span>{t('usageRequestCount', { n: formatCount(totals.requests) })}</span>
-                </div>
-                {pct !== undefined && (
-                  <div className={styles.usageTipRow}>
-                    <span>{t('usageTipHit')}</span><span>{pct}%</span>
-                  </div>
-                )}
+                <UsageTipBody label={row.label} totals={totals} t={t} />
               </div>
             )}
           </div>
@@ -520,6 +554,8 @@ function UsageHeat({
   t: CodeArtsPluginCardInjected['t']
 }): React.ReactElement {
   const [hovered, setHovered] = useState<string | null>(null)
+  /** 指针离开格子就清掉，卡片跟着指针停在那一次进入的位置。 */
+  const [point, setPoint] = useState<{ x: number; y: number } | null>(null)
   const last = days.at(-1)
   const month = last?.date.slice(0, 7) ?? ''
   const inMonth = days.filter(day => day.date.startsWith(month))
@@ -565,9 +601,9 @@ function UsageHeat({
               className={styles.heatCell}
               data-tone={tone}
               data-today={entry.date === last?.date ? 'true' : undefined}
-              title={entry.totals === undefined ? undefined : `${entry.date} · ${trendDetail(entry.totals, t)}`}
-              onMouseEnter={entry.totals === undefined ? undefined : () => {
+              onMouseEnter={entry.totals === undefined ? undefined : event => {
                 setHovered(entry.date)
+                setPoint({ x: event.clientX, y: event.clientY })
               }}
               onMouseLeave={entry.totals === undefined ? undefined : () => {
                 setHovered(null)
@@ -578,11 +614,17 @@ function UsageHeat({
           )
         })}
       </div>
-      <p className={styles.trendTip}>
-        {shown?.totals === undefined
-          ? t('usageTrendHint')
-          : `${shown.date} · ${trendDetail(shown.totals, t)}`}
-      </p>
+      {shown?.totals !== undefined && point !== null && (
+        <div
+          className={styles.usageTip}
+          data-float="true"
+          role="tooltip"
+          style={tipPointStyle(point)}
+        >
+          <UsageTipBody label={shown.date} totals={shown.totals} t={t} />
+        </div>
+      )}
+      <p className={styles.trendTip}>{t('usageTrendHint')}</p>
     </>
   )
 }
@@ -600,6 +642,7 @@ function UsageHours({
   t: CodeArtsPluginCardInjected['t']
 }): React.ReactElement {
   const [hovered, setHovered] = useState<number | null>(null)
+  const [point, setPoint] = useState<{ x: number; y: number } | null>(null)
   const max = hours.reduce((peak, hour) => Math.max(peak, hour.totals.totalTokens), 0)
   const shown = hovered === null ? undefined : hours.find(entry => entry.hour === hovered)
   return (
@@ -610,9 +653,9 @@ function UsageHours({
             key={entry.hour}
             className={styles.heatHourCell}
             data-tone={toneOf(entry.totals.totalTokens, max)}
-            title={`${String(entry.hour)}:00 · ${trendDetail(entry.totals, t)}`}
-            onMouseEnter={() => {
+            onMouseEnter={event => {
               setHovered(entry.hour)
+              setPoint({ x: event.clientX, y: event.clientY })
             }}
             onMouseLeave={() => {
               setHovered(null)
@@ -627,25 +670,23 @@ function UsageHours({
           </span>
         ))}
       </div>
-      <p className={styles.trendTip}>
-        {shown === undefined
-          ? t('usageTrendHint')
-          : `${String(shown.hour).padStart(2, '0')}:00 · ${trendDetail(shown.totals, t)}`}
-      </p>
+      {shown !== undefined && point !== null && (
+        <div
+          className={styles.usageTip}
+          data-float="true"
+          role="tooltip"
+          style={tipPointStyle(point)}
+        >
+          <UsageTipBody
+            label={`${String(shown.hour).padStart(2, '0')}:00`}
+            totals={shown.totals}
+            t={t}
+          />
+        </div>
+      )}
+      <p className={styles.trendTip}>{t('usageTrendHint')}</p>
     </>
   )
-}
-
-/** 一格趋势的明细文案：输入 / 缓存 / 命中率 / 请求数（输出与思考在明细卡里看）。 */
-function trendDetail(totals: CodeArtsWebUsage['today'], t: CodeArtsPluginCardInjected['t']): string {
-  const pct = hitPercentOf(totals)
-  const parts = [
-    t('usageStatIn', { n: formatTokens(totals.promptTokens) }),
-    `${t('usageTipCached')} ${formatTokens(totals.cachedTokens ?? 0)}`,
-    `${t('usageTipHit')} ${pct === undefined ? '—' : `${pct}%`}`,
-    t('usageRequestCount', { n: formatCount(totals.requests) }),
-  ]
-  return parts.join(' · ')
 }
 
 /**
