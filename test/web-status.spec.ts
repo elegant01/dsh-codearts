@@ -12,7 +12,10 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: 
   return { promise, resolve, reject }
 }
 
-const { startLoginMock } = vi.hoisted(() => ({ startLoginMock: vi.fn() }))
+const { startLoginMock, identityMock } = vi.hoisted(() => ({
+  startLoginMock: vi.fn(),
+  identityMock: vi.fn(async (): Promise<unknown> => null),
+}))
 
 vi.mock('../src/oauth.ts', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/oauth.ts')>()
@@ -21,11 +24,12 @@ vi.mock('../src/oauth.ts', async importOriginal => {
 
 // 登录成功后 web-status 会立刻问一次上游身份。真实实现是带签名的网络请求
 // （最长等 8s），在 CI 上会拖过 vi.waitFor 默认的 1s 超时，让「迟到的轮询必须
-// 拿到 done」这条回归测试误报成 idle。这里让它立刻返回 null，走「拿不到身份就
-// 退回 token.userId」的既有分支，测试只验证终态记账逻辑。
+// 拿到 done」这条回归测试误报成 idle。这里默认让它立刻返回 null，走「拿不到身份
+// 就退回 token.userId」的既有分支；需要验证「重新登录时身份对不上」的分支再
+// 单独给某个测试设置返回值。
 vi.mock('../src/upstream.ts', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/upstream.ts')>()
-  return { ...actual, fetchCallerIdentity: vi.fn(async () => null) }
+  return { ...actual, fetchCallerIdentity: identityMock }
 })
 
 import { CodeArtsAccountStore, credentialFromOAuth } from '../src/auth.ts'
@@ -146,6 +150,8 @@ beforeEach(async () => {
   store = new CodeArtsAccountStore(join(dir, '.codearts-accounts.json'))
   routes = mountRoutes({ store, models: () => [] })
   startLoginMock.mockReset()
+  identityMock.mockReset()
+  identityMock.mockResolvedValue(null)
 })
 
 afterEach(async () => {
@@ -250,6 +256,76 @@ describe('login flow', () => {
       expect(revived).toHaveLength(1)
     })
     expect(revived).toEqual(await store.ids())
+  })
+})
+
+// 用户诉求（issue）：账号过期时界面上只有「删除」，删了再加回来会把顺序和备注
+// 弄丢。现在每个账号都能「重新登录」，凭证写回原条目。
+describe('relogin an existing account', () => {
+  const URL = 'https://codearts.huaweicloud.com/portal/authorize?fake=1'
+  const poll = (): Promise<{ status: number; body: Record<string, unknown> | undefined }> =>
+    call(routes.get(CODEARTS_LOGIN_STATUS_PATH)!, GET, `${CODEARTS_LOGIN_STATUS_PATH}?url=${encodeURIComponent(URL)}`)
+
+  /** 轮询到终态为止；idle 不消费终态记录，所以可以安全重试。 */
+  async function pollUntilDone(): Promise<Record<string, unknown>> {
+    let body: Record<string, unknown> = {}
+    await vi.waitFor(async () => {
+      body = (await poll()).body ?? {}
+      expect(body.status).toBe('done')
+    })
+    return body
+  }
+
+  function token(userId: string, userName: string) {
+    return {
+      securityToken: `sts-${userId}-new`, accessKeyId: '', secretAccessKey: '', refreshToken: 'r2',
+      clientId: 'c', dpopPrivateKey: { kty: 'EC', crv: 'P-256', x: 'x', y: 'y', d: 'd' },
+      expiration: new Date(Date.now() + 3600_000).toISOString(), userId, userName,
+    } as never
+  }
+
+  it('writes the fresh credential back to the same entry', async () => {
+    await store.upsert(credential('uid-a'))
+    const outcome = fakeLogin()
+    const res = await call(routes.get(CODEARTS_LOGIN_PATH)!, POST, `${CODEARTS_LOGIN_PATH}?account=uid-a`)
+    expect(res.status).toBe(200)
+    outcome.resolve(token('uid-a', 'alice'))
+
+    const body = await pollUntilDone()
+    expect(body.replaced).toBe(true)
+    expect(body.conflict).toBe(false)
+    // 还是同一条，token 换成了新的 —— 没有第二条账号。
+    expect(await store.ids()).toEqual(['uid-a'])
+    expect((await store.credential('uid-a'))?.token).toBe('sts-uid-a-new')
+    // 备注沿用原条目，不会因为重登被清掉。
+    expect((await store.credential('uid-a'))?.label).toBe('uid-a')
+  })
+
+  it('adds a new account when the relogin turns out to be someone else', async () => {
+    await store.upsert(credential('uid-a'))
+    identityMock.mockResolvedValue({ userId: 'uid-b', userName: 'bob', domainId: 'd' })
+    const outcome = fakeLogin()
+    await call(routes.get(CODEARTS_LOGIN_PATH)!, POST, `${CODEARTS_LOGIN_PATH}?account=uid-a`)
+    outcome.resolve(token('uid-b', 'bob'))
+
+    const body = await pollUntilDone()
+    expect(body.conflict).toBe(true)
+    // 原账号一个字节都没动，新账号另起一条。
+    expect((await store.credential('uid-a'))?.token).toBe('sts-uid-a')
+    expect((await store.credential('uid-b'))?.token).toBe('sts-uid-b-new')
+    expect((await store.ids()).sort()).toEqual(['uid-a', 'uid-b'])
+  })
+
+  // 没有 account 参数就是原来的「添加账号」，行为必须完全不变。
+  it('keeps plain add-account behaviour without the account parameter', async () => {
+    await store.upsert(credential('uid-a'))
+    const outcome = fakeLogin()
+    await call(routes.get(CODEARTS_LOGIN_PATH)!, POST, CODEARTS_LOGIN_PATH)
+    outcome.resolve(token('uid-b', 'bob'))
+
+    await pollUntilDone()
+    expect((await store.credential('uid-a'))?.token).toBe('sts-uid-a')
+    expect((await store.credential('uid-b'))?.token).toBe('sts-uid-b-new')
   })
 })
 

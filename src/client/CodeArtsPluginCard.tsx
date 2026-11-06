@@ -834,6 +834,8 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [msg, setMsg] = useState<string | null>(null)
   const [loginUrl, setLoginUrl] = useState<string | null>(null)
   const [loginPending, setLoginPending] = useState(false)
+  /** 正在进行的是哪个账号的「重新登录」（无则 null）。用来只让那一行的按钮变「登录中」。 */
+  const [reloginId, setReloginId] = useState<string | null>(null)
   const [selection, setSelection] = useState<ModelSelectionDoc['selection'] | null>(null)
   const [draft, setDraft] = useState<string[]>([])
   const [savingModels, setSavingModels] = useState(false)
@@ -1165,16 +1167,29 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     }
   }
 
-  async function startOAuthLogin(): Promise<void> {
+  /**
+   * 开始一次浏览器登录。
+   *
+   * 不带 `targetId` 是「添加账号」；带 `targetId` 是「重新登录这个账号」——
+   * 服务端会把新凭证写回原条目（保留顺序与备注），而不是又长出一条。
+   */
+  async function startOAuthLogin(targetId?: string): Promise<void> {
     setBusy(true)
     setMsg(null)
     setLoginPending(true)
+    if (targetId !== undefined) setReloginId(targetId)
+    const finish = (): void => {
+      setLoginUrl(null)
+      setLoginPending(false)
+      setReloginId(null)
+    }
     try {
-      const res = await fetch('/api/codearts/login', { method: 'POST' })
+      const query = targetId === undefined ? '' : `?account=${encodeURIComponent(targetId)}`
+      const res = await fetch(`/api/codearts/login${query}`, { method: 'POST' })
       const data = await res.json().catch(() => ({}))
       if (!res.ok || typeof data.url !== 'string') {
         setMsg(data.error ?? `HTTP ${res.status}`)
-        setLoginPending(false)
+        finish()
         return
       }
       setLoginUrl(data.url)
@@ -1185,16 +1200,20 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         const r = await fetch(`/api/codearts/login/status?url=${encodeURIComponent(data.url)}`, {
           headers: { Accept: 'application/json' },
         })
-        const st = await r.json().catch(() => ({ status: 'pending' }))
+        const st = await r.json().catch(() => ({ status: 'pending' })) as {
+          status?: string
+          replaced?: boolean
+          conflict?: boolean
+        }
         if (st.status === 'done') {
-          setLoginUrl(null)
-          setLoginPending(false)
+          finish()
+          // 点了「重新登录」却登了另一个号：已作为新账号添加，原账号没动。
+          if (st.conflict === true) setMsg(t('reloginOtherAccount'))
           await refresh()
           return
         }
         if (st.status === 'error') {
-          setLoginUrl(null)
-          setLoginPending(false)
+          finish()
           setMsg(t('loginFailed'))
           return
         }
@@ -1202,8 +1221,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         // 按钮就会永远停在「登录中」——把 idle 也当终止态，刷新一次让卡片反映
         // 真实结果（加上就是多一个账号，没加上就是没变）。
         if (st.status === 'idle') {
-          setLoginUrl(null)
-          setLoginPending(false)
+          finish()
           await refresh()
           return
         }
@@ -1212,7 +1230,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       void poll()
     } catch (err) {
       setMsg(err instanceof Error ? err.message : String(err))
-      setLoginPending(false)
+      finish()
     } finally {
       setBusy(false)
     }
@@ -1419,11 +1437,25 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                             {accountLine !== '' && <span className={styles.meta}>{accountLine}</span>}
                           </div>
                           <div className={styles.accountRowActions}>
+                            {/*
+                              「重新登录」把新凭证写回这一条：以前只有删除，凭证一过期
+                              就只能删掉再加回来，顺序和备注全丢。
+                            */}
+                            <Button
+                              variant={account.stale ? 'primary' : 'outline'}
+                              size="sm"
+                              disabled={busy || loginPending}
+                              onClick={() => void startOAuthLogin(account.id)}
+                            >
+                              {reloginId === account.id && loginPending
+                                ? t('reloginPending')
+                                : t('accountRelogin')}
+                            </Button>
                             <Button
                               variant="outline"
                               size="sm"
                               className={styles.danger}
-                              disabled={busy}
+                              disabled={busy || loginPending}
                               onClick={() => void removeAccount(account.id)}
                             >
                               {t('accountRemove')}

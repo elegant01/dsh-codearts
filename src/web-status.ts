@@ -13,7 +13,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { CodeArtsAccountStore, CodeArtsAccountSummary } from './auth.ts'
-import { MANUAL_ACCOUNT_ID } from './auth.ts'
+import { MANUAL_ACCOUNT_ID, credentialFromOAuth } from './auth.ts'
 import type { AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
 import type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
@@ -438,6 +438,69 @@ async function probeIdentity(token: OAuthToken): Promise<CallerIdentity | null> 
   } finally {
     clearTimeout(timer)
   }
+}
+
+/** 一次登录落库的结果：`replaced` 表示凭证写回指定账号，`conflict` 表示登错了号。 */
+interface LoginSettlement {
+  /** 落库后的账号 id（可能因并入稳定身份键而与目标 id 不同）。 */
+  id: string
+  replaced: boolean
+  conflict: boolean
+}
+
+/**
+ * 落一次 OAuth 登录的凭证。
+ *
+ * 不带 `targetId` 是「添加账号」：同一账号更新，别的账号新增。
+ *
+ * 带 `targetId` 是「重新登录这个账号」：凭证写回原条目（保留 id、展示顺序和
+ * 备注），而不是又长出一条 —— 以前卡片上只有「删除」，用户遇到凭证过期只能
+ * 先把账号删掉再加回来，顺序和备注都丢。
+ *
+ * 上游只在 `fetchCallerIdentity` 成功时才给稳定 `userId`，拿不到身份就判断不了
+ * 「是不是同一个人」。此时按用户意图替换（他点的就是这个账号的重登），并沿用
+ * 旧条目的身份字段；只有两边 `userId` 都非空且不同，才判为登了另一个账号，
+ * 退回「新增」，原账号原样不动。
+ */
+async function settleLogin(
+  deps: CodeArtsStatusRouteOptions,
+  token: OAuthToken,
+  targetId: string | undefined,
+): Promise<LoginSettlement> {
+  const identity = await probeIdentity(token)
+  const target = targetId === undefined ? undefined : await deps.store.credential(targetId)
+  // 登录期间该账号被删了：别凭空复活一个用户刚删掉的号，按新增处理。
+  if (targetId !== undefined && target !== undefined) {
+    const known = typeof target.userId === 'string' && target.userId !== ''
+    const otherAccount = identity !== null && known && target.userId !== identity.userId
+    if (!otherAccount) {
+      const cred = credentialFromOAuth(token, target.label)
+      // 身份探测失败时沿用旧字段：把它们抹掉，下次「重新登录」又会多出一条。
+      cred.userId = cred.userId || target.userId
+      cred.userName = cred.userName || target.userName
+      cred.domainId = cred.domainId || target.domainId
+      const id = await deps.store.upsert(cred, targetId)
+      deps.reviveAccount?.(id)
+      if (identity !== null && identity.userId !== '') {
+        // 老条目若还是 DPoP 键，借这次登录并入稳定身份键 —— 否则同一个号会一直
+        // 在「DPoP 键 + userId 键」之间来回多出一条。
+        if (identity.userId !== id) await deps.store.adoptIdentity(id, identity)
+        deps.reviveAccount?.(identity.userId)
+        return { id: identity.userId, replaced: true, conflict: false }
+      }
+      return { id, replaced: true, conflict: false }
+    }
+  }
+  const id = await deps.store.upsertFromOAuth(token, undefined, identity ?? undefined)
+  // 身份已有、但这次是用老键（DPoP）新建的条目：并入稳定键，避免重复账号。
+  if (identity !== null && id !== identity.userId) {
+    await deps.store.adoptIdentity(id, identity)
+  }
+  // 凭据已换新：把这个号从禁用/冷却里捞出来（含 adopt 前后的两个键）。
+  // 没有这个，「重新登录」对已被禁用的账号完全无效（issue #1）。
+  deps.reviveAccount?.(id)
+  if (identity !== null && identity.userId !== id) deps.reviveAccount?.(identity.userId)
+  return { id: identity?.userId ?? id, replaced: false, conflict: target !== undefined }
 }
 
 /** 账号还能用吗（没被标 stale、也没过期）。 */
@@ -1009,6 +1072,8 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
     const activeLogins = new Map<string, LoginSession>()
     /** 已结束登录的终态，供迟到的轮询读取。被读一次即删。 */
     const recentLogins = new Map<string, LoginOutcome>()
+    /** 本次登录是「重新登录」时，授权 URL → 目标账号 id。终态落库后即删。 */
+    const reloginTargets = new Map<string, string>()
     const disposeStatus = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_STATUS_PATH,
@@ -1035,7 +1100,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
     const disposeLoginStart = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_LOGIN_PATH,
-      handler: loginStartHandler(deps, activeLogins, recentLogins),
+      handler: loginStartHandler(deps, activeLogins, recentLogins, reloginTargets),
     })
     const disposeLoginStatus = ctx.webServer.register({
       kind: 'exact',
@@ -1093,6 +1158,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeDebug()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()
+      reloginTargets.clear()
     }
   }, 'dsh-codearts: Web status route')
 }
@@ -1106,7 +1172,9 @@ function tokenHandler(deps: CodeArtsStatusRouteOptions) {
 }
 
 /** 一次登录的终态。落库成功才算 done；落库失败按 error 报给卡片。 */
-type LoginOutcome = 'done' | 'error'
+type LoginOutcome =
+  | { status: 'done'; id: string; replaced: boolean; conflict: boolean }
+  | { status: 'error' }
 
 /** 记一次登录终态；超出容量就丢最旧的，别让这个表无限长。 */
 function recordLoginOutcome(recent: Map<string, LoginOutcome>, url: string, outcome: LoginOutcome): void {
@@ -1117,11 +1185,16 @@ function recordLoginOutcome(recent: Map<string, LoginOutcome>, url: string, outc
   recent.set(url, outcome)
 }
 
-/** POST /api/codearts/login — 启动本地 OAuth 回调，返回授权 URL。 */
+/**
+ * POST /api/codearts/login — 启动本地 OAuth 回调，返回授权 URL。
+ *
+ * `?account=<id>` 表示「重新登录这个账号」（见 settleLogin）；省略就是添加账号。
+ */
 function loginStartHandler(
   deps: CodeArtsStatusRouteOptions,
   active: Map<string, LoginSession>,
   recent: Map<string, LoginOutcome>,
+  targets: Map<string, string>,
 ) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method !== 'POST') {
@@ -1132,9 +1205,11 @@ function loginStartHandler(
       json(res, 403, { error: 'request-not-trusted' })
       return
     }
+    const targetId = (new URL(req.url ?? '', 'http://localhost').searchParams.get('account') ?? '').trim()
     try {
       const session = await startLogin()
       active.set(session.url, session)
+      if (targetId !== '') targets.set(session.url, targetId)
       // 终态只在 promise 兑现/失败时处理**一次**：落库 + 记下结果。之后不管卡片
       // 轮询多少次、迟到的轮询什么时候到，都从 recent 里读这个终态——不能在每个
       // 轮询里各自 .then 一遍（那样登录完成时所有叠着的回调会一起跑、把会话从
@@ -1142,34 +1217,28 @@ function loginStartHandler(
       session.promise.then(
         async token => {
           active.delete(session.url)
+          // 先同步取走目标 id：轮询可能马上到达，别让它读到已经清空的状态。
+          const reloginId = targets.get(session.url)
+          targets.delete(session.url)
           try {
-            // 登录响应不带 user_id，所以立刻问一次上游身份：拿到就能让「同一账号
-            // 重新登录」命中同一条记录，拿不到就退回旧行为（DPoP 公钥当键）。
-            const identity = await probeIdentity(token)
-            const id = await deps.store.upsertFromOAuth(token, undefined, identity ?? undefined)
-            // 身份已有、但这次是用老键（DPoP）新建的条目：并入稳定键，避免重复账号。
-            if (identity !== null && id !== identity.userId) {
-              await deps.store.adoptIdentity(id, identity)
-            }
-            // 凭据已换新：把这个号从禁用/冷却里捞出来（含 adopt 前后的两个键）。
-            // 没有这个，「重新登录」对已被禁用的账号完全无效（issue #1）。
-            deps.reviveAccount?.(id)
-            if (identity !== null && identity.userId !== id) deps.reviveAccount?.(identity.userId)
-            recordLoginOutcome(recent, session.url, 'done')
+            const result = await settleLogin(deps, token, reloginId)
+            recordLoginOutcome(recent, session.url, { status: 'done', ...result })
           } catch {
-            recordLoginOutcome(recent, session.url, 'error')
+            recordLoginOutcome(recent, session.url, { status: 'error' })
           }
         },
         () => {
           active.delete(session.url)
-          recordLoginOutcome(recent, session.url, 'error')
+          targets.delete(session.url)
+          recordLoginOutcome(recent, session.url, { status: 'error' })
         },
       )
       // 5 分钟超时：关回调端口。注意此时 promise 永远不会兑现（take() 没有等
       // 到 code 就一直挂着），所以终态要在这里自己记，不能指望上面的 .then。
       const timer = setTimeout(() => {
         session.close()
-        if (active.delete(session.url)) recordLoginOutcome(recent, session.url, 'error')
+        targets.delete(session.url)
+        if (active.delete(session.url)) recordLoginOutcome(recent, session.url, { status: 'error' })
       }, 5 * 60 * 1000)
       // finally 派生出的 promise 会继承 rejection —— 登录失败时同样会变成未处理 rejection。
       session.promise.finally(() => clearTimeout(timer)).catch(() => {})
@@ -1206,7 +1275,7 @@ function loginPollHandler(
       // 读完即消费：这个终态只告诉第一个来问的轮询。卡片侧把 idle 也当终止态
       // 兜底，所以第二个轮询拿不到 done 也不会卡死。
       recent.delete(key)
-      json(res, 200, { status: outcome })
+      json(res, 200, { ...outcome })
       return
     }
     json(res, 200, { status: 'idle' })

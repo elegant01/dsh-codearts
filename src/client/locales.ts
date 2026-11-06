@@ -30,6 +30,12 @@ export interface CodeArtsSettingsKey {
   expiredHint: string
   accountsTitle: string
   accountRemove: string
+  /** 重新登录这个账号：新凭证写回原条目，不会多出一条。 */
+  accountRelogin: string
+  /** 该账号正在浏览器里授权。 */
+  reloginPending: string
+  /** 「重新登录」却登了另一个账号：已作为新账号添加，原账号未动。 */
+  reloginOtherAccount: string
   addAccount: string
   pasteTokenAdd: string
   accountsRotateHint: string
@@ -189,6 +195,9 @@ export const zh: CodeArtsSettingsKey = {
   expiredHint: '凭证已过期，请重新登录以继续使用；已勾选的模型设置会保留。',
   accountsTitle: '账号',
   accountRemove: '删除',
+  accountRelogin: '重新登录',
+  reloginPending: '登录中…',
+  reloginOtherAccount: '你登录的是另一个账号，已作为新账号添加；原账号保持不变。',
   addAccount: '添加账号',
   pasteTokenAdd: '粘贴 Token 添加',
   accountsRotateHint: '已存多个账号：请求会自动轮转，某个账号忙时改用下一个，不用干等。',
@@ -340,6 +349,9 @@ export const en: CodeArtsSettingsKey = {
   expiredHint: 'Your credential has expired. Sign in again to continue; your model selection is kept.',
   accountsTitle: 'Accounts',
   accountRemove: 'Remove',
+  accountRelogin: 'Sign in again',
+  reloginPending: 'Signing in…',
+  reloginOtherAccount: 'That was a different account, so it was added as a new one; the original stayed unchanged.',
   addAccount: 'Add account',
   pasteTokenAdd: 'Paste a token',
   accountsRotateHint: 'Multiple accounts stored: requests rotate automatically, so a busy account hands over to the next one instead of making you wait.',
