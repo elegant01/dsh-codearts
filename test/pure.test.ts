@@ -8,6 +8,7 @@ import {
 import {
   canonicalModel,
   degradeTokenCeiling,
+  estimatePromptTokens,
   estimateTokens,
   isTpmLimit,
   maxTokensCeilingFor,
@@ -269,6 +270,55 @@ describe('estimateTokens', () => {
     // 同样 10 个字符：中文按每字 1、ASCII 按每 4 字符 1 —— 窗口预算必须按重的算。
     expect(estimateTokens('a'.repeat(10))).toBe(3)
     expect(estimateTokens('你好'.repeat(5))).toBe(10)
+  })
+})
+
+describe('estimatePromptTokens', () => {
+  /** 造一张宽 w 高 h 的 PNG data URL（只有 IHDR 是真的，后面填 0）。 */
+  const png = (w: number, h: number, paddingBytes = 0): string => {
+    const head = Buffer.alloc(24)
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(head, 0)
+    head.writeUInt32BE(13, 8)
+    head.write('IHDR', 12, 'ascii')
+    head.writeUInt32BE(w, 16)
+    head.writeUInt32BE(h, 20)
+    const body = Buffer.concat([head, Buffer.alloc(paddingBytes)])
+    return `data:image/png;base64,${body.toString('base64')}`
+  }
+  const imageMessage = (url: string) => ({
+    role: 'user',
+    content: [{ type: 'image_url', image_url: { url } }],
+  })
+
+  it('counts a picture by area, not by its base64 length', () => {
+    // 1024×1024 ≈ 1338 个 28×28 块。base64 长度对这个数没有影响。
+    const small = estimatePromptTokens([imageMessage(png(1024, 1024))], undefined)
+    const padded = estimatePromptTokens([imageMessage(png(1024, 1024, 400_000))], undefined)
+    expect(small).toBeGreaterThan(1_000)
+    expect(small).toBeLessThan(2_000)
+    expect(padded).toBe(small)
+  })
+
+  // 这条是 bug 本身：8 张 A4 页渲染图（约 3.7 MB）曾被算成 128 万 token，
+  // 于是 1M 窗口的模型直接报「上下文放不下」，一次都没发出去。
+  it('keeps a multi-page PDF render well inside a 1M window', () => {
+    const pages = Array.from({ length: 8 }, () => imageMessage(png(1240, 1754, 400_000)))
+    const total = estimatePromptTokens(pages, undefined)
+    expect(total).toBeLessThan(200_000)
+  })
+
+  it('falls back to a conservative constant when the image header is unreadable', () => {
+    const total = estimatePromptTokens([imageMessage('data:image/png;base64,bm90LWEtcG5n')], undefined)
+    expect(total).toBeGreaterThan(0)
+    expect(total).toBeLessThan(10_000)
+  })
+
+  it('still counts plain text exactly as before', () => {
+    const messages = [{ role: 'user', content: '你好世界' }]
+    const textOnly = estimatePromptTokens(messages, undefined)
+    // 正文 4 + role/结构约 1
+    expect(textOnly).toBeGreaterThanOrEqual(4)
+    expect(textOnly).toBeLessThan(30)
   })
 })
 
