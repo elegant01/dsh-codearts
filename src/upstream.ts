@@ -191,10 +191,13 @@ export function resetTokenCeilings(): void {
 }
 
 /**
- * 粗估一段文本占多少 token：CJK 每字约 1，其余每 4 字符约 1。
+ * 粗估一段**文本**占多少 token：CJK 每字约 1，其余每 4 字符约 1。
  *
  * 只要保守就够用 —— 它的用途是「在我们这边就把装不下的情况判掉」，
  * 而不是精确计费（上游不会告诉我们超没超，只会回一句参数非法）。
+ *
+ * **不要拿它去量带图的 content。** 图片在请求里是 base64 字面量，按字符折算会
+ * 虚报两个数量级；整条 prompt 的估算走 `estimatePromptTokens`。
  */
 export function estimateTokens(text: string): number {
   let cjk = 0
@@ -206,6 +209,144 @@ export function estimateTokens(text: string): number {
     }
   }
   return Math.ceil(cjk + (text.length - cjk) / 4)
+}
+
+/** 单张图 token 的下限/上限：防止极端尺寸把整个估算拉飞。 */
+const IMAGE_TOKEN_MIN = 85
+const IMAGE_TOKEN_MAX = 8_000
+/**
+ * 视觉编码器把图切成 28×28 的块，每块约 1 token —— 所以图片的代价随**像素面积**
+ * 走，和它在请求里编码成多少字符无关。
+ */
+const IMAGE_PATCH_AREA = 784
+/** 读不出图片尺寸时的保守兜底（≈ 一张 1024×1024）。 */
+const IMAGE_TOKEN_FALLBACK = 1_600
+/** 解析图片头最多解码这么多 base64 字符（≈72 KB）：够覆盖 PNG IHDR 与 JPEG 的 SOF。 */
+const IMAGE_HEAD_BASE64_CHARS = 96 * 1024
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
+}
+
+function be32(bytes: Uint8Array, offset: number): number {
+  return ((bytes[offset]! << 24) | (bytes[offset + 1]! << 16) | (bytes[offset + 2]! << 8) | bytes[offset + 3]!) >>> 0
+}
+
+/** 从图片头读宽高（不解码像素）。认不出格式返回 undefined。 */
+function imageDimensions(bytes: Uint8Array): { width: number; height: number } | undefined {
+  // PNG：8 字节签名 + 4 字节长度 + 'IHDR'，其后 width/height 各 4 字节大端
+  if (bytes.length >= 24 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return { width: be32(bytes, 16), height: be32(bytes, 20) }
+  }
+  // GIF：'GIF8'，其后 width/height 各 2 字节小端
+  if (bytes.length >= 10 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) {
+    return { width: bytes[6]! | (bytes[7]! << 8), height: bytes[8]! | (bytes[9]! << 8) }
+  }
+  // JPEG：逐段扫 SOF0..SOF15（跳过 C4/C8/CC），段内 height 在前、width 在后
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let i = 2
+    while (i + 9 < bytes.length) {
+      if (bytes[i] !== 0xff) {
+        i += 1
+        continue
+      }
+      const marker = bytes[i + 1]!
+      // 无长度的独立标记
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+        i += 2
+        continue
+      }
+      const length = (bytes[i + 2]! << 8) | bytes[i + 3]!
+      if (length <= 0) break
+      const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+      if (isSof) {
+        return {
+          height: (bytes[i + 5]! << 8) | bytes[i + 6]!,
+          width: (bytes[i + 7]! << 8) | bytes[i + 8]!,
+        }
+      }
+      i += 2 + length
+    }
+  }
+  return undefined
+}
+
+/**
+ * 一张 `data:image/...;base64,...` 占多少 token。
+ *
+ * **不能拿 estimateTokens 去量 base64。** 一张 400 KB 的 A4 页渲染图 base64 后约
+ * 55 万字符，按「4 字符 1 token」会算成 13.7 万 token —— 比真实视觉编码器的读数
+ * 大两个数量级（同一张图通常 1~3 千）。后果是宿主那边上下文还很空、插件这边已经
+ * 报「上下文放不下」，用户只看到一句让他新建会话的错，实际上一次都没发出去。
+ *
+ * 所以图片单独走面积估算：读图片头拿宽高，按 28×28 的块数折算。
+ */
+export function estimateImageTokens(url: string): number {
+  const comma = url.indexOf(',')
+  if (comma === -1 || !/^data:image\//i.test(url.slice(0, comma))) return IMAGE_TOKEN_FALLBACK
+  const base64 = url.slice(comma + 1, comma + 1 + IMAGE_HEAD_BASE64_CHARS)
+  let bytes: Uint8Array
+  try {
+    bytes = new Uint8Array(Buffer.from(base64, 'base64'))
+  } catch {
+    return IMAGE_TOKEN_FALLBACK
+  }
+  const size = imageDimensions(bytes)
+  if (!size || size.width <= 0 || size.height <= 0) return IMAGE_TOKEN_FALLBACK
+  return clamp(Math.ceil((size.width * size.height) / IMAGE_PATCH_AREA), IMAGE_TOKEN_MIN, IMAGE_TOKEN_MAX)
+}
+
+/** 一条消息 content 的 token 数：文本走 estimateTokens，图片走面积估算。 */
+function estimateContentTokens(content: unknown): number {
+  if (typeof content === 'string') return estimateTokens(content)
+  if (content === undefined || content === null) return 0
+  if (!Array.isArray(content)) return estimateTokens(JSON.stringify(content))
+  let total = 0
+  for (const part of content) {
+    if (!part || typeof part !== 'object') {
+      total += estimateTokens(JSON.stringify(part ?? ''))
+      continue
+    }
+    const block = part as Record<string, unknown>
+    if (block.type === 'image_url') {
+      const image = block.image_url
+      const url = typeof image === 'string'
+        ? image
+        : (typeof (image as { url?: unknown } | undefined)?.url === 'string' ? (image as { url: string }).url : '')
+      total += estimateImageTokens(url)
+      continue
+    }
+    if (block.type === 'text' && typeof block.text === 'string') {
+      total += estimateTokens(block.text)
+      continue
+    }
+    total += estimateTokens(JSON.stringify(block))
+  }
+  return total
+}
+
+/**
+ * 整个 prompt 的 token 数（messages + tools）。
+ *
+ * 逐条走 `estimateContentTokens`，而不是 `estimateTokens(JSON.stringify(messages))`：
+ * 后者会把图片的 base64 当成正文去量，一条带图的请求就能虚报出几十万 token。
+ * 非 content 的结构化字段（role / tool_calls / tool_call_id / name）照旧按 JSON 量。
+ */
+export function estimatePromptTokens(messages: unknown, tools: unknown): number {
+  let total = 0
+  if (Array.isArray(messages)) {
+    for (const message of messages) {
+      if (!message || typeof message !== 'object') continue
+      const record = message as Record<string, unknown>
+      total += estimateContentTokens(record.content)
+      const { content: _content, ...rest } = record
+      if (Object.keys(rest).length > 0) total += estimateTokens(JSON.stringify(rest))
+    }
+  } else if (messages !== undefined) {
+    total += estimateTokens(JSON.stringify(messages))
+  }
+  if (tools !== undefined) total += estimateTokens(JSON.stringify(tools))
+  return total
 }
 
 /** 上游要求 chat_id 为 32 位小写十六进制。 */
@@ -336,7 +477,7 @@ export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedCha
   if (typeof body.max_tokens === 'number') {
     let maxTokens = Math.min(body.max_tokens, ceiling)
     if (contextWindow > 0) {
-      const promptTokens = estimateTokens(`${JSON.stringify(body.messages ?? '')}${JSON.stringify(body.tools ?? '')}`)
+      const promptTokens = estimatePromptTokens(body.messages, body.tools)
       const room = contextWindow - promptTokens - PROMPT_ESTIMATE_MARGIN
       if (room < MIN_USEFUL_OUTPUT_TOKENS) {
         body.max_tokens = maxTokens
