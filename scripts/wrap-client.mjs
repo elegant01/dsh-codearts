@@ -17,8 +17,12 @@
  */
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const SRC = dirname(dirname(new URL(import.meta.url).pathname)).replace(/^\/([A-Za-z]):/, '$1:')
+// 不能用 `new URL(import.meta.url).pathname`：它把路径按 URL 规则编码，工作目录里
+// 一有空格就变成 `%20`，join 出来的路径找不到文件 —— 于是 `pnpm build` 在
+// `D:\HarnessWorkspace\WorkBuddy AI\...` 这种目录下必然失败在最后一步。
+const SRC = dirname(dirname(fileURLToPath(import.meta.url)))
 const cjsPath = join(SRC, 'lib', 'client', 'index.cjs')
 const outPath = join(SRC, 'lib', 'client', 'index.js')
 const id = 'dsh-codearts'
