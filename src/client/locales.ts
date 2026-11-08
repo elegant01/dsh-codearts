@@ -87,6 +87,45 @@ export interface CodeArtsSettingsKey {
   usageTipHit: string
   usageStatHit: string
   usageStatRequests: string
+  /** 今日失败率（失败 /（成功 + 失败））。 */
+  usageStatFailures: string
+  usageStatFailureCount: string
+  /** 首字延迟（P95，毫秒）。 */
+  usageStatLatency: string
+  usageStatLatencyDetail: string
+  usageStatLatencyEmpty: string
+  /** 行内的上下文窗口 / 最大输出（`1M · 64K`）。 */
+  modelSpec: string
+  modelSpecTitle: string
+  /** 账号暂停/置顶。 */
+  accountPaused: string
+  accountPinned: string
+  accountPause: string
+  accountResume: string
+  accountPin: string
+  accountUnpin: string
+  accountToday: string
+  /** 体检（doctor）区块。 */
+  doctorTitle: string
+  doctorHint: string
+  doctorRun: string
+  doctorRunning: string
+  doctorFailed: string
+  doctorCheckAccount: string
+  doctorCheckRuntime: string
+  doctorCheckAccounts: string
+  doctorCheckModels: string
+  doctorCheckUsage: string
+  doctorCheckPiAi: string
+  doctorHintNoAccount: string
+  doctorHintAccountStale: string
+  doctorHintAccountNoKey: string
+  doctorHintAccountExpired: string
+  doctorHintEmptyCatalog: string
+  doctorHintUsageMissing: string
+  doctorHintDshHome: string
+  doctorHintPiAi: string
+  doctorHintOther: string
   /** 趋势两张图的标题与悬停提示（近 7 天命中率 / 今天逐小时）。 */
   usageTrendWeek: string
   usageTrendHour: string
@@ -249,6 +288,40 @@ export const zh: CodeArtsSettingsKey = {
   usageTipHit: '命中率',
   usageStatHit: '缓存命中',
   usageStatRequests: '今日请求',
+  usageStatFailures: '今日失败率',
+  usageStatFailureCount: '失败 {n} 次',
+  usageStatLatency: '首字 P95',
+  usageStatLatencyDetail: 'P50 {p50} ms · {n} 次',
+  usageStatLatencyEmpty: '还没有成功请求',
+  modelSpec: '{context} 上下文 · {output} 输出',
+  modelSpecTitle: '上游返回的上下文窗口 {context} token，最大输出 {output} token',
+  accountPaused: '已暂停',
+  accountPinned: '已置顶',
+  accountPause: '暂停',
+  accountResume: '恢复',
+  accountPin: '置顶',
+  accountUnpin: '取消置顶',
+  accountToday: '今日 {n} 次 · 失败 {failed}',
+  doctorTitle: '体检',
+  doctorHint: '只查本机状态（版本、凭证、目录、账本、pi-ai 兼容），不联网、不改任何东西。',
+  doctorRun: '开始体检',
+  doctorRunning: '检查中…',
+  doctorFailed: '体检失败：{message}',
+  doctorCheckAccount: '账号',
+  doctorCheckRuntime: '运行环境',
+  doctorCheckAccounts: '账号数量',
+  doctorCheckModels: '模型目录',
+  doctorCheckUsage: '用量账本',
+  doctorCheckPiAi: 'pi-ai 兼容',
+  doctorHintNoAccount: '还没有账号：先添加一个，或用 token 手动接入。',
+  doctorHintAccountStale: '有账号需要重新登录。',
+  doctorHintAccountNoKey: '有账号缺少签名私钥，无法自动续期。',
+  doctorHintAccountExpired: '有账号凭证已过期：重新登录即可续上。',
+  doctorHintEmptyCatalog: '模型目录为空：点「重拉目录」或检查上游连通性。',
+  doctorHintUsageMissing: '用量账本没有接上：重启宿主后再看。',
+  doctorHintDshHome: '没有设置 DSH_HOME：凭证和账本会写到默认位置。',
+  doctorHintPiAi: '宿主口的 pi-ai 版本与插件预期不一致，可能影响流式解析。',
+  doctorHintOther: '未知提示：{id}',
   usageRequests: '{n} 次请求',
   usageTrendWeek: '本月 · 每日 token',
   usageTrendHour: '今天 · 逐小时 token',
@@ -403,6 +476,40 @@ export const en: CodeArtsSettingsKey = {
   usageTipHit: 'Hit rate',
   usageStatHit: 'Cache hit',
   usageStatRequests: 'Today requests',
+  usageStatFailures: 'Failure rate today',
+  usageStatFailureCount: '{n} failed',
+  usageStatLatency: 'First token P95',
+  usageStatLatencyDetail: 'P50 {p50} ms · {n} samples',
+  usageStatLatencyEmpty: 'No successful request yet',
+  modelSpec: '{context} ctx · {output} out',
+  modelSpecTitle: 'Context window {context} tokens, max output {output} tokens reported upstream',
+  accountPaused: 'Paused',
+  accountPinned: 'Pinned',
+  accountPause: 'Pause',
+  accountResume: 'Resume',
+  accountPin: 'Pin',
+  accountUnpin: 'Unpin',
+  accountToday: 'Today {n} · {failed} failed',
+  doctorTitle: 'Health check',
+  doctorHint: 'Local checks only (version, credentials, catalog, ledger, pi-ai compat). No network, changes nothing.',
+  doctorRun: 'Run check',
+  doctorRunning: 'Checking…',
+  doctorFailed: 'Health check failed: {message}',
+  doctorCheckAccount: 'Account',
+  doctorCheckRuntime: 'Runtime',
+  doctorCheckAccounts: 'Account count',
+  doctorCheckModels: 'Model catalog',
+  doctorCheckUsage: 'Usage ledger',
+  doctorCheckPiAi: 'pi-ai compat',
+  doctorHintNoAccount: 'No account yet: sign in or paste a token first.',
+  doctorHintAccountStale: 'An account needs to sign in again.',
+  doctorHintAccountNoKey: 'An account has no signing key and cannot refresh automatically.',
+  doctorHintAccountExpired: 'An account credential has expired: sign in again to renew it.',
+  doctorHintEmptyCatalog: 'Model catalog is empty: refresh it or check upstream connectivity.',
+  doctorHintUsageMissing: 'Usage ledger is not wired: restart the host and retry.',
+  doctorHintDshHome: 'DSH_HOME is not set: credentials and ledger fall back to the default location.',
+  doctorHintPiAi: 'Host pi-ai version differs from what the plugin expects; streaming parsing may be affected.',
+  doctorHintOther: 'Unknown hint: {id}',
   usageRequests: '{n} request(s)',
   usageTrendWeek: 'This month · tokens per day',
   usageTrendHour: 'Today · tokens by hour',

@@ -163,3 +163,36 @@ describe('sync', () => {
     expect(pool.get('a')?.cappedUntil).toBeGreaterThan(0)
   })
 })
+
+describe('paused and pinned', () => {
+  it('never picks a paused account', () => {
+    const pool = poolOf(['a', 'b'])
+    pool.setPaused(['a'])
+    expect(pool.pick()).toBe('b')
+    pool.setPaused(['a', 'b'])
+    expect(pool.pick()).toBeUndefined()
+    // 暂停只是不参与轮转，不是禁用：账号本身的状态还在。
+    expect(pool.get('a')?.disabled).toBe(false)
+  })
+
+  it('picks pinned accounts first, then falls back to least-recently-used', () => {
+    const pool = poolOf(['a', 'b', 'c'])
+    pool.setPreferred(['c'])
+    expect(pool.pick()).toBe('c')
+    pool.acquire('c')
+    pool.release('c')
+    // c 仍是置顶；只在置顶里挑不到可用号时才回落到普通账号。
+    expect(pool.pick()).toBe('c')
+    pool.setPreferred([])
+    expect(pool.pick()).toBe('a')
+  })
+
+  it('clears both sets when called with an empty list', () => {
+    const pool = poolOf(['a', 'b'])
+    pool.setPaused(['a'])
+    pool.setPreferred(['b'])
+    pool.setPaused([])
+    pool.setPreferred([])
+    expect(pool.pick()).toBe('a')
+  })
+})

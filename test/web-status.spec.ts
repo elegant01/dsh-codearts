@@ -45,6 +45,7 @@ import {
 import {
   CODEARTS_ACCOUNTS_PATH,
   CODEARTS_CLAIM_PATH,
+  CODEARTS_DOCTOR_PATH,
   CODEARTS_LOGIN_PATH,
   CODEARTS_LOGIN_STATUS_PATH,
   CODEARTS_QUEUE_PATH,
@@ -366,8 +367,8 @@ describe('DELETE /api/codearts/accounts', () => {
     expect(res.status).toBe(400)
   })
 
-  it('rejects a non-DELETE method', async () => {
-    const res = await call(routes.get(CODEARTS_ACCOUNTS_PATH)!, 'GET', CODEARTS_ACCOUNTS_PATH)
+  it('rejects a non-DELETE/POST method', async () => {
+    const res = await call(routes.get(CODEARTS_ACCOUNTS_PATH)!, 'PUT', CODEARTS_ACCOUNTS_PATH)
     expect(res.status).toBe(405)
   })
 
@@ -397,6 +398,85 @@ describe('DELETE /api/codearts/accounts', () => {
   it('requires a loopback Origin for the status route too', async () => {
     const res = await call(routes.get(CODEARTS_ACCOUNTS_PATH)!, 'DELETE', `${CODEARTS_ACCOUNTS_PATH}?id=x`, { origin: LOOPBACK })
     expect(res.status).toBe(200)
+  })
+})
+
+describe('POST /api/codearts/accounts', () => {
+  it('pauses and pins an account, answering with the fresh status document', async () => {
+    await store.upsert(credential('uid-a'))
+
+    const paused = await call(
+      routes.get(CODEARTS_ACCOUNTS_PATH)!,
+      POST,
+      CODEARTS_ACCOUNTS_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'uid-a', paused: true }),
+    )
+
+    expect(paused.status).toBe(200)
+    expect((paused.body?.accounts as { id: string; paused?: boolean }[])[0]?.paused).toBe(true)
+
+    const pinned = await call(
+      routes.get(CODEARTS_ACCOUNTS_PATH)!,
+      POST,
+      CODEARTS_ACCOUNTS_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'uid-a', pinned: true }),
+    )
+    expect(pinned.status).toBe(200)
+    expect((pinned.body?.accounts as { id: string; pinned?: boolean }[])[0]?.pinned).toBe(true)
+  })
+
+  it('rejects an unknown account with 404', async () => {
+    const res = await call(
+      routes.get(CODEARTS_ACCOUNTS_PATH)!,
+      POST,
+      CODEARTS_ACCOUNTS_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'nope', paused: true }),
+    )
+    expect(res.status).toBe(404)
+  })
+
+  it('rejects a body that changes nothing', async () => {
+    await store.upsert(credential('uid-a'))
+    const res = await call(
+      routes.get(CODEARTS_ACCOUNTS_PATH)!,
+      POST,
+      CODEARTS_ACCOUNTS_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'uid-a' }),
+    )
+    expect(res.status).toBe(400)
+  })
+
+  it('rejects a cross-origin request', async () => {
+    await store.upsert(credential('uid-a'))
+    const res = await call(
+      routes.get(CODEARTS_ACCOUNTS_PATH)!,
+      POST,
+      CODEARTS_ACCOUNTS_PATH,
+      { origin: 'https://evil.example', 'content-type': 'application/json' },
+      JSON.stringify({ id: 'uid-a', paused: true }),
+    )
+    expect(res.status).toBe(403)
+  })
+})
+
+describe('GET /api/codearts/doctor', () => {
+  it('reports runtime checks and a hint when there is no account', async () => {
+    const res = await call(routes.get(CODEARTS_DOCTOR_PATH)!, GET, CODEARTS_DOCTOR_PATH)
+    expect(res.status).toBe(200)
+    const checks = res.body?.checks as { id: string; ok: boolean }[]
+    expect(checks.map(check => check.id)).toContain('runtime')
+    expect(checks.find(check => check.id === 'accounts')?.ok).toBe(false)
+    expect(res.body?.hints as string[]).toContain('no-account')
+    expect(res.body?.ok).toBe(false)
+  })
+
+  it('rejects a non-GET request', async () => {
+    const res = await call(routes.get(CODEARTS_DOCTOR_PATH)!, POST, CODEARTS_DOCTOR_PATH)
+    expect(res.status).toBe(405)
   })
 })
 
@@ -494,6 +574,9 @@ describe('GET /api/codearts/status', () => {
         days: 1,
         recentDays: [{ date: '2026-11-03', totals }],
         todayByHour: [{ hour: 13, totals }],
+        failuresToday: { total: 1, byKind: { queued: 1 } },
+        failuresByAccountToday: { 'uid-a': 1 },
+        latencyToday: { samples: 2, p50: 500, p95: 2000, overflow: false },
       }),
     })
     const res = await call(usageRoutes.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)

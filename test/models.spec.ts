@@ -460,6 +460,8 @@ describe('refreshCatalog 的显示名', () => {
   function oneAccountStore() {
     return {
       ids: async () => ['acct'],
+      pausedIds: async () => [],
+      pinnedIds: async () => [],
       list: async () => [{ id: 'acct', label: 'acct' }],
       resolve: async () => credential,
     } as never

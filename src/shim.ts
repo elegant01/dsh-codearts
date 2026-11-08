@@ -468,7 +468,10 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   }
 
   async function chatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    /** 首字延迟的起点：从读完请求头就开始算，排队与换号的时间都算「用户等了多久」。 */
+    const requestStartedAt = Date.now()
     if (!isJsonContentType(req)) {
+      usage?.noteFailure('media_type')
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
       return
     }
@@ -487,6 +490,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     const checked = prepareChatBody(raw, contextWindow)
     noteRequestShape(raw, checked.model)
     if (checked.error !== undefined) {
+      usage?.noteFailure('context_overflow')
       writeOpenAIError(res, 400, 'context_overflow', checked.error)
       return
     }
@@ -501,12 +505,19 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
 
     let ids: string[]
     try {
-      ids = await store.ids()
+      const all = await store.ids()
+      const paused = new Set(await store.pausedIds())
+      pool.sync(all)
+      pool.setPaused([...paused])
+      pool.setPreferred(await store.pinnedIds())
+      ids = all.filter(id => !paused.has(id))
     } catch (error: unknown) {
+      usage?.noteFailure('not_signed_in')
       writeOpenAIError(res, 401, 'not_signed_in', String(error))
       return
     }
     if (ids.length === 0) {
+      usage?.noteFailure('not_signed_in')
       writeOpenAIError(res, 401, 'not_signed_in', 'no CodeArts account stored; sign in from the CodeArts settings card')
       return
     }
@@ -521,6 +532,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     let tpmAccount: string | undefined
     let queueWaitedMs = 0
     let lastKind: UpstreamErrorKind | undefined
+    let lastAccountId: string | undefined
     let lastStatus = 0
     let lastMessage = ''
 
@@ -545,10 +557,12 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             // 400 而不是 429：宿主的 classifyPiAiError 按状态码归类，429 会被判成
             // RATE_LIMIT 并自动重试 5 次（实测），用户看到的是「一直转圈」而不是一句
             // 「在排队，稍后再试」。INVALID_REQUEST 不在重试名单里，一次就把话说到。
+            usage?.noteFailure('queued', id)
             writeOpenAIError(res, 400, 'queued', queuedMessage(checked.model, gate))
             return
           }
           if (gate.kind === 'queue_full' || gate.kind === 'error') {
+            usage?.noteFailure(gate.kind, id)
             writeOpenAIError(res, gate.kind === 'queue_full' ? 429 : 502, gate.kind, gate.message)
             return
           }
@@ -564,10 +578,11 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         }
         if (result.ok) {
           pool.noteSuccess(id)
-          await pipeToResponse(res, result.stream, controller.signal, { accountId: id, model: prepared.model }, opened.head)
+          await pipeToResponse(res, result.stream, controller.signal, { accountId: id, model: prepared.model, startedAt: requestStartedAt }, opened.head)
           return
         }
         lastKind = result.kind
+        lastAccountId = id
         lastStatus = result.status
         lastMessage = result.message
 
@@ -639,10 +654,11 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             }
             if (result.ok) {
               pool.noteSuccess(queueAccount)
-              await pipeToResponse(res, result.stream, controller.signal, { accountId: queueAccount, model: opened.prepared.model }, opened.head)
+              await pipeToResponse(res, result.stream, controller.signal, { accountId: queueAccount, model: opened.prepared.model, startedAt: requestStartedAt }, opened.head)
               return
             }
             lastKind = result.kind
+            lastAccountId = queueAccount
             lastStatus = result.status
             lastMessage = result.message
           }
@@ -654,12 +670,14 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
 
     if (lastKind === undefined) {
       const none = noAccountError(pool.list())
+      usage?.noteFailure(none.kind)
       writeOpenAIError(res, none.status, none.kind, none.message)
       return
     }
     // 排队等过就明说等过多久：否则用户不知道插件已经努力过，只会觉得「又失败了」。
     const explanation = upstreamErrorMessage(lastMessage, lastStatus)
     const waited = queueWaitedMs >= 1_000 ? `（本地已排队重试 ${Math.round(queueWaitedMs / 1000)} 秒）` : ''
+    usage?.noteFailure(lastKind, lastAccountId)
     writeOpenAIError(res, KIND_STATUS[lastKind], lastKind, `${explanation}${waited}`)
   }
 
@@ -685,7 +703,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     res: ServerResponse,
     stream: ReadableStream<Uint8Array>,
     signal: AbortSignal,
-    attribution?: { accountId: string; model: string },
+    attribution?: { accountId: string; model: string; startedAt?: number },
     head?: Uint8Array,
   ): Promise<void> {
     res.writeHead(200, {
@@ -704,6 +722,8 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     // 上游流里可能已经带了终止帧（openAIDone）。收尾时只在没写过的情况下补，
     // 否则下游会连续收到两个 data: [DONE]。
     let sawDone = false
+    /** 首个真正写出的帧记一次 TTFT；之后不再记。 */
+    let firstFrame = true
     const finish = (): void => {
       if (!res.writable || res.writableEnded) return
       res.end(sawDone ? undefined : 'data: [DONE]\n\n')
@@ -725,7 +745,15 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           if (usage !== undefined && attribution !== undefined && frame.includes('"usage"')) {
             recordFrameUsage(frame, attribution)
           }
-          if (res.writable) res.write(frame + '\n\n')
+          if (res.writable) {
+            if (firstFrame) {
+              firstFrame = false
+              if (usage !== undefined && attribution?.startedAt !== undefined) {
+                usage.noteLatency(Date.now() - attribution.startedAt)
+              }
+            }
+            res.write(frame + '\n\n')
+          }
         }
       }
       finish()

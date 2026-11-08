@@ -67,7 +67,7 @@ beforeEach(async () => {
     securityToken: 'sts-token',
   })
   shim = createCodeArtsShim({
-    store: { ids: async () => storeIds, resolve: () => resolveCredential() } as never,
+    store: { ids: async () => storeIds, pausedIds: async () => [], pinnedIds: async () => [], resolve: () => resolveCredential() } as never,
     catalog: { current: () => CATALOG } as never,
   })
   await shim.ready
@@ -225,7 +225,7 @@ describe('usage accounting', () => {
     vi.stubGlobal('fetch', async () => new Response(SSE, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
     const usage = new CodeArtsUsageTracker()
     const withUsage = createCodeArtsShim({
-      store: { ids: async () => ['acct'], resolve: async () => ({ token: 'sts-token', accessKeyId: 'AKID', secretAccessKey: 'SK', securityToken: 'sts-token' }) } as never,
+      store: { ids: async () => ['acct'], pausedIds: async () => [], pinnedIds: async () => [], resolve: async () => ({ token: 'sts-token', accessKeyId: 'AKID', secretAccessKey: 'SK', securityToken: 'sts-token' }) } as never,
       catalog: { current: () => CATALOG } as never,
       usage,
     })
@@ -257,7 +257,7 @@ describe('usage accounting', () => {
     }))
     const usage = new CodeArtsUsageTracker()
     const withUsage = createCodeArtsShim({
-      store: { ids: async () => ['acct'], resolve: async () => ({ token: 'sts-token', accessKeyId: 'AKID', secretAccessKey: 'SK', securityToken: 'sts-token' }) } as never,
+      store: { ids: async () => ['acct'], pausedIds: async () => [], pinnedIds: async () => [], resolve: async () => ({ token: 'sts-token', accessKeyId: 'AKID', secretAccessKey: 'SK', securityToken: 'sts-token' }) } as never,
       catalog: { current: () => CATALOG } as never,
       usage,
     })
@@ -288,7 +288,7 @@ describe('queue gate replies', () => {
     })
     vi.stubGlobal('fetch', upstream)
     const gated = createCodeArtsShim({
-      store: { ids: async () => ['acct'], resolve: async () => ({ token: 't', securityToken: 't' }) } as never,
+      store: { ids: async () => ['acct'], pausedIds: async () => [], pinnedIds: async () => [], resolve: async () => ({ token: 't', securityToken: 't' }) } as never,
       catalog: { current: () => CATALOG } as never,
       queue: { wait: async () => outcome } as never,
     })

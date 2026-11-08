@@ -114,6 +114,8 @@ async function startShim(
   shim = createCodeArtsShim({
     store: {
       ids: async () => ['acct'],
+      pausedIds: async () => [],
+      pinnedIds: async () => [],
       resolve: async () => ({ token: 'sts', accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }),
     } as never,
     catalog: { current: () => catalogModels } as never,

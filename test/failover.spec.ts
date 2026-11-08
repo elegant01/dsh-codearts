@@ -140,6 +140,8 @@ async function start(accountIds: string[], options: { capTimes?: number; tpmTime
   shim = createCodeArtsShim({
     store: {
       ids: async () => ids,
+      pausedIds: async () => [],
+      pinnedIds: async () => [],
       resolve: async (id: string) => credentialFor(id),
     } as never,
     catalog: { current: () => [] } as never,
@@ -210,7 +212,7 @@ describe('cross-account failover', () => {
     }))
     pool = new CodeArtsAccountPool([])
     shim = createCodeArtsShim({
-      store: { ids: async () => ids, resolve: async (id: string) => credentialFor(id) } as never,
+      store: { ids: async () => ids, pausedIds: async () => [], pinnedIds: async () => [], resolve: async (id: string) => credentialFor(id) } as never,
       catalog: { current: () => [] } as never,
       pool,
     })
@@ -253,7 +255,7 @@ describe('cross-account failover', () => {
       }))
       pool = new CodeArtsAccountPool([])
       shim = createCodeArtsShim({
-        store: { ids: async () => ids, resolve: async (id: string) => credentialFor(id) } as never,
+        store: { ids: async () => ids, pausedIds: async () => [], pinnedIds: async () => [], resolve: async (id: string) => credentialFor(id) } as never,
         catalog: { current: () => [] } as never,
         pool,
       })
@@ -353,7 +355,7 @@ describe('local proxy resign refusal (issue #1)', () => {
     }))
     pool = new CodeArtsAccountPool([])
     shim = createCodeArtsShim({
-      store: { ids: async () => ids, resolve: async (id: string) => credentialFor(id) } as never,
+      store: { ids: async () => ids, pausedIds: async () => [], pinnedIds: async () => [], resolve: async (id: string) => credentialFor(id) } as never,
       catalog: { current: () => [] } as never,
       pool,
     })
@@ -423,7 +425,7 @@ describe('no-account error message', () => {
     }))
     pool = new CodeArtsAccountPool([])
     shim = createCodeArtsShim({
-      store: { ids: async () => ids, resolve: async (id: string) => credentialFor(id) } as never,
+      store: { ids: async () => ids, pausedIds: async () => [], pinnedIds: async () => [], resolve: async (id: string) => credentialFor(id) } as never,
       catalog: { current: () => [] } as never,
       pool,
     })
@@ -474,6 +476,8 @@ describe('stream-frame auth errors', () => {
     shim = createCodeArtsShim({
       store: {
         ids: async () => ['A'],
+        pausedIds: async () => [],
+        pinnedIds: async () => [],
         resolve: async () => ({ token: current, accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }),
         forceRefresh: async (_id: string, seenToken?: string) => {
           expect(seenToken).toBe('old-token')

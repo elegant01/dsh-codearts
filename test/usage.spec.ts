@@ -413,6 +413,75 @@ describe('trend series', () => {
   })
 })
 
+describe('failure and latency accounting', () => {
+  const at = (day: number, hour = 0): number => new Date(2026, 8, day, hour, 30, 0).getTime()
+
+  it('counts failures by kind and by account, and keeps them out of token totals', async () => {
+    const path = join(dir, '.codearts-usage.json')
+    const now = at(30, 9)
+    const tracker = new CodeArtsUsageTracker({ path, saveDebounceMs: 0, now: () => now })
+    await tracker.load()
+    tracker.noteFailure('queued', 'uid-a')
+    tracker.noteFailure('queued', 'uid-a')
+    tracker.noteFailure('context_overflow', 'uid-b')
+    await tracker.flush()
+
+    const snapshot = tracker.snapshot(now)
+    expect(snapshot.failuresToday).toEqual({ total: 3, byKind: { queued: 2, context_overflow: 1 } })
+    expect(snapshot.failuresByAccountToday).toEqual({ 'uid-a': 2, 'uid-b': 1 })
+    // 失败不是请求成功，不能混进 token 账本里。
+    expect(snapshot.today.requests).toBe(0)
+    expect(snapshot.today.totalTokens).toBe(0)
+  })
+
+  it('buckets first-token latency and reports p50/p95 bucket ceilings', async () => {
+    const path = join(dir, '.codearts-usage.json')
+    const now = at(30, 9)
+    const tracker = new CodeArtsUsageTracker({ path, saveDebounceMs: 0, now: () => now })
+    await tracker.load()
+    for (const ms of [120, 480, 900, 1_500, 2_500, 4_000, 9_000, 15_000, 25_000]) tracker.noteLatency(ms)
+    const snapshot = tracker.snapshot(now)
+    expect(snapshot.latencyToday.samples).toBe(9)
+    // 9 个样本：p50 的目标位是 ceil(9*0.5)=5，落进 3000ms 档；p95 是 ceil(9*0.95)=9，落进 30s 档。
+    expect(snapshot.latencyToday.p50).toBe(3_000)
+    expect(snapshot.latencyToday.p95).toBe(30_000)
+    expect(snapshot.latencyToday.overflow).toBe(false)
+    await tracker.flush()
+  })
+
+  it('marks the overflow bucket when p95 is slower than the last observed ceiling', async () => {
+    const path = join(dir, '.codearts-usage.json')
+    const now = at(30, 9)
+    const tracker = new CodeArtsUsageTracker({ path, saveDebounceMs: 0, now: () => now })
+    await tracker.load()
+    for (let index = 0; index < 20; index += 1) tracker.noteLatency(150)
+    tracker.noteLatency(60_000)
+    tracker.noteLatency(60_000)
+    const snapshot = tracker.snapshot(now)
+    // 22 个样本：p95 的目标位是第 21 个，20 个快样本不够，落进溢出档。
+    expect(snapshot.latencyToday.p95).toBeUndefined()
+    expect(snapshot.latencyToday.overflow).toBe(true)
+    await tracker.flush()
+  })
+
+  it('survives a reload: failures and latency are part of the day bucket', async () => {
+    const path = join(dir, '.codearts-usage.json')
+    const now = at(30, 9)
+    const tracker = new CodeArtsUsageTracker({ path, saveDebounceMs: 0, now: () => now })
+    await tracker.load()
+    tracker.noteFailure('queue_full', 'uid-a')
+    tracker.noteLatency(700)
+    await tracker.flush()
+
+    const reopened = new CodeArtsUsageTracker({ path, now: () => now })
+    await reopened.load()
+    const snapshot = reopened.snapshot(now)
+    expect(snapshot.failuresToday).toEqual({ total: 1, byKind: { queue_full: 1 } })
+    expect(snapshot.failuresByAccountToday).toEqual({ 'uid-a': 1 })
+    expect(snapshot.latencyToday.samples).toBe(1)
+  })
+})
+
 describe('codeartsUsagePath', () => {
   it('lives next to the account document under DSH_HOME', () => {
     expect(codeartsUsagePath('/tmp/home')).toBe(join('/tmp/home', '.codearts-usage.json'))

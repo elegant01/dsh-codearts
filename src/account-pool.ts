@@ -51,6 +51,10 @@ export interface PoolOptions {
 
 export class CodeArtsAccountPool {
   private readonly accounts = new Map<string, AccountRuntime>()
+  /** 用户手动暂停的账号：运行时状态留着（卡片还看得见槽位），但不参与轮转。 */
+  private readonly paused = new Set<string>()
+  /** 用户置顶的账号：选号时排在最前面，不再按「最久未用」轮它。 */
+  private readonly preferred = new Set<string>()
   private readonly maxConcurrent: number
   private readonly now: () => number
 
@@ -96,12 +100,27 @@ export class CodeArtsAccountPool {
     return !account.disabled && this.now() >= account.coolUntil
   }
 
-  /** 现在就能接活的账号（健康 + 本地还有空槽位），按「最久未用」排序。 */
+  /** 现在就能接活的账号（健康 + 未暂停 + 本地还有空槽位），置顶的优先，其余按「最久未用」。 */
   private available(exclude: ReadonlySet<string>): AccountRuntime[] {
     const now = this.now()
     return this.list()
-      .filter(a => !a.disabled && now >= a.coolUntil && !exclude.has(a.id) && a.activeConcurrent < a.maxConcurrent)
-      .sort((a, b) => a.lastUsed - b.lastUsed)
+      .filter(a => !a.disabled && !this.paused.has(a.id) && now >= a.coolUntil && !exclude.has(a.id) && a.activeConcurrent < a.maxConcurrent)
+      .sort((a, b) => {
+        const pinned = Number(this.preferred.has(b.id)) - Number(this.preferred.has(a.id))
+        return pinned !== 0 ? pinned : a.lastUsed - b.lastUsed
+      })
+  }
+
+  /** 设置暂停集合（账号 id）。与账号文档同步时调用。 */
+  setPaused(ids: readonly string[]): void {
+    this.paused.clear()
+    for (const id of ids) this.paused.add(id)
+  }
+
+  /** 设置置顶集合（账号 id）。置顶只在「同时可用」时改变先后，不会绕过冷却/上限。 */
+  setPreferred(ids: readonly string[]): void {
+    this.preferred.clear()
+    for (const id of ids) this.preferred.add(id)
   }
 
   /**

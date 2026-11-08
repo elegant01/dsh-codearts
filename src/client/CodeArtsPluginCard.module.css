@@ -833,3 +833,40 @@
 @media (prefers-reduced-motion: reduce) {
   .skeletonRow { animation: none; }
 }
+
+/* 上下文窗口 / 最大输出：跟在名称后的次要信息，别抢勾选框的视线。 */
+.modelSpec {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 体检列表：一行一条，状态点 + 名称 + 说明。 */
+.doctorList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.doctorRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.doctorName {
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.doctorRow .meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

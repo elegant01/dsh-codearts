@@ -29,6 +29,12 @@ export interface CodeArtsModelInfo {
   id: string
   name: string
   contextWindow: number
+  /**
+   * `contextWindow` 是上游真的给的，还是兜底值（32768）。
+   *
+   * 卡片只在上游给值时印「1M 上下文」这类规格；兜底值印出来就是假数据。
+   */
+  contextWindowKnown?: boolean
   maxTokens: number
   supportsImages: boolean
   /**

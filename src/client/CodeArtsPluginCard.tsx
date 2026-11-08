@@ -1,7 +1,13 @@
 import { useEffect, useId, useState } from 'react'
 import { Button, Checkbox, Input, SegmentedTabs, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SegmentedTab, StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { CodeArtsWebStatus, CodeArtsWebUsage, CodeArtsCreditSnapshot, CodeArtsWelfareState } from '../web-status.ts'
+import type {
+  CodeArtsDoctorReport,
+  CodeArtsWebStatus,
+  CodeArtsWebUsage,
+  CodeArtsCreditSnapshot,
+  CodeArtsWelfareState,
+} from '../web-status.ts'
 import { stripModelSuffixes } from '../catalog.ts'
 import { setSidebarPanelWanted } from './panel-switch.ts'
 import styles from './CodeArtsPluginCard.module.css'
@@ -28,6 +34,10 @@ interface ModelChoice {
   supportsImages?: boolean
   /** 上游今天判定该模型不可用的原因（挂「异常」Tag，悬浮显示）。 */
   error?: string
+  /** 上游返回的上下文窗口；undefined 表示没返回（后端那个 32768 是兜底值，不能当真）。 */
+  contextWindow?: number
+  /** 上游返回的最大输出 token。 */
+  maxTokens?: number
 }
 
 interface ModelSelectionDoc {
@@ -143,6 +153,62 @@ const DOCK_DEFAULT = { credits: true, queue: true, sidebar: false }
  * 后台再刷新 —— 比每次都先闪骨架舒服，也不会把「还没读到」误判成未登录。
  */
 let lastStatusSnapshot: LocalStatus | null = null
+
+/**
+ * 实测结果也要跨挂载保留：一次实测要真发一次请求、等上游回话，用户切到别的
+ * 页再回来就清空，等于逼他重测。模块级存一份，进程内不丢。
+ */
+type ModelTestResult = { ok: boolean; message: string; ms?: number }
+const lastTestResults: Record<string, ModelTestResult> = {}
+
+/**
+ * 上下文窗口这类数字不适合印全值（1048576 比 1M 难读），按 K/M 取整。
+ *
+ * undefined 表示上游没给 —— 此时后端下发的 32768 是兜底值，不能当成真的印出来。
+ */
+function formatWindow(tokens: number | undefined): string {
+  if (tokens === undefined || !Number.isFinite(tokens) || tokens <= 0) return '—'
+  if (tokens >= 1_048_576) return `${Math.round(tokens / 1_048_576)}M`
+  if (tokens >= 1_024) return `${Math.round(tokens / 1_024)}K`
+  return String(tokens)
+}
+
+/** 体检里一条检查的标题。账号级检查按 id 找回备注名，别让用户对着哈希猜。 */
+function doctorCheckLabel(
+  id: string,
+  accounts: readonly { id: string; label?: string; userName?: string }[],
+  t: CodeArtsPluginCardInjected['t'],
+): string {
+  if (id.startsWith('account:')) {
+    const accountId = id.slice('account:'.length)
+    const account = accounts.find(entry => entry.id === accountId)
+    const name = account?.label?.trim() || account?.userName?.trim() || accountId
+    return `${t('doctorCheckAccount')} ${name}`
+  }
+  switch (id) {
+    case 'runtime': return t('doctorCheckRuntime')
+    case 'accounts': return t('doctorCheckAccounts')
+    case 'models': return t('doctorCheckModels')
+    case 'usage': return t('doctorCheckUsage')
+    case 'pi-ai': return t('doctorCheckPiAi')
+    default: return id
+  }
+}
+
+/** 体检的 hints 是稳定 id（见 web-status.ts 的 doctorReport），这里翻成人话。 */
+function doctorHintText(id: string, t: CodeArtsPluginCardInjected['t']): string {
+  switch (id) {
+    case 'no-account': return t('doctorHintNoAccount')
+    case 'account-stale': return t('doctorHintAccountStale')
+    case 'account-no-key': return t('doctorHintAccountNoKey')
+    case 'account-expired': return t('doctorHintAccountExpired')
+    case 'empty-catalog': return t('doctorHintEmptyCatalog')
+    case 'usage-missing': return t('doctorHintUsageMissing')
+    case 'dsh-home-missing': return t('doctorHintDshHome')
+    case 'pi-ai': return t('doctorHintPiAi')
+    default: return t('doctorHintOther', { id })
+  }
+}
 
 /** 一个 Tab 面板；未选中的用 hidden 留在 DOM 里，草稿和滚动位置都别丢。 */
 function TabPanel({
@@ -726,8 +792,14 @@ function UsageSection({
     totals: entry.totals,
   }))
   const today = usage.today
-  const hasUsage = usage.allTime.requests > 0 || today.requests > 0
+  // 失败率的分母是「进了 shim 的请求」，不是上游收到的请求 —— 排队/换号失败也该算。
+  const failures = usage.failuresToday ?? { total: 0, byKind: {} }
+  // 「一次都没成功、但一直在失败」也要能看到失败率，不能因为 requests=0 就整段空着。
+  const hasUsage = usage.allTime.requests > 0 || today.requests > 0 || failures.total > 0
   const hit = hitPercentOf(today)
+  const attempts = today.requests + failures.total
+  const failRate = attempts > 0 ? Math.round((failures.total / attempts) * 100) : undefined
+  const latency = usage.latencyToday ?? { samples: 0, overflow: false }
   return (
     <div className={styles.section}>
       <div className={styles.sectionHead}>
@@ -763,6 +835,24 @@ function UsageSection({
             <div className={styles.statCard}>
               <span className={styles.statLabel}>{t('usageStatRequests')}</span>
               <span className={styles.statValue}>{formatCount(today.requests)}</span>
+            </div>
+            <div className={styles.statCard}>
+              <span className={styles.statLabel}>{t('usageStatFailures')}</span>
+              <span className={styles.statValue}>{failRate === undefined ? '—' : `${failRate}%`}</span>
+              <span className={styles.statSub}>
+                {t('usageStatFailureCount', { n: formatCount(failures.total) })}
+              </span>
+            </div>
+            <div className={styles.statCard}>
+              <span className={styles.statLabel}>{t('usageStatLatency')}</span>
+              <span className={styles.statValue}>
+                {latency.p95 === undefined ? '—' : latency.overflow ? '>30 s' : `${formatCount(latency.p95)} ms`}
+              </span>
+              <span className={styles.statSub}>
+                {latency.p50 === undefined
+                  ? t('usageStatLatencyEmpty')
+                  : t('usageStatLatencyDetail', { p50: formatCount(latency.p50), n: formatCount(latency.samples) })}
+              </span>
             </div>
           </div>
 
@@ -846,7 +936,12 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   /** 正在实测的模型 id；同一时间只测一个，避免把上游并发槽位占满。 */
   const [testingId, setTestingId] = useState<string | null>(null)
   /** 逐模型的测试结果（通过/失败 + 原因）。 */
-  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message: string; ms?: number }>>({})
+  const [testResults, setTestResults] = useState<Record<string, ModelTestResult>>(() => ({ ...lastTestResults }))
+  /** 正在提交 paused/pinned 的账号 id。 */
+  const [flagBusy, setFlagBusy] = useState<string | null>(null)
+  const [doctor, setDoctor] = useState<CodeArtsDoctorReport | null>(null)
+  const [doctorBusy, setDoctorBusy] = useState(false)
+  const [doctorError, setDoctorError] = useState<string | null>(null)
   /** 正在领取的账号 id；批量领取时是 CLAIM_ALL。null 表示没有在飞。 */
   const [claimingId, setClaimingId] = useState<string | null>(null)
   /** 逐账号的领取结果文案。 */
@@ -1064,6 +1159,48 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     }
   }
 
+  /**
+   * 改一个账号的 paused/pinned 标记。
+   *
+   * 暂停 ≠ 删除：凭证还在，只是不参与轮转（比如这个号今天额度用完了，但明天还要用）。
+   * 置顶改变的是 pick() 的优先级，不是顺序本身 —— 取消置顶就回到「最久未用优先」。
+   */
+  async function setAccountFlag(id: string, patch: { paused?: boolean; pinned?: boolean }): Promise<void> {
+    setFlagBusy(id)
+    setMsg(null)
+    try {
+      const res = await fetch('/api/codearts/accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ id, ...patch }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(typeof data.error === 'string' ? data.error : `HTTP ${res.status}`)
+      }
+      await refresh()
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : String(err))
+    } finally {
+      setFlagBusy(null)
+    }
+  }
+
+  /** 点「体检」拉一次本机报告；只读，不改任何状态。 */
+  async function runDoctor(): Promise<void> {
+    setDoctorBusy(true)
+    setDoctorError(null)
+    try {
+      const res = await fetch('/api/codearts/doctor', { headers: { Accept: 'application/json' } })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setDoctor((await res.json()) as CodeArtsDoctorReport)
+    } catch (err) {
+      setDoctorError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setDoctorBusy(false)
+    }
+  }
+
   // 服务端把「空数组」当作「不加限制 = 全部可用」，所以全选时回写空数组。
   const all = selection?.choices.length ?? 0
   const blockedCount = selection?.choices.filter(c => c.blocked === true).length ?? 0
@@ -1107,8 +1244,15 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
    * 上游的清单会列出调不动的模型（81003.401），刷新救不了；只有真发一次最小请求
    * 才知道。测试成功会清掉后端记的「异常」标记，所以结束后重拉一次 selection。
    */
+  function recordTest(id: string, result: ModelTestResult): void {
+    // 模块级缓存与组件 state 同步写：切换页签/重开卡片时不至于把结果丢掉。
+    lastTestResults[id] = result
+    setTestResults(current => ({ ...current, [id]: result }))
+  }
+
   async function testModel(id: string): Promise<void> {
     setTestingId(id)
+    delete lastTestResults[id]
     setTestResults(current => {
       const next = { ...current }
       delete next[id]
@@ -1122,13 +1266,10 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       })
       const data = (await res.json().catch(() => null)) as { ok?: boolean; message?: string; ms?: number } | null
       if (!res.ok) throw new Error(data?.message ?? `HTTP ${res.status}`)
-      setTestResults(current => ({ ...current, [id]: { ok: data?.ok === true, message: data?.message ?? '', ms: data?.ms } }))
+      recordTest(id, { ok: data?.ok === true, message: data?.message ?? '', ms: data?.ms })
       await refreshSelection()
     } catch (err) {
-      setTestResults(current => ({
-        ...current,
-        [id]: { ok: false, message: err instanceof Error ? err.message : String(err) },
-      }))
+      recordTest(id, { ok: false, message: err instanceof Error ? err.message : String(err) })
     } finally {
       setTestingId(null)
     }
@@ -1431,12 +1572,40 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                           <div className={styles.accountInfo}>
                             <span className={styles.accountNameRow}>
                               <span className={styles.accountName}>{accountName(account)}</span>
+                              {account.paused && <Tag>{t('accountPaused')}</Tag>}
+                              {account.pinned && <Tag tone="success">{t('accountPinned')}</Tag>}
                               {account.stale && <Tag>{t('accountNeedsSignIn')}</Tag>}
                               {!account.signable && <Tag>{t('accountNoKey')}</Tag>}
                             </span>
                             {accountLine !== '' && <span className={styles.meta}>{accountLine}</span>}
+                            <span className={styles.meta}>
+                              {t('accountToday', {
+                                n: formatCount(status?.usage?.byAccountToday[account.id]?.requests ?? 0),
+                                failed: formatCount(status?.usage?.failuresByAccountToday?.[account.id] ?? 0),
+                              })}
+                            </span>
                           </div>
                           <div className={styles.accountRowActions}>
+                            {/*
+                              暂停 ≠ 删除：凭证留着，只是不参与轮转。适合「这个号今天额度
+                              用完/想留着专用」这种临时状态，不用重新登录一次。
+                            */}
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy || loginPending || flagBusy === account.id}
+                              onClick={() => void setAccountFlag(account.id, { paused: !account.paused })}
+                            >
+                              {account.paused ? t('accountResume') : t('accountPause')}
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={busy || loginPending || flagBusy === account.id}
+                              onClick={() => void setAccountFlag(account.id, { pinned: !account.pinned })}
+                            >
+                              {account.pinned ? t('accountUnpin') : t('accountPin')}
+                            </Button>
                             {/*
                               「重新登录」把新凭证写回这一条：以前只有删除，凭证一过期
                               就只能删掉再加回来，顺序和备注全丢。
@@ -1518,7 +1687,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                   </p>
                   {blockedCount > 0 && <p className={styles.hint}>{t('benefitBlockedHint', { n: blockedCount })}</p>}
                   <div className={styles.choices}>
-                    {selection.choices.map(choice => {
+                    {(selection.choices ?? []).map(choice => {
                       const result = testResults[choice.id]
                       return (
                         <div key={choice.id} className={styles.choiceRow}>
@@ -1529,6 +1698,23 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                             onChange={(on) => setModel(choice.id, on)}
                             label={modelName(choice)}
                           />
+                          {/*
+                            上下文窗口体现「这个模型能不能装下整份代码」。上游 agent 来源
+                            确实返回值；builtin 来源没有，后端会兜底成 32768 并置
+                            contextWindow=undefined，这里就显示「—」而不是假的 32K。
+                          */}
+                          <span
+                            className={styles.modelSpec}
+                            title={t('modelSpecTitle', {
+                              context: choice.contextWindow === undefined ? '?' : formatCount(choice.contextWindow),
+                              output: choice.maxTokens === undefined ? '?' : formatCount(choice.maxTokens),
+                            })}
+                          >
+                            {t('modelSpec', {
+                              context: formatWindow(choice.contextWindow),
+                              output: formatWindow(choice.maxTokens),
+                            })}
+                          </span>
                           {choice.benefit === true && (
                             <Tag tone={choice.blocked === true ? 'warning' : 'success'}>
                               {choice.blocked === true ? t('benefitBlocked') : t('benefit')}
@@ -1650,6 +1836,34 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     />
                   </div>
                 </div>
+              </div>
+
+              {/* 体检：CLI doctor 的可视化版本，只查本机可判定的东西，不联网。 */}
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('doctorTitle')}</span>
+                  <Button variant="outline" size="sm" disabled={doctorBusy} onClick={() => void runDoctor()}>
+                    {doctorBusy ? t('doctorRunning') : t('doctorRun')}
+                  </Button>
+                </div>
+                <p className={styles.hint}>{t('doctorHint')}</p>
+                {doctorError !== null && <p className={styles.error}>{t('doctorFailed', { message: doctorError })}</p>}
+                {doctor !== null && (
+                  <>
+                    <div className={styles.doctorList}>
+                      {doctor.checks.map(check => (
+                        <div key={check.id} className={styles.doctorRow}>
+                          <StateDot state={check.ok ? 'done' : 'warning'} />
+                          <span className={styles.doctorName}>{doctorCheckLabel(check.id, accounts, t)}</span>
+                          {check.detail !== undefined && <span className={styles.meta}>{check.detail}</span>}
+                        </div>
+                      ))}
+                    </div>
+                    {doctor.hints.length > 0 && (
+                      <p className={styles.hint}>{doctor.hints.map(id => doctorHintText(id, t)).join('；')}</p>
+                    )}
+                  </>
+                )}
               </div>
             </TabPanel>
           </>

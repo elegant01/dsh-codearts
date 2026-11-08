@@ -68,7 +68,29 @@ export interface UsageDay {
    * 而超过两天的逐小时数据没人看。老账本没有这个键，读的时候当空表。
    */
   hours?: Record<string, UsageTotals>
+  /**
+   * 失败次数，按错误类别（`kind`）累计。键与 shim 的失败出口一一对应。
+   *
+   * 单独记而不是塞进 {@link UsageTotals}.requests：那里是「真的跑出流」的请求数，
+   * 失败率要拿两者相加当分母，混在一起就再也算不出来了。
+   */
+  failures?: Record<string, number>
+  /** 失败次数，按账号累计（只记总数，类别明细在上面的 failures 里）。 */
+  failuresByAccount?: Record<string, number>
+  /**
+   * 首字延迟直方图：`TTFT_BUCKETS_MS` 每档一个计数，多一个溢出档（>30s）。
+   *
+   * 存桶而不是存原始毫秒：账本要留 60 天，逐请求样本会让文件膨胀两个数量级，
+   * 而界面上只显示 P50/P95，桶的精度足够了。
+   */
+  ttft?: number[]
 }
+
+/** 首字延迟分桶的上界（毫秒）；落进最后一档表示「超过 30 秒」。 */
+export const TTFT_BUCKETS_MS = [200, 500, 1_000, 2_000, 3_000, 5_000, 8_000, 12_000, 20_000, 30_000] as const
+
+/** 直方图桶数（含溢出档）。 */
+export const TTFT_BUCKET_COUNT = TTFT_BUCKETS_MS.length + 1
 
 interface UsageFile {
   version: 1
@@ -112,6 +134,16 @@ export interface UsageSnapshot {
   byModelToday: { id: string; totals: UsageTotals }[]
   /** 今天按账号的合计。 */
   byAccountToday: Record<string, UsageTotals>
+  /** 今天的失败次数：总数 + 按错误类别。 */
+  failuresToday: { total: number; byKind: Record<string, number> }
+  /** 今天按账号的失败次数。 */
+  failuresByAccountToday: Record<string, number>
+  /**
+   * 今天的首字延迟分位（毫秒）。样本为 0 时 p50/p95 缺省。
+   *
+   * `overflow` 表示 P95 落进了「>30 秒」那一档，前端据此显示「30s+」。
+   */
+  latencyToday: { samples: number; p50?: number; p95?: number; overflow: boolean }
   /** 账本覆盖的天数（便于「数据从哪天开始」的说明）。 */
   days: number
   /**
@@ -248,6 +280,24 @@ function normalizeStore(store: Record<string, Partial<UsageTotals>> | undefined)
   return out
 }
 
+/** 计数表（失败类别 / 账号失败数）补齐：只留正数，空表给 undefined。 */
+function normalizeCounts(raw: Record<string, unknown> | undefined): Record<string, number> | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const out: Record<string, number> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    const count = positiveInt(value)
+    if (count > 0) out[key] = count
+  }
+  return Object.keys(out).length === 0 ? undefined : out
+}
+
+/** 首字延迟直方图补齐到固定桶数；旧账本/脏数组一律按空表。 */
+function normalizeBuckets(raw: unknown): number[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out = Array.from({ length: TTFT_BUCKET_COUNT }, (_, index) => positiveInt(raw[index]))
+  return out.some((count) => count > 0) ? out : undefined
+}
+
 export interface UsageTrackerOptions {
   /** 账本文件路径；省略则只记在内存里（测试用）。 */
   path?: string
@@ -299,12 +349,18 @@ export class CodeArtsUsageTracker {
       if (parsed.version !== 1 || typeof parsed.days !== 'object' || parsed.days === null) return
       for (const [date, day] of Object.entries(parsed.days)) {
         if (typeof day !== 'object' || day === null) continue
-        const models = normalizeStore((day as UsageDay).models)
-        const accounts = normalizeStore((day as UsageDay).accounts)
-        const hours = (day as UsageDay).hours
-        this.days.set(date, hours === undefined
-          ? { models, accounts }
-          : { models, accounts, hours: normalizeStore(hours) })
+        const stored = day as UsageDay
+        const models = normalizeStore(stored.models)
+        const accounts = normalizeStore(stored.accounts)
+        const restored: UsageDay = { models, accounts }
+        if (stored.hours !== undefined) restored.hours = normalizeStore(stored.hours)
+        const failures = normalizeCounts(stored.failures)
+        if (failures !== undefined) restored.failures = failures
+        const failuresByAccount = normalizeCounts(stored.failuresByAccount)
+        if (failuresByAccount !== undefined) restored.failuresByAccount = failuresByAccount
+        const ttft = normalizeBuckets(stored.ttft)
+        if (ttft !== undefined) restored.ttft = ttft
+        this.days.set(date, restored)
       }
       this.prune(this.now())
     } catch {
@@ -364,6 +420,44 @@ export class CodeArtsUsageTracker {
   }
 
   /**
+   * 记一次失败请求。
+   *
+   * 只在「这次请求最终回给用户一个错误」时调用一次 —— 插件内部换号重试不算失败，
+   * 否则一个排队重试就能把失败率刷成好几倍。`kind` 用 shim 的失败出口标识。
+   */
+  noteFailure(kind: string, accountId?: string, at: number = this.now()): void {
+    if (kind === '') return
+    const day = this.day(localDateKey(at))
+    day.failures ??= {}
+    day.failures[kind] = (day.failures[kind] ?? 0) + 1
+    if (accountId !== undefined && accountId !== '') {
+      day.failuresByAccount ??= {}
+      day.failuresByAccount[accountId] = (day.failuresByAccount[accountId] ?? 0) + 1
+    }
+    this.lastAt = at
+    this.prune(at)
+    this.scheduleSave()
+  }
+
+  /**
+   * 记一次首字延迟（毫秒），落进直方图。
+   *
+   * 从请求进入 shim 算起，到上游第一帧真的写给 DSH 为止 —— 排队和换号的时间都算进去，
+   * 因为那正是用户盯着转圈等掉的时长。
+   */
+  noteLatency(ms: number, at: number = this.now()): void {
+    if (!Number.isFinite(ms) || ms < 0) return
+    const day = this.day(localDateKey(at))
+    day.ttft ??= new Array<number>(TTFT_BUCKET_COUNT).fill(0)
+    let index = TTFT_BUCKETS_MS.findIndex((limit) => ms <= limit)
+    if (index < 0) index = TTFT_BUCKET_COUNT - 1
+    day.ttft[index] += 1
+    this.lastAt = at
+    this.prune(at)
+    this.scheduleSave()
+  }
+
+  /**
    * 丢弃保留期之外的天（按日期键比较即可，YYYY-MM-DD 是字典序）。
    *
    * 顺带把两天之前的**小时桶**清掉：逐小时数据只有「今天按小时」在画，留着只是
@@ -396,10 +490,25 @@ export class CodeArtsUsageTracker {
       }
     }
     const models = today?.models ?? {}
+    const failuresByKind = today?.failures ?? {}
+    const ttft = today?.ttft ?? []
+    const p50 = percentileOf(ttft, 0.5)
+    const p95 = percentileOf(ttft, 0.95)
     return {
       today: { ...emptyTotals(), ...(today === undefined ? {} : sumOf(models)) },
       allTime,
       last30,
+      failuresToday: {
+        total: Object.values(failuresByKind).reduce((sum, count) => sum + count, 0),
+        byKind: { ...failuresByKind },
+      },
+      failuresByAccountToday: { ...(today?.failuresByAccount ?? {}) },
+      latencyToday: {
+        samples: ttft.reduce((sum, count) => sum + count, 0),
+        ...(p50.value === undefined ? {} : { p50: p50.value }),
+        ...(p95.value === undefined ? {} : { p95: p95.value }),
+        overflow: p95.overflow,
+      },
       byModelToday: Object.entries(models)
         .map(([id, totals]) => ({ id, totals: { ...totals } }))
         .sort((a, b) => b.totals.totalTokens - a.totals.totalTokens || (a.id < b.id ? -1 : 1)),
@@ -473,4 +582,25 @@ function sumOf(store: Record<string, UsageTotals>): UsageTotals {
   const out = emptyTotals()
   for (const totals of Object.values(store)) mergeTotals(out, totals)
   return out
+}
+
+/**
+ * 直方图分位。
+ *
+ * 返回的是「落进的那一档的上界」而不是精确毫秒 —— 界面上显示 `≤200ms` 这种口径，
+ * 比伪造一个精确值诚实。落进溢出档时 `value` 缺省、`overflow` 为真。
+ */
+function percentileOf(buckets: number[], ratio: number): { value?: number; overflow: boolean } {
+  const total = buckets.reduce((sum, count) => sum + count, 0)
+  if (total === 0) return { overflow: false }
+  const target = Math.ceil(total * ratio)
+  let seen = 0
+  for (let index = 0; index < buckets.length; index += 1) {
+    seen += buckets[index] ?? 0
+    if (seen < target) continue
+    return index < TTFT_BUCKETS_MS.length
+      ? { value: TTFT_BUCKETS_MS[index], overflow: false }
+      : { overflow: true }
+  }
+  return { overflow: true }
 }

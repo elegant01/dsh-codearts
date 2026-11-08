@@ -1308,6 +1308,7 @@ export async function fetchModels(
     return {
       ...model,
       ...(thinking === undefined ? {} : { thinking }),
+      contextWindowKnown: model.contextWindow > 0,
       contextWindow: model.contextWindow > 0 ? model.contextWindow : UNKNOWN_CONTEXT_WINDOW,
       maxTokens: Math.min(
         model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS,

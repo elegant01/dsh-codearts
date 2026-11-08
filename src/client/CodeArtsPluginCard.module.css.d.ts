@@ -33,6 +33,9 @@ declare const styles: {
   readonly "creditRows": string
   readonly "danger": string
   readonly "desc": string
+  readonly "doctorList": string
+  readonly "doctorName": string
+  readonly "doctorRow": string
   readonly "error": string
   readonly "expiryLabel": string
   readonly "expiryRow": string
@@ -61,6 +64,7 @@ declare const styles: {
   readonly "modelRequests": string
   readonly "modelRow": string
   readonly "modelShare": string
+  readonly "modelSpec": string
   readonly "modelTokens": string
   readonly "modelTrack": string
   readonly "name": string

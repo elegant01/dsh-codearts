@@ -19,6 +19,7 @@ import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
 import type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import type { CodeArtsQueueEntry } from './queue.ts'
 import type { UsageSnapshot, UsageTotals } from './usage.ts'
+import { CODEARTS_VERSION } from './version.ts'
 // 卡片只认 web-status 这一份状态契约，所以契约里用到的积分类型要跟着转出去 ——
 // 否则 client 侧只能越过本模块去直引 credits.ts。
 export type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
@@ -79,6 +80,13 @@ export const CODEARTS_QUEUE_PATH = '/api/codearts/queue'
 export const CODEARTS_DOCK_PATH = '/api/codearts/dock'
 /** 最近出站请求的**形状**摘要（只有 role 名与计数，不含内容），排障用。 */
 export const CODEARTS_DEBUG_PATH = '/api/codearts/debug'
+/**
+ * GET /api/codearts/doctor — 把 CLI `doctor` 的静态体检搬进卡片。
+ *
+ * 只做本机可判定的检查（版本、账号、凭证有效期、目录、账本、pi-ai 兼容），
+ * 不额外打上游 —— 卡片本来就每 60 秒刷一次状态，不该因为点了体检再等超时。
+ */
+export const CODEARTS_DOCTOR_PATH = '/api/codearts/doctor'
 
 /** 勾选 UI 的一个选项。 */
 export interface CodeArtsModelChoice {
@@ -93,6 +101,14 @@ export interface CodeArtsModelChoice {
   /** 支持图片输入（卡片据此挂「识图」Tag；纯文本模型缺省）。 */
   supportsImages?: boolean
   /**
+   * 上下文窗口（上游发现值；拿不到时是目录的兜底值 32768）。
+   *
+   * 卡片用它显示「1M 上下文」这类规格 —— 这是选模型时最该看的数字，之前完全看不到。
+   */
+  contextWindow?: number
+  /** 单次输出上限（endpoint 元数据或实测天花板）。 */
+  maxTokens?: number
+  /**
    * 上游今天判定该模型不可用（如 `InferHub.ModelArts.81003.401`）的原因。
    *
    * 卡片挂一个「异常」Tag，悬浮显示这段原因；**不**替用户取消勾选。
@@ -102,7 +118,7 @@ export interface CodeArtsModelChoice {
 
 /** enabled-models 路由返回的 selection 文档（与 codebuddy 的 shape 对齐）。 */
 export interface CodeArtsModelSelection {
-  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; error?: string }[]
+  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; contextWindow?: number; maxTokens?: number; error?: string }[]
   /** 已选子集是否小于全集（卡片据此显示不同提示）。 */
   restricted: boolean
   /** 是否可写（无 settings provider 时为 false，卡片只读）。 */
@@ -129,6 +145,8 @@ export function selectionOf(
     blocked: m.blocked,
     ratio: m.ratio,
     supportsImages: m.supportsImages,
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
     ...(m.error === undefined ? {} : { error: m.error }),
     enabled: restricted ? allowed.has(m.id) : true,
   }))
@@ -148,6 +166,8 @@ function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
       blocked: isBenefitBlocked(m.id),
       ...(ratio === undefined ? {} : { ratio }),
       ...(m.supportsImages === true ? { supportsImages: true } : {}),
+      ...(m.contextWindowKnown === true ? { contextWindow: m.contextWindow } : {}),
+      ...(m.maxTokens > 0 ? { maxTokens: m.maxTokens } : {}),
       ...(error === undefined ? {} : { error }),
     }
   })
@@ -300,6 +320,12 @@ export interface CodeArtsWebUsage {
   /** 今天 0..23 点的逐小时合计（没到的小时补 0）。 */
   todayByHour: readonly { hour: number; totals: UsageTotals }[]
   lastAt?: number
+  /** 今天的失败次数与类别（失败率的分母是成功请求数 + 这里的 total）。 */
+  failuresToday: { total: number; byKind: Record<string, number> }
+  /** 今天按账号的失败次数。 */
+  failuresByAccountToday: Record<string, number>
+  /** 今天的首字延迟分位；样本为 0 时 p50/p95 缺省。 */
+  latencyToday: { samples: number; p50?: number; p95?: number; overflow: boolean }
   /** 每个账号的会话槽位占用与池状态 —— 这是「为什么刚才要等」的直接答案。 */
   slots: readonly CodeArtsWebAccountSlot[]
 }
@@ -326,6 +352,23 @@ export interface CodeArtsWebModelBadge {
    * 需要把这两件事分开拿，所以这里单列一个字段而不是让客户端去拆名字。
    */
   ratio?: string
+}
+
+/** 体检里的一条检查。`id` 是稳定标识，卡片按它选本地化文案。 */
+export interface CodeArtsDoctorCheck {
+  id: string
+  ok: boolean
+  /** 已格式化的说明（账号 id、有效期、模型数等）；卡片直接印，不再拼。 */
+  detail?: string
+}
+
+export interface CodeArtsDoctorReport {
+  ok: boolean
+  version: string
+  node: string
+  checks: CodeArtsDoctorCheck[]
+  /** 需要用户动手的建议（与 checks 里的失败项对应，但合并成一句话更好读）。 */
+  hints: string[]
 }
 
 export interface CodeArtsStatusRouteOptions {
@@ -559,6 +602,9 @@ function usageOf(deps: CodeArtsStatusRouteOptions): CodeArtsWebUsage {
     days: snapshot?.days ?? 0,
     recentDays: snapshot?.recentDays ?? [],
     todayByHour: snapshot?.todayByHour ?? [],
+    failuresToday: snapshot?.failuresToday ?? { total: 0, byKind: {} },
+    failuresByAccountToday: snapshot?.failuresByAccountToday ?? {},
+    latencyToday: snapshot?.latencyToday ?? { samples: 0, overflow: false },
     ...snapshot?.lastAt === undefined ? {} : { lastAt: snapshot.lastAt },
     slots: slotsOf(deps),
   }
@@ -645,6 +691,93 @@ function statusHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/**
+ * 本机体检：与 CLI 的 `doctor` 同一份判据，但只做不联网的检查。
+ *
+ * 这里的每一项都能在 1ms 内判定；需要网络的（凭证能不能续期、上游目录是否正常）
+ * 已经在 /status 与 /refresh-models 里体现，重复做只会让「体检」按钮转圈。
+ */
+async function doctorReport(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsDoctorReport> {
+  const accounts = await deps.store.list()
+  const models = deps.models()
+  const checks: CodeArtsDoctorCheck[] = []
+  const hints = new Set<string>()
+
+  checks.push({
+    id: 'runtime',
+    ok: true,
+    detail: `dsh-codearts ${CODEARTS_VERSION} · node ${process.version} · ${process.platform}`,
+  })
+
+  checks.push({
+    id: 'accounts',
+    ok: accounts.length > 0,
+    detail: `${accounts.length}`,
+  })
+  if (accounts.length === 0) hints.add('no-account')
+
+  for (const account of accounts) {
+    const problems: string[] = []
+    if (account.stale) problems.push('stale')
+    if (!account.signable) problems.push('no-key')
+    if (account.expiration !== undefined) {
+      const expiresAt = Date.parse(account.expiration)
+      if (!Number.isNaN(expiresAt) && expiresAt <= Date.now()) problems.push('expired')
+    }
+    checks.push({
+      id: `account:${account.id}`,
+      ok: problems.length === 0,
+      detail: problems.length > 0
+        ? problems.join(',')
+        : (account.label ?? account.userName ?? account.expiration ?? 'ok'),
+    })
+    for (const problem of problems) hints.add(`account-${problem}`)
+  }
+
+  checks.push({ id: 'models', ok: models.length > 0, detail: `${models.length}` })
+  if (models.length === 0) hints.add('empty-catalog')
+
+  checks.push({
+    id: 'usage',
+    ok: deps.usage !== undefined,
+    detail: deps.usage === undefined ? 'tracker not wired' : 'local ledger',
+  })
+  if (deps.usage === undefined) hints.add('usage-missing')
+
+  if (process.env.DSH_HOME === undefined) hints.add('dsh-home-missing')
+
+  // pi-ai 探测带缓存（同一个宿主版本只探一次），放在这里不会变成一次慢请求。
+  const piAi = await probePiAiCompat()
+  checks.push({ id: 'pi-ai', ok: piAi === undefined, ...(piAi === undefined ? {} : { detail: piAi }) })
+  if (piAi !== undefined) hints.add('pi-ai')
+
+  return {
+    ok: checks.every(check => check.ok),
+    version: CODEARTS_VERSION,
+    node: process.version,
+    checks,
+    hints: [...hints],
+  }
+}
+
+/** GET /api/codearts/doctor */
+function doctorHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'GET') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    try {
+      json(res, 200, await doctorReport(deps))
+    } catch (error: unknown) {
+      json(res, 500, { error: safeMessage(error) })
+    }
+  }
+}
 /**
  * GET/POST /api/codearts/dock — 对话底部那一行的显隐开关读写。
  *
@@ -823,13 +956,14 @@ function tokenDeleteHandler(deps: CodeArtsStatusRouteOptions) {
 
 /**
  * DELETE /api/codearts/accounts?id=<accountId> — 删掉一个账号。
+ * POST /api/codearts/accounts — 改账号标记：`{ id, paused?, pinned? }`。
  *
  * id 必须显式给：多账号下「删掉当前那个」是歧义的。改状态的路由，所以和
  * /token 一样走 Host + Origin 双校验。
  */
 function accountsHandler(deps: CodeArtsStatusRouteOptions) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (req.method !== 'DELETE') {
+    if (req.method !== 'DELETE' && req.method !== 'POST') {
       json(res, 405, { error: 'method not allowed' })
       return
     }
@@ -838,12 +972,46 @@ function accountsHandler(deps: CodeArtsStatusRouteOptions) {
       return
     }
     const url = new URL(req.url ?? '', 'http://localhost')
-    const id = (url.searchParams.get('id') ?? '').trim()
-    if (id === '') {
-      json(res, 400, { error: 'expected ?id=<accountId>' })
-      return
-    }
     try {
+      if (req.method === 'POST') {
+        const type = req.headers['content-type']
+        if (typeof type !== 'string' || !type.trim().toLowerCase().startsWith('application/json')) {
+          json(res, 415, { error: 'content-type must be application/json' })
+          return
+        }
+        const body = JSON.parse(await readBody(req)) as { id?: unknown; paused?: unknown; pinned?: unknown }
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        if (id === '') {
+          json(res, 400, { error: 'expected {"id": string}' })
+          return
+        }
+        let changed = false
+        if (typeof body.paused === 'boolean') {
+          if (!await deps.store.setPaused(id, body.paused)) {
+            json(res, 404, { error: 'unknown account' })
+            return
+          }
+          changed = true
+        }
+        if (typeof body.pinned === 'boolean') {
+          if (!await deps.store.setPinned(id, body.pinned)) {
+            json(res, 404, { error: 'unknown account' })
+            return
+          }
+          changed = true
+        }
+        if (!changed) {
+          json(res, 400, { error: 'expected paused and/or pinned boolean' })
+          return
+        }
+        json(res, 200, await buildStatus(deps))
+        return
+      }
+      const id = (url.searchParams.get('id') ?? '').trim()
+      if (id === '') {
+        json(res, 400, { error: 'expected ?id=<accountId>' })
+        return
+      }
       await deps.store.remove(id)
       json(res, 200, await buildStatus(deps))
     } catch (error: unknown) {
@@ -1142,6 +1310,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_DEBUG_PATH,
       handler: debugHandler(deps),
     })
+    const disposeDoctor = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_DOCTOR_PATH,
+      handler: doctorHandler(deps),
+    })
     return () => {
       disposeStatus()
       disposeModels()
@@ -1156,6 +1329,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeQueue()
       disposeDock()
       disposeDebug()
+      disposeDoctor()
       for (const s of activeLogins.values()) s.close()
       activeLogins.clear()
       reloginTargets.clear()

@@ -128,6 +128,30 @@ describe('account management', () => {
     expect(await new CodeArtsAccountStore(accountsPath).ids()).toEqual(['uid-a'])
   })
 
+  it('stores paused and pinned flags, and keeps them across instances', async () => {
+    const store = new CodeArtsAccountStore(accountsPath)
+    await store.upsert(credential('uid-a'))
+    await store.upsert(credential('uid-b'))
+
+    expect(await store.setPaused('uid-a', true)).toBe(true)
+    expect(await store.setPinned('uid-b', true)).toBe(true)
+    expect(await store.pausedIds()).toEqual(['uid-a'])
+    expect(await store.pinnedIds()).toEqual(['uid-b'])
+    // 暂停的账号仍在列表里（还能重新登录、删除），只是不参与分派。
+    expect(await store.list()).toHaveLength(2)
+    expect((await store.list()).find(account => account.id === 'uid-a')?.paused).toBe(true)
+
+    const reopened = new CodeArtsAccountStore(accountsPath)
+    expect(await reopened.pausedIds()).toEqual(['uid-a'])
+    expect(await reopened.pinnedIds()).toEqual(['uid-b'])
+  })
+
+  it('rejects flag changes for an unknown account', async () => {
+    const store = new CodeArtsAccountStore(accountsPath)
+    expect(await store.setPaused('nope', true)).toBe(false)
+    expect(await store.setPinned('nope', true)).toBe(false)
+  })
+
   it('resolves the signing material for a specific account', async () => {
     const store = new CodeArtsAccountStore(accountsPath)
     await store.upsert(credential('uid-a', { securityToken: 'tok-a' }))

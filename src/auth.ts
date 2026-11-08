@@ -51,6 +51,15 @@ export interface CodeArtsCredential {  /** STS security_token（聊天鉴权 + A
   storedAt?: number
   /** 续期已尝试且失败（多半已过期），需用户重新登录。 */
   stale?: boolean
+  /**
+   * 用户手动暂停：凭证还在、也未必过期，只是暂时不想用它。
+   *
+   * 和 `stale` 分开：`stale` 是「这个号坏了，必须重新登录」，这里只是「先别派活」。
+   * 恢复时不需要重新登录，也不会清掉池里的禁用/冷却状态。
+   */
+  paused?: boolean
+  /** 用户置顶：轮转时优先用这个号（仍受冷却与并发槽位约束）。 */
+  pinned?: boolean
 }
 
 /** 从 OAuthToken 落库。 */
@@ -352,6 +361,10 @@ export interface CodeArtsAccountSummary {
   stale: boolean
   /** 带 AK/SK，能产生签名（只有 security_token 的降级凭证不能）。 */
   signable: boolean
+  /** 用户手动暂停（不参与轮转）。 */
+  paused: boolean
+  /** 用户置顶（轮转优先）。 */
+  pinned: boolean
 }
 
 export function codeartsAccountsPath(home?: string): string {
@@ -393,6 +406,8 @@ export function summarizeAccount(id: string, cred: CodeArtsCredential): CodeArts
     stale: cred.stale === true,
     signable: typeof cred.accessKeyId === 'string' && cred.accessKeyId !== '' &&
       typeof cred.secretAccessKey === 'string' && cred.secretAccessKey !== '',
+    paused: cred.paused === true,
+    pinned: cred.pinned === true,
   }
 }
 
@@ -701,6 +716,61 @@ export class CodeArtsAccountStore {
     delete doc.accounts[id]
     doc.order = doc.order.filter(existing => existing !== id)
     await this.persistDoc()
+  }
+
+  /**
+   * 暂停 / 恢复一个账号。
+   *
+   * 只改标记，不碰凭证：恢复时不需要重新登录。重新装配槽位是因为 AccountSlot
+   * 缓存的 `_cred` 是旧对象，续期回写会把它盖回来 —— 换了对象，续期写到新文档里。
+   */
+  async setPaused(id: string, paused: boolean): Promise<boolean> {
+    await this.loaded()
+    const doc = this._doc as CodeArtsAccountDocument
+    const cred = doc.accounts[id]
+    if (cred === undefined) return false
+    doc.accounts[id] = { ...cred, paused }
+    const slot = this._slots.get(id)
+    slot?.invalidate()
+    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id)))
+    await this.persistDoc()
+    return true
+  }
+
+  /** 置顶 / 取消置顶：只改变轮转先后，不绕过冷却与并发上限。 */
+  async setPinned(id: string, pinned: boolean): Promise<boolean> {
+    await this.loaded()
+    const doc = this._doc as CodeArtsAccountDocument
+    const cred = doc.accounts[id]
+    if (cred === undefined) return false
+    doc.accounts[id] = { ...cred, pinned }
+    const slot = this._slots.get(id)
+    slot?.invalidate()
+    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id)))
+    await this.persistDoc()
+    return true
+  }
+
+  /** shim 用：参与轮转的账号 id（排除用户暂停的）。 */
+  async dispatchIds(): Promise<string[]> {
+    const paused = new Set(await this.pausedIds())
+    return (await this.ids()).filter(id => !paused.has(id))
+  }
+
+  /** 被用户暂停的账号 id（账号池据此保留状态但不派活）。 */
+  async pausedIds(): Promise<string[]> {
+    await this.loaded()
+    const doc = this._doc as CodeArtsAccountDocument
+    const ids = await this.ids()
+    return ids.filter(id => doc.accounts[id]?.paused === true)
+  }
+
+  /** 置顶账号的 id 列表（给账号池排序用）。 */
+  async pinnedIds(): Promise<string[]> {
+    await this.loaded()
+    const doc = this._doc as CodeArtsAccountDocument
+    const ids = await this.ids()
+    return ids.filter(id => doc.accounts[id]?.pinned === true)
   }
 
   /** 清空全部账号（整体登出）。 */
