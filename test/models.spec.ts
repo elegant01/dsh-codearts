@@ -64,6 +64,38 @@ describe('mergeModelLists', () => {
     expect(merged[0]?.ratio).toBe('0.7x')
     expect(merged[0]?.maxTokens).toBe(65_536)
   })
+
+  // 多号才是这个插件的核心场景：两个号都列同一个模型，而「上游真给的上下文窗口」
+  // 只在一个号的返回里。以前 richerModel 逐字段手抄，把 contextWindowKnown 丢了
+  // ⇒ 卡片那一列「上下文」整列成「—」（上游其实给了值），而且 shim 可能拿兜底值
+  // 32768 去算上下文预算。
+  it('carries contextWindowKnown through the merge and keeps the real window', () => {
+    const merged = mergeModelLists([
+      [model('glm-5.3', { contextWindow: 32_768 })],
+      [model('glm-5.3', { contextWindow: 1_048_576, contextWindowKnown: true })],
+    ])
+    expect(merged[0]?.contextWindow).toBe(1_048_576)
+    expect(merged[0]?.contextWindowKnown).toBe(true)
+  })
+
+  // 兜底值也是 >0，所以「谁可信」只能看标记，不能看大小。
+  it('prefers the known window over a bigger unknown one', () => {
+    const merged = mergeModelLists([
+      [model('glm-5.2', { contextWindow: 32_768, contextWindowKnown: true })],
+      [model('glm-5.2', { contextWindow: 524_288 })],
+    ])
+    expect(merged[0]?.contextWindow).toBe(32_768)
+    expect(merged[0]?.contextWindowKnown).toBe(true)
+  })
+
+  // 两边都只是兜底值时不许留下标记：印出来就是假数据。
+  it('leaves the flag off when neither row got a real window', () => {
+    const merged = mergeModelLists([
+      [model('kimi-k3', { contextWindow: 32_768 })],
+      [model('kimi-k3', { contextWindow: 32_768 })],
+    ])
+    expect(merged[0]?.contextWindowKnown).toBeUndefined()
+  })
 })
 
 describe('backfillParams', () => {

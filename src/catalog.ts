@@ -310,27 +310,45 @@ export function mergeModelLists(
   })
 }
 
-/** 同一模型两条记录取更全的一条；`benefit` 永远取或。 */
+/**
+ * 同一模型两条记录取更全的一条；`benefit` 永远取或。
+ *
+ * 基底用 `{ ...keep }` 而不是逐字段手抄：以前这里只抄自己想到的几个字段，
+ * `contextWindowKnown` 被静默丢掉 —— 多账号时每个 id 都要过一次这条函数，卡片的
+ * 「上下文」整列就成了「—」，而上游其实给了值。以后新增可选字段不用再记得改这里。
+ */
 function richerModel(current: CodeArtsModelInfo, next: CodeArtsModelInfo): CodeArtsModelInfo {
   const benefit = current.benefit === true || next.benefit === true
   const keep = richerThan(next, current) ? next : current
   const drop = keep === next ? current : next
   const ratio = keep.ratio ?? drop.ratio
   const thinking = keep.thinking ?? drop.thinking
-  return {
+  // 上下文窗口取自哪一条，「上游真给的」标记就跟着哪一条，两者不能分家。
+  const ctxFrom = keep.contextWindow > 0 ? keep : drop
+  const merged: CodeArtsModelInfo = {
+    ...keep,
     id: keep.id,
     name: keep.name || drop.name || keep.id,
-    contextWindow: keep.contextWindow > 0 ? keep.contextWindow : drop.contextWindow,
+    contextWindow: ctxFrom.contextWindow,
     maxTokens: keep.maxTokens > 0 ? keep.maxTokens : drop.maxTokens,
     supportsImages: keep.supportsImages || drop.supportsImages,
     ...(ratio === undefined ? {} : { ratio }),
     ...(thinking === undefined ? {} : { thinking }),
     ...(benefit ? { benefit: true } : {}),
   }
+  if (ctxFrom.contextWindowKnown === true) merged.contextWindowKnown = true
+  else delete merged.contextWindowKnown
+  return merged
 }
 
-/** a 是否比 b 更值得保留：优先带参数，其次保留大小写更「像注册名」的一条。 */
+/** a 是否比 b 更值得保留：先认「上游真给的上下文窗口」，再比参数，最后比大小写。 */
 function richerThan(a: CodeArtsModelInfo, b: CodeArtsModelInfo): boolean {
+  // 跨账号合并时两边的 contextWindow 都 >0（没给的那条被兜底成 32768，见 upstream.ts
+  // 的 UNKNOWN_CONTEXT_WINDOW），只比大小分不出谁可信 —— 真值 1M 会被兜底值换掉，
+  // 而 shim 拿这个数算上下文预算。
+  const aKnown = a.contextWindowKnown === true
+  const bKnown = b.contextWindowKnown === true
+  if (aKnown !== bKnown) return aKnown
   if ((a.contextWindow > 0) !== (b.contextWindow > 0)) return a.contextWindow > 0
   if ((a.maxTokens > 0) !== (b.maxTokens > 0)) return a.maxTokens > 0
   return a.id !== a.id.toLowerCase() && b.id === b.id.toLowerCase()

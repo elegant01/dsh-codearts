@@ -126,7 +126,10 @@ export interface CodeArtsSettingsKey {
   doctorHintDshHome: string
   doctorHintPiAi: string
   doctorHintOther: string
-  /** 趋势两张图的标题与悬停提示（近 7 天命中率 / 今天逐小时）。 */
+  /**
+   * 趋势两张图的标题与悬停提示（本月每日 / 今天逐小时）。
+   * 键名里的 Week 是历史遗留：那张图铺的是 `TREND_DAYS` = 35 天（5 周），不是 7 天。
+   */
   usageTrendWeek: string
   usageTrendHour: string
   usageTrendHint: string

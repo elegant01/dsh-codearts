@@ -333,11 +333,15 @@ export function apply(ctx: Context, rawConfig: Config): void {
   })
 
   // 动态模型发现：启动后拉一次真实目录，之后每小时刷新。失败只记日志 —— 目录保留
-  // 上一次的结果（冷启动时就是种子清单），不因为上游抖动把模型选择器清空。
+  // 上一次的结果，不因为上游抖动把模型选择器清空。冷启动时目录就是空的
+  // （`CodeArtsCatalog` 不拿历史名单冒充），所以下面那条快速重试是唯一的出路。
   const CATALOG_REFRESH_MS = 60 * 60 * 1000
-  // 目录还是空（启动/热重载后第一次发现正好撞上上游抖动）就每分钟重试，而不是干等
+  // 目录还是空（启动/热重载后第一次发现正好撞上上游抖动）就尽快重试，而不是干等
   // 一小时 —— 空目录期间每条消息都会死在 pi-ai 的 "has no configured model"。
+  // 但上游长期故障时不能按分钟硬刷：每一轮对**每个号**都要 list + resolve（可能续期）
+  // + 多路目录请求，越久不好刷得越凶，所以指数退避到 5 分钟封顶。
   const CATALOG_EMPTY_RETRY_MS = 60 * 1000
+  const CATALOG_EMPTY_RETRY_MAX_MS = 5 * 60 * 1000
   const abort = new AbortController()
   const discover = async (): Promise<void> => {
     if (stopped) return
@@ -361,11 +365,20 @@ export function apply(ctx: Context, rawConfig: Config): void {
   }
 
   let discoveryTimer: ReturnType<typeof setTimeout> | undefined
-  /** 自我重排的发现循环：目录为空时加快到每分钟，有货后回到每小时。 */
+  /** 连续多少轮目录是空的（用来算退避）；一旦有货就归零。 */
+  let emptyStreak = 0
+  /** 自我重排的发现循环：目录为空时退避着重试（60s → 5min 封顶），有货后回到每小时。 */
   const discoverLoop = async (): Promise<void> => {
     await discover()
     if (stopped) return
-    const delay = catalog.current().length === 0 ? CATALOG_EMPTY_RETRY_MS : CATALOG_REFRESH_MS
+    let delay: number
+    if (catalog.current().length === 0) {
+      delay = Math.min(CATALOG_EMPTY_RETRY_MS * 2 ** emptyStreak, CATALOG_EMPTY_RETRY_MAX_MS)
+      emptyStreak += 1
+    } else {
+      emptyStreak = 0
+      delay = CATALOG_REFRESH_MS
+    }
     discoveryTimer = setTimeout(() => void discoverLoop(), delay)
     discoveryTimer.unref?.()
   }
@@ -383,7 +396,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
   void shim.ready
     .then(async () => {
       if (stopped) return
-      // 先让 provider 挂上（用种子目录即可服务），再异步换成真实清单。
+      // 先让 provider 挂上，再异步跑第一次发现 —— 目录是空起步的，模型要等这一轮填进来。
       void discoverLoop()
       // 版本不兼容时每条消息都会死在出网之前，所以要在这里说明白（卡片上也显示）。
       const incompatible = await probePiAiCompat()
