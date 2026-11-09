@@ -164,6 +164,81 @@ describe('sync', () => {
   })
 })
 
+describe('cap 窗口按实测自适应', () => {
+  function poolOne(start = 1_000_000): { pool: CodeArtsAccountPool; clockRef: { now: () => number; advance: (ms: number) => void } } {
+    const clockRef = clock(start)
+    return { pool: new CodeArtsAccountPool(['a', 'b'], { maxConcurrent: 1, now: clockRef.now }), clockRef }
+  }
+
+  // 52 秒是实测均值，不是每个号每次都一样；量到过就别再用固定 30 秒（窗口一过就
+  // 白打一次上游、再记一次 cap，而每次 cap 又把窗口重置成 30 秒，永远学不到）。
+  it('uses the measured release time for the next cap window', () => {
+    const { pool, clockRef } = poolOne()
+    pool.noteConcurrencyCap('a')
+    clockRef.advance(52_000)
+    pool.noteCapRelease('a')
+    expect(pool.get('a')?.capSamples).toEqual([52_000])
+
+    clockRef.advance(1)
+    pool.noteConcurrencyCap('a')
+    expect((pool.get('a')?.cappedUntil ?? 0) - clockRef.now()).toBe(52_000)
+  })
+
+  it('takes the median so one long sample cannot stretch the window', () => {
+    const { pool, clockRef } = poolOne()
+    for (const ms of [40_000, 52_000, 90_000]) {
+      pool.noteConcurrencyCap('a')
+      clockRef.advance(ms)
+      pool.noteCapRelease('a')
+    }
+    expect(pool.get('a')?.capSamples).toEqual([40_000, 52_000, 90_000])
+
+    clockRef.advance(1)
+    pool.noteConcurrencyCap('a')
+    expect((pool.get('a')?.cappedUntil ?? 0) - clockRef.now()).toBe(52_000)
+  })
+
+  // 脏样本必须丢：隔了 3 分钟才成功，说明那不是「排队等槽位」，量出来会把避让窗口
+  // 拉到几分钟，卡片长时间显示「避让中」，比固定 30 秒更糟。
+  it('drops samples outside the plausible range and falls back to the hint', () => {
+    const { pool, clockRef } = poolOne()
+    pool.noteConcurrencyCap('a')
+    clockRef.advance(200_000)
+    pool.noteCapRelease('a')
+    expect(pool.get('a')?.capSamples).toEqual([])
+    expect(pool.get('a')?.lastCapAt).toBe(0)
+
+    pool.noteConcurrencyCap('a')
+    expect((pool.get('a')?.cappedUntil ?? 0) - clockRef.now()).toBe(CAPPED_HINT_MS)
+
+    // 太短的也不算：那一刻就成功说明槽位本来就没被这次请求占住。
+    pool.noteConcurrencyCap('b')
+    clockRef.advance(1_000)
+    pool.noteCapRelease('b')
+    expect(pool.get('b')?.capSamples).toEqual([])
+  })
+
+  // 同一个号只允许一次排队样本，重复调用不能把同一段时间记两遍。
+  it('consumes the pending cap sample once', () => {
+    const { pool, clockRef } = poolOne()
+    pool.noteConcurrencyCap('a')
+    clockRef.advance(52_000)
+    pool.noteCapRelease('a')
+    pool.noteCapRelease('a')
+    expect(pool.get('a')?.capSamples).toEqual([52_000])
+  })
+
+  // 成功就是「槽位空了」的铁证：提示继续留着会让卡片把这个刚跑通的号显示成「避让中」。
+  it('clears the cap hint when the account just succeeded', () => {
+    const { pool, clockRef } = poolOne()
+    pool.noteConcurrencyCap('a')
+    expect(pool.get('a')?.cappedUntil).toBeGreaterThan(clockRef.now())
+    pool.noteSuccess('a')
+    expect(pool.get('a')?.cappedUntil).toBe(0)
+    expect(pool.get('a')?.lastCapAt).toBe(0)
+  })
+})
+
 describe('paused and pinned', () => {
   it('never picks a paused account', () => {
     const pool = poolOf(['a', 'b'])

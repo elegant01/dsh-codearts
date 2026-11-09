@@ -21,8 +21,23 @@ export const DEFAULT_MAX_CONCURRENT = 2
  * 这不是冷却：账号本身没坏，只是它的会话槽位暂时满了（约 52 秒才释放）。
  * 所以只是一个「倾向」——池里还有别的账号就先换一个；全都这样时照样会选它，
  * 因为排队等它总比直接失败强。
+ *
+ * 这里只是**默认值**：每个号的真实释放时长不一样（52 秒是实测均值，不是常数），
+ * 一旦量到过就不再用它 —— 见 `noteCapRelease` 与 `capHintFor`。以前固定 30 秒比
+ * 实测短 20 多秒，窗口一过这个号又变成优先候选，于是白打一次上游、再记一次 cap，
+ * 而每次 cap 又把窗口重置成同样的 30 秒，永远学不到真实时长。
  */
 export const CAPPED_HINT_MS = 30_000
+/** 实测样本的下界：比这还短说明量的不是槽位释放（比如立刻就成功了）。 */
+const CAP_SAMPLE_MIN_MS = 5_000
+/**
+ * 实测样本的上界：比这还长说明样本不来自「同一请求内排队等槽位」。
+ * 脏样本（用户隔几分钟才再问一次）会把避让窗口拉到几分钟，卡片会长时间显示「避让中」，
+ * 比固定 30 秒更糟 —— 所以宁可丢掉。
+ */
+const CAP_SAMPLE_MAX_MS = 120_000
+/** 参与中位数的最近样本数。 */
+const CAP_SAMPLE_KEEP = 5
 
 /** 连续出错多少次后短时冷却。 */
 export const ERROR_THRESHOLD = 3
@@ -36,6 +51,10 @@ export interface AccountRuntime {
   coolUntil: number
   /** 撞上游并发上限后的「优先避开」截止时间。 */
   cappedUntil: number
+  /** 最近一次撞上限的时刻（0 = 没有待量的样本），用来在排队成功后量出释放时长。 */
+  lastCapAt: number
+  /** 实测到的槽位释放时长样本（毫秒，最近 `CAP_SAMPLE_KEEP` 个）。 */
+  capSamples: number[]
   disabled: boolean
   lastError?: string
   /** 上次被选中的时间，用于「最久未用优先」。 */
@@ -47,6 +66,21 @@ export interface PoolOptions {
   maxConcurrent?: number
   /** 可注入的时钟，便于测试。 */
   now?: () => number
+}
+
+/**
+ * 这个号的「优先避开」窗口：量到过就用实测中位数，没量过用默认提示。
+ *
+ * 取中位数而不是均值：一次被打断的请求可能让某个样本偏长，中位数不会被单点带跑。
+ */
+function capHintFor(account: AccountRuntime): number {
+  const samples = account.capSamples
+  if (samples.length === 0) return CAPPED_HINT_MS
+  const sorted = [...samples].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 1
+    ? (sorted[mid] ?? CAPPED_HINT_MS)
+    : Math.round(((sorted[mid - 1] ?? CAPPED_HINT_MS) + (sorted[mid] ?? CAPPED_HINT_MS)) / 2)
 }
 
 export class CodeArtsAccountPool {
@@ -78,6 +112,8 @@ export class CodeArtsAccountPool {
         maxConcurrent: this.maxConcurrent,
         coolUntil: 0,
         cappedUntil: 0,
+        lastCapAt: 0,
+        capSamples: [],
         disabled: false,
         lastUsed: 0,
         errorCount: 0,
@@ -164,7 +200,26 @@ export class CodeArtsAccountPool {
   noteConcurrencyCap(id: string): void {
     const account = this.accounts.get(id)
     if (account === undefined) return
-    account.cappedUntil = this.now() + CAPPED_HINT_MS
+    account.lastCapAt = this.now()
+    account.cappedUntil = this.now() + capHintFor(account)
+  }
+
+  /**
+   * 撞过上限、又在**同一个请求里**排队等到成功 —— 这就是这个号槽位释放的实测时长。
+   *
+   * 只在兜底排队那条路上调用：主循环里普通成功不能当样本，那样量到的是「用户下一次
+   * 提问隔了多久」（常常是几分钟），窗口会被拉到几分钟，比固定 30 秒更糟。
+   */
+  noteCapRelease(id: string): void {
+    const account = this.accounts.get(id)
+    if (account === undefined) return
+    const cappedAt = account.lastCapAt
+    account.lastCapAt = 0
+    if (cappedAt === 0) return
+    const sample = this.now() - cappedAt
+    if (sample < CAP_SAMPLE_MIN_MS || sample > CAP_SAMPLE_MAX_MS) return
+    account.capSamples.push(sample)
+    if (account.capSamples.length > CAP_SAMPLE_KEEP) account.capSamples.shift()
   }
 
   /** 凭据失效等硬错误：直接停用，等用户重新登录。 */
@@ -188,6 +243,7 @@ export class CodeArtsAccountPool {
     account.disabled = false
     account.coolUntil = 0
     account.cappedUntil = 0
+    account.lastCapAt = 0
     account.errorCount = 0
     account.lastError = undefined
   }
@@ -218,6 +274,10 @@ export class CodeArtsAccountPool {
     account.errorCount = 0
     account.coolUntil = 0
     account.lastError = undefined
+    // 成功本身就是「这个号的槽位空了」的铁证：避让提示继续留着，卡片会把这个刚跑通的号
+    // 显示成「避让中」（web-status 那句 avoiding it for ~Ns），纯属假状态。
+    account.cappedUntil = 0
+    account.lastCapAt = 0
   }
 
   /** 有没有任何账号可用（含被撞上限提示的）。 */

@@ -680,6 +680,10 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
               return
             }
             if (result.ok) {
+              // 先量样本再复位：noteSuccess 会把 lastCapAt 清零。
+              // 这一条是「撞上限后在同一请求里排队等到槽位」，正好是这个号释放槽位的
+              // 实测时长；主循环里的普通成功不能当这个样本（见 pool.noteCapRelease）。
+              pool.noteCapRelease(queueAccount)
               pool.noteSuccess(queueAccount)
               await pipeToResponse(res, result.stream, controller.signal, { accountId: queueAccount, model: opened.prepared.model, startedAt: requestStartedAt }, opened.head)
               return
