@@ -166,8 +166,23 @@
   flex: none;
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 6px;
+}
+
+/* 「启用」开关：和按钮同排，关闭即暂停（不参与轮转）。 */
+.accountToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.accountToggleLabel {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 20px;
+  white-space: nowrap;
 }
 
 .accountHint {

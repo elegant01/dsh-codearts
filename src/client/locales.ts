@@ -100,8 +100,8 @@ export interface CodeArtsSettingsKey {
   /** 账号暂停/置顶。 */
   accountPaused: string
   accountPinned: string
-  accountPause: string
-  accountResume: string
+  /** 「启用」开关的标签：关掉即暂停，不参与轮转。 */
+  accountEnabled: string
   accountPin: string
   accountUnpin: string
   accountToday: string
@@ -297,8 +297,7 @@ export const zh: CodeArtsSettingsKey = {
   modelSpecTitle: '上游返回的上下文窗口 {context} token，最大输出 {output} token',
   accountPaused: '已暂停',
   accountPinned: '已置顶',
-  accountPause: '暂停',
-  accountResume: '恢复',
+  accountEnabled: '启用',
   accountPin: '置顶',
   accountUnpin: '取消置顶',
   accountToday: '今日 {n} 次 · 失败 {failed}',
@@ -485,8 +484,7 @@ export const en: CodeArtsSettingsKey = {
   modelSpecTitle: 'Context window {context} tokens, max output {output} tokens reported upstream',
   accountPaused: 'Paused',
   accountPinned: 'Pinned',
-  accountPause: 'Pause',
-  accountResume: 'Resume',
+  accountEnabled: 'Enabled',
   accountPin: 'Pin',
   accountUnpin: 'Unpin',
   accountToday: 'Today {n} · {failed} failed',

@@ -8,6 +8,8 @@ declare const styles: {
   readonly "accountNameRow": string
   readonly "accountRow": string
   readonly "accountRowActions": string
+  readonly "accountToggle": string
+  readonly "accountToggleLabel": string
   readonly "accountToolbar": string
   readonly "actions": string
   readonly "area": string

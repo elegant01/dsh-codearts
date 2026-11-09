@@ -1,5 +1,5 @@
 import { useEffect, useId, useState } from 'react'
-import { Button, Checkbox, Input, SegmentedTabs, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Checkbox, Input, SegmentedTabs, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SegmentedTab, StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
   CodeArtsDoctorReport,
@@ -1587,17 +1587,19 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                           </div>
                           <div className={styles.accountRowActions}>
                             {/*
-                              暂停 ≠ 删除：凭证留着，只是不参与轮转。适合「这个号今天额度
-                              用完/想留着专用」这种临时状态，不用重新登录一次。
+                              启用 = 参与轮转。关掉就是暂停：凭证留着，不删号也不用
+                              重新登录 —— 以前这里是一个「暂停/恢复」按钮，状态要靠
+                              按钮文案反推；换成开关后，开着的就是能接活的号。
                             */}
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={busy || loginPending || flagBusy === account.id}
-                              onClick={() => void setAccountFlag(account.id, { paused: !account.paused })}
-                            >
-                              {account.paused ? t('accountResume') : t('accountPause')}
-                            </Button>
+                            <span className={styles.accountToggle}>
+                              <span className={styles.accountToggleLabel}>{t('accountEnabled')}</span>
+                              <Switch
+                                checked={!account.paused}
+                                disabled={busy || loginPending || flagBusy === account.id}
+                                label={`${accountName(account)} ${t('accountEnabled')}`}
+                                onChange={next => void setAccountFlag(account.id, { paused: !next })}
+                              />
+                            </span>
                             <Button
                               variant="outline"
                               size="sm"
