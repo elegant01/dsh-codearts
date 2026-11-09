@@ -10,6 +10,7 @@ import type {
 } from '../web-status.ts'
 import { stripModelSuffixes } from '../catalog.ts'
 import { setSidebarPanelWanted } from './panel-switch.ts'
+import { latencyP95Label } from './latency-label.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
 export interface CodeArtsPluginCardInjected {
@@ -845,9 +846,7 @@ function UsageSection({
             </div>
             <div className={styles.statCard}>
               <span className={styles.statLabel}>{t('usageStatLatency')}</span>
-              <span className={styles.statValue}>
-                {latency.p95 === undefined ? '—' : latency.overflow ? '>30 s' : `${formatCount(latency.p95)} ms`}
-              </span>
+              <span className={styles.statValue}>{latencyP95Label(latency)}</span>
               <span className={styles.statSub}>
                 {latency.p50 === undefined
                   ? t('usageStatLatencyEmpty')
