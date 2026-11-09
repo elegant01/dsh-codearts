@@ -13,6 +13,18 @@ import { clearModelUnavailable, modelUnavailableReason } from '../src/catalog.ts
 const TOKEN_A = 'token-account-a'
 const TOKEN_B = 'token-account-b'
 
+/** 账号 id → token。A/B 保留原来的常量名，其余按 id 生成，供 5 号以上的用例区分账号。 */
+function tokenOf(id: string): string {
+  if (id === 'A') return TOKEN_A
+  if (id === 'B') return TOKEN_B
+  return `token-account-${id.toLowerCase()}`
+}
+
+function idOfToken(token: string): string {
+  const suffix = token.replace('token-account-', '')
+  return suffix === '' ? token : suffix.toUpperCase()
+}
+
 /** 上游的并发上限错误（HTTP 400 + TM.00001041）。 */
 const CAP_BODY = JSON.stringify({
   error_code: 'TM.00001041',
@@ -106,21 +118,42 @@ let ids: string[]
 let seenTokens: string[]
 
 function credentialFor(id: string): { token: string; accessKeyId: string; secretAccessKey: string; securityToken: string } {
-  return { token: id === 'A' ? TOKEN_A : TOKEN_B, accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }
+  return { token: tokenOf(id), accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }
 }
 
 /**
  * 假上游。账号 A 默认**永远**回并发上限（用户打断后那个账号的处境）；
- * `capOnce` 让 A 只被拒第一次、之后放行，用来测单账号的原地重试兜底。
+ * `capTimes` 让 A 只被拒前 N 次、之后放行，用来测单账号的原地重试兜底。
  * 账号 B 永远正常。
+ *
+ * 给了 `capIds` / `capOnceIds` 时按账号指定：前者永远拒，后者只拒第一次。
+ * 多号用例靠它们把 A/B 之外的号也做成「撞上限」。
  */
-function stubUpstream(options: { capTimes?: number; tpmTimes?: number } = {}): void {
+function stubUpstream(options: {
+  capTimes?: number
+  tpmTimes?: number
+  capIds?: string[]
+  capOnceIds?: string[]
+} = {}): void {
   let aCalls = 0
   const capTimes = options.capTimes ?? (options.tpmTimes === undefined ? Number.POSITIVE_INFINITY : 0)
   const tpmTimes = options.tpmTimes ?? 0
+  const capIds = new Set(options.capIds ?? [])
+  const capOnceIds = new Set(options.capOnceIds ?? [])
+  const callsByToken = new Map<string, number>()
+  const byId = capIds.size > 0 || capOnceIds.size > 0
   vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { headers?: unknown }) => {
     const token = authTokenOf(init)
     seenTokens.push(token)
+    if (byId) {
+      const calls = (callsByToken.get(token) ?? 0) + 1
+      callsByToken.set(token, calls)
+      const id = idOfToken(token)
+      if (capIds.has(id) || (capOnceIds.has(id) && calls === 1)) {
+        return new Response(CAP_BODY, { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      return sseResponse(OK_CHUNKS)
+    }
     if (token === TOKEN_A) {
       aCalls += 1
       if (aCalls <= tpmTimes) return sseResponse([TPM_FRAME])
@@ -132,7 +165,10 @@ function stubUpstream(options: { capTimes?: number; tpmTimes?: number } = {}): v
   }))
 }
 
-async function start(accountIds: string[], options: { capTimes?: number; tpmTimes?: number } = {}): Promise<void> {
+async function start(
+  accountIds: string[],
+  options: { capTimes?: number; tpmTimes?: number; capIds?: string[]; capOnceIds?: string[] } = {},
+): Promise<void> {
   ids = accountIds
   seenTokens = []
   stubUpstream(options)
@@ -171,6 +207,31 @@ describe('cross-account failover', () => {
     expect(res.text).toContain('来自 B')
     // A 试过、被拒，然后换 B —— 两个账号都用到了。
     expect(seenTokens).toEqual([TOKEN_A, TOKEN_B])
+  })
+
+  // 轮换次数跟着账号数走（clamp(账号数, 3, 6)）：前三个都满时，第四个空着也必须轮到，
+  // 否则请求会落到「原地排队等 52 秒」那根稻草上 —— 那 52 秒本来能绕开。
+  it('reaches a fourth account when the first three all report the cap', async () => {
+    await start(['A', 'B', 'C', 'D', 'E'], { capIds: ['A', 'B', 'C'] })
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(200)
+    expect(seenTokens).toEqual([TOKEN_A, TOKEN_B, tokenOf('C'), tokenOf('D')])
+  })
+
+  // 上界是 6：第 7 个号这一轮不试（留给下一次请求，LRU 会把它排到前面），
+  // 剩下的成本只有兜底那一次原地重发。
+  it('tries at most six accounts in one request and then queues on the last capped one', async () => {
+    await start(['A', 'B', 'C', 'D', 'E', 'F', 'G'], { capOnceIds: ['A', 'B', 'C', 'D', 'E', 'F'] })
+    const started = Date.now()
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(200)
+    expect(seenTokens.slice(0, 6)).toEqual([TOKEN_A, TOKEN_B, tokenOf('C'), tokenOf('D'), tokenOf('E'), tokenOf('F')])
+    expect(seenTokens).not.toContain(tokenOf('G'))
+    // 兜底回到 F：它第二次就放行，所以这里不该出现 75 秒的排队等待。
+    expect(seenTokens[6]).toBe(tokenOf('F'))
+    expect(Date.now() - started).toBeLessThan(5_000)
   })
 
   it('remembers which account was capped so the next request prefers the other one', async () => {

@@ -166,11 +166,25 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   })
 }
 
-/** 一次请求最多试几个账号（与 Go 参考的 MaxRotate 一致）。 */
-const MAX_ROTATE = 3/** 一次请求最多把 max_tokens 降几档（65536 → 32768 → 16384 → 8192）。 */
+/** 一次请求最多把 max_tokens 降几档（65536 → 32768 → 16384 → 8192）。 */
 const MAX_CEILING_HEALS = 3
 /**
- * 所有账号都撞上并发上限时，回落到「在同一账号上原地重发」的预算。
+ * 一次请求最多试几个账号：clamp(可用账号数, ROTATE_MIN_ATTEMPTS, ROTATE_MAX_ATTEMPTS)。
+ *
+ * 原来固定试 3 个（与 Go 参考的 MaxRotate 一致）。多号才是这个插件的核心场景：
+ * 5 个号时前 3 个在这一轮里都新报了并发上限，第 4 个明明空着也轮不到，只能落到
+ * 下面那根「原地排队等 52 秒」的稻草上 —— 那 52 秒本来是可以绕开的。
+ *
+ * 上界 6 只是次数天花板，真正的刹车是 CAP_WAIT_LIMIT 那个共用截止点：每次尝试都要
+ * 挂号 + 开一次流，号再多也不能无限试下去。
+ */
+const ROTATE_MIN_ATTEMPTS = 3
+const ROTATE_MAX_ATTEMPTS = 6
+/** 开始下一次尝试前必须留下的预算：一次挂号最多等这么久。 */
+const ATTEMPT_RESERVE_MS = 20_000
+/**
+ * 一次请求在「换号轮换 + 回落到同一账号原地重发」上总共能花的墙上时间，从进入
+ * 轮换起算，两段共用一个截止点。
  *
  * 2026-09-30 实测：一个上游会话要 ~52s 才被释放，而且**中途打断并不减免** ——
  * 只跑了 98ms 就中止的请求，同样占满一个名额 52s。所以用户「打断 → 马上重问」
@@ -178,7 +192,8 @@ const MAX_CEILING_HEALS = 3
  * 稻草，必须盖过 52s，否则用户看到的不是「稍等一下」而是直接失败。
  *
  * 上限受 pi-ai 的 90s idle 超时约束：等待期间我们发不出任何内容，超过 90s 用户
- * 看到的就是超时。75s 给 52s 留了余量，也还在 90s 之内。
+ * 看到的就是超时。75s 给 52s 留了余量，也还在 90s 之内。以前这个预算只归兜底那一段
+ * 自己，轮换花掉的时间是额外加的，多号最坏能顶穿 90s —— 所以现在是共用截止点。
  */
 const CAP_WAIT_LIMIT = 75_000
 const CAP_RETRY_GAP = 3_000
@@ -427,6 +442,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   /**
    * 在**同一个账号**上重发，直到不再被限流或预算耗尽。
    *
+   * `untilAt` 由调用方给：它和前面的换号轮换是同一个截止点，不是这段自己重新起算，
+   * 否则两段各自 75s 会顶穿宿主的 90s 流空闲超时。
+   *
    * 并发槽位是账号级的：有别的号就该换号，等 52s 是最后手段。
    * TPM 是模型级配额：换号只是换个账号撞同一堵墙，只能原地等窗口滑过去 ——
    * 间隔逐次翻倍（3s → 6s → 12s → 24s，封顶 30s），避免在配额已经满的时候
@@ -439,9 +457,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     raw: string,
     contextWindow: number,
     signal: AbortSignal,
+    untilAt: number,
   ): Promise<{ prepared: PreparedChatBody; result: ChatResult; head?: Uint8Array; waitedMs: number }> {
     const started = Date.now()
-    const until = started + CAP_WAIT_LIMIT
     let gap = CAP_RETRY_GAP
     for (;;) {
       const opened = await openWithCeilingHeal(credential, raw, contextWindow, signal)
@@ -449,7 +467,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       if (opened.result.ok || signal.aborted) return { ...opened, waitedMs }
       if (!isQueueableRate(opened.result)) return { ...opened, waitedMs }
       if (isTpmLimit(opened.result)) gap = Math.min(gap * 2, 30_000)
-      if (Date.now() + gap > until) return { ...opened, waitedMs }
+      if (Date.now() + gap > untilAt) return { ...opened, waitedMs }
       await sleep(gap)
     }
   }
@@ -536,7 +554,14 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     let lastStatus = 0
     let lastMessage = ''
 
-    for (let attempt = 0; attempt < MAX_ROTATE; attempt += 1) {
+    // 轮换与下面的兜底排队共用这一个截止点。
+    const rotateDeadline = Date.now() + CAP_WAIT_LIMIT
+    const attempts = Math.min(Math.max(ids.length, ROTATE_MIN_ATTEMPTS), ROTATE_MAX_ATTEMPTS)
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      // 剩下的预算还得够过一次挂号（queue.ts 的 maxWaitMs 默认 20 秒），否则这一试
+      // 自己就会把截止点拖过去，比直接报错更糟。
+      if (Date.now() + ATTEMPT_RESERVE_MS > rotateDeadline) break
       const id = pool.pick(tried)
       if (id === undefined) break
       tried.add(id)
@@ -634,8 +659,10 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
 
     if (controller.signal.aborted) return
 
-    // 所有账号都撞在上限上：回到单账号时代的做法 —— 挑一个号原地排队等限流解除。
-    // 多账号时走不到这里；单账号时这是唯一的兜底。
+    // 所有账号都撞在上限上：挑一个号原地排队等限流解除。单号时这是唯一的兜底；
+    // 号超过尝试次数（>6）时剩下的号这一轮没被碰过，也是走这里排队 —— 那部分靠
+    // LRU 在请求之间轮转覆盖（acquire 会推 lastUsed）。
+    // 截止点跟轮换共用，所以前面耗掉的时间会从这里的等待里扣掉。
     const queueAccount = cappedAccount ?? tpmAccount
     if (queueAccount !== undefined) {
       if (pool.acquire(queueAccount)) {
@@ -644,7 +671,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         try {
           const credential = await store.resolve(queueAccount)
           if (credential !== undefined) {
-            const opened = await openStream(credential, raw, contextWindow, controller.signal)
+            const opened = await openStream(credential, raw, contextWindow, controller.signal, rotateDeadline)
             const { result } = opened
             queueWaitedMs = opened.waitedMs
             // 同上：客户端主动中止不算账号故障，不要拿它去回写池状态。
