@@ -15,7 +15,7 @@
   height: 100%;
   min-height: 0;
   overflow: auto;
-  padding: calc(28px + var(--dsh-frame-top-clearance, 0px)) clamp(24px, 4vw, 48px) 48px;
+  padding: calc(28px + var(--dsh-frame-top-clearance, 0px)) clamp(16px, 2vw, 24px) 48px;
   color: var(--dsw-alias-label-primary);
 }
 
@@ -24,8 +24,7 @@
   flex-direction: column;
   gap: 6px;
   width: 100%;
-  max-width: 860px;
-  margin: 0 auto;
+  margin: 0;
 }
 
 .back {
@@ -80,8 +79,16 @@
 
 .body {
   width: 100%;
-  max-width: 860px;
-  margin: 20px auto 0;
+  margin: 20px 0 0;
+}
+
+/*
+ * 卡片自己带 max-width: 720px（设置页里宿主给的列就差不多这个宽，正好），但整页
+ * 模式下中间列比它宽得多，照搬就会在右边留一大片空。这里是整页，让它铺满可用宽度。
+ */
+.body > div {
+  width: 100%;
+  max-width: none;
 }
 
 /* 侧边栏按钮里那个 glyph：宿主在 currentColor 主题格里渲染，尺寸由 size 决定。 */

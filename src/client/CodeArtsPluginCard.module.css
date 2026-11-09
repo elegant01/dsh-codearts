@@ -12,7 +12,14 @@
   border: 0.5px solid var(--dsw-alias-settings-card-stroke);
   border-radius: var(--dsw-radius-lg);
   background: var(--dsw-alias-settings-card-fill);
-  max-width: 720px;
+  /*
+   * 以前这里写死 max-width: 720px —— 设置页的列差不多就这么宽，看不出问题；但宿主的
+   * 插件详情页给的是整列宽度，720 一卡，右边就空出一大片，看着像「卡片缩水了」。
+   * 宽度交给父容器决定，卡片自己只负责描边和底色。
+   */
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
 }
 
 .header {
@@ -638,10 +645,17 @@
   color: #ffffff;
 }
 
-/* 今天：不画边框（会被读成「选中」或者脏边），只在底下压一条同色短线 + 加粗。 */
+/* 今天：不画边框（会被读成「选中」或者脏边），只在底下压一条短线 + 加粗。
+   这条线不能跟着字色走 —— lv1~lv3 的字色是近黑（#0f1115），压出来就是一条黑边，
+   在浅绿格子上尤其刺眼。所以按格子深浅分两档：浅底用深绿，深底用白。 */
 .heatCell[data-today='true'] {
-  box-shadow: inset 0 -2px 0 0 currentColor;
+  box-shadow: inset 0 -2px 0 0 var(--heat-today-mark, #16a34a);
   font-weight: 700;
+}
+
+.heatCell[data-today='true'][data-tone='lv4'],
+.heatCell[data-today='true'][data-tone='lv5'] {
+  --heat-today-mark: #ffffff;
 }
 
 /* 今天逐小时：一行 24 格，同一套绿阶。 */
