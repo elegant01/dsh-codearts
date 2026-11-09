@@ -3,6 +3,20 @@
 本文件记录本插件的重要改动。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.13] - 2026-11-09
+
+### 修复
+
+- **带图的请求不再被误判「上下文放不下」**：图片在请求里是 `data:image/...;base64,...`
+  字面量，旧的估算按字符数折算，一张 400 KB 的 A4 页渲染图会被算成十几万 token
+  （真实视觉编码器只要一两千），8 张图就能把 1M 窗口假性撑爆，上游一次请求都没发出，
+  用户只看到「请新建会话」。现在图片按像素面积估：只读图片头（PNG IHDR / JPEG SOF /
+  GIF）拿宽高，按 28×28 块折算并钳在 85~8000，读不出尺寸时退回 1600；文本仍按原规则，
+  `role` / `tool_calls` 等结构化字段也照旧。感谢 [@rachel1028-blip](https://github.com/rachel1028-blip)
+  的 [PR #6](https://github.com/elegant01/dsh-codearts/pull/6)。
+- **`pnpm build` 在含空格的路径下不再挂**：`scripts/wrap-client.mjs` 改用
+  `fileURLToPath` 取路径，工作目录里的空格不会再被编码成 `%20` 让最后一步找不到产物。
+
 ## [1.2.12] - 2026-11-09
 
 ### 变更
