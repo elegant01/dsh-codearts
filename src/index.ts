@@ -36,7 +36,7 @@ import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { probePiAiCompat } from './pi-ai-compat.ts'
 import { createCodeArtsShim, recentRequestShapes, recentUsageShapes } from './shim.ts'
 import { registerCodeArtsStatusRoute, summarizeClaims } from './web-status.ts'
-import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult, CodeArtsDockFlags } from './web-status.ts'
+import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult, CodeArtsClaimResult, CodeArtsDockFlags } from './web-status.ts'
 import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
 
 export { CODEARTS_PROVIDER, createCodeArtsAdapter, type CodeArtsAdapter } from './adapter.ts'
@@ -111,6 +111,21 @@ export interface Config {
    * 而「设置 → 插件」里本来就能看到同一张卡片，所以这一格交给用户自己决定要不要。
    */
   showSidebarPanel?: boolean
+  /**
+   * 对话底部的「Model 模型 · x 倍率 · 排队」这几段是否显示。缺省 = 显示。
+   *
+   * 只管 **Model 及其右侧**：`Provider CodeArts` 是插件的身份标识，永远显示，
+   * 不受这个开关控制。关掉之后那一行是 `积分 24,091 · Provider CodeArts`。
+   */
+  showModelDetailDock?: boolean
+  /**
+   * 后台自动领取每日签到积分（多账号逐个领）。缺省 = **关**。
+   *
+   * 缺省关的理由不是"收益小"，而是：这个开关会在用户看不见的时候动他的账号余额，
+   * 默认替他打开不合适。打开后每次启动 30 秒试一轮，领不到再退避重试（最多 3 次），
+   * 结果会留在卡片上给用户看。
+   */
+  autoClaim?: boolean
 }
 
 interface VolatileValue<T> {
@@ -136,6 +151,8 @@ export const Config: z<Config> = z.object({
   showCreditDock: z.boolean().default(true).description('Show the remaining-credits line under the chat input box').volatile(),
   showQueueDock: z.boolean().default(true).description('Show the upstream queue position under the chat input box').volatile(),
   showSidebarPanel: z.boolean().default(false).description('Show a CodeArts icon in the DSH sidebar icon column, opening this page in the middle column').volatile(),
+  showModelDetailDock: z.boolean().default(true).description('Show "Model … · x ratio" on the line under the chat input box (Provider CodeArts always shows)').volatile(),
+  autoClaim: z.boolean().default(false).description('Automatically claim the daily sign-in credits for every signed-in account').volatile(),
 }) as unknown as z<Config>
 
 function settingsCompatNamespace(ctx: Context): SettingsNamespace {
@@ -158,6 +175,12 @@ export function apply(ctx: Context, rawConfig: Config): void {
 
   /** /status 是卡片与对话底部都会轮询的接口，积分慢请求不能把它拖成转圈。 */
   const CREDIT_TIMEOUT_MS = 8_000
+
+  /**
+   * 领取签到积分的单号预算。福利中心偶尔很慢（要拉活动列表再认领），给足 20 秒，
+   * 但必须有个上限：自动领取是在后台跑的，卡死的请求会把这个号的后续重试全堵住。
+   */
+  const CLAIM_TIMEOUT_MS = 20_000
 
   /**
    * 拉一次积分（每个账号各自一份）。
@@ -205,10 +228,13 @@ export function apply(ctx: Context, rawConfig: Config): void {
 
   // 缺省即显示：老配置没这两个键时不该把已经用惯的那一行变没。
   // 侧边栏入口相反 —— 缺省关闭，没写过就是不要。
+  // `modelDetail` 缺省开（保持老版本的样子）；`autoClaim` 缺省关。
   const dock = (): CodeArtsDockFlags => ({
     credits: current().showCreditDock !== false,
     queue: current().showQueueDock !== false,
     sidebar: current().showSidebarPanel === true,
+    modelDetail: current().showModelDetailDock !== false,
+    autoClaim: current().autoClaim === true,
   })
 
   const setDock = async (patch: Partial<CodeArtsDockFlags>): Promise<boolean> => {
@@ -218,6 +244,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
       ...patch.credits === undefined ? {} : { showCreditDock: patch.credits },
       ...patch.queue === undefined ? {} : { showQueueDock: patch.queue },
       ...patch.sidebar === undefined ? {} : { showSidebarPanel: patch.sidebar },
+      ...patch.modelDetail === undefined ? {} : { showModelDetailDock: patch.modelDetail },
+      ...patch.autoClaim === undefined ? {} : { autoClaim: patch.autoClaim },
     })
     return true
   }
@@ -226,6 +254,77 @@ export function apply(ctx: Context, rawConfig: Config): void {
   // 卡片另外读账号池的槽位占用与用量账本：这两个都是本机事实，不涉及令牌。
   /** 手动「刷新模型列表」的预算：三路来源各打一次，比每小时的后台刷新更该给足时间。 */
   const MANUAL_REFRESH_MS = 60_000
+
+  /**
+   * 最近一次**自动**领取的结果，给卡片留痕用。
+   *
+   * 为什么要留痕：自动领取是在用户看不见的时候动他的账号余额。只做不说，用户只
+   * 会看到积分莫名其妙变多（或者没变），无从判断这个功能到底有没有在工作。
+   */
+  let lastAutoClaim: { at: number; claimed: boolean; state: string; amount: number; message: string } | undefined
+
+  /**
+   * 逐号领取每日签到积分。
+   *
+   * 手动「领取」按钮和后台自动领取走的是**同一条**路径，只是入口不同：领的是什么、
+   * 失败怎么归类、什么时候作废缓存，两处必须完全一致，否则「手动能领到、自动领不到」
+   * 这种差异排查起来极其费劲。
+   */
+  const claimAll = async (accountId?: string): Promise<CodeArtsClaimResult> => {
+    const ids = accountId === undefined ? await store.ids() : [accountId]
+    if (ids.length === 0) {
+      return { ok: false, claimed: false, state: 'failed', amount: 0, message: 'no usable credential' }
+    }
+    // 逐号串行领：签到是轻量操作，串行能避免同一时刻对福利中心打一串并发。
+    const results: CodeArtsClaimAccountResult[] = []
+    for (const id of ids) {
+      try {
+        const stored = await store.credential(id)
+        if (stored === undefined || stored.stale === true) {
+          results.push({
+            id,
+            ok: false,
+            claimed: false,
+            state: 'failed',
+            amount: 0,
+            message: stored === undefined ? 'account not found' : 'account needs sign-in',
+          })
+          continue
+        }
+        const resolved = await store.resolve(id)
+        if (resolved === undefined) {
+          results.push({ id, ok: false, claimed: false, state: 'failed', amount: 0, message: 'no usable credential' })
+          continue
+        }
+        // 应用内点「领取」拿的是福利中心的每日签到活动（/v1/ops/delivery + /v1/ops/claim），
+        // 不是 claimBenefit 那条限时福利免费模型渠道 —— 后者不发积分。
+        const outcome = await claimDailyWelfare(resolved, AbortSignal.timeout(CLAIM_TIMEOUT_MS))
+        if (outcome.state === 'claimed') {
+          // 余额真的变了，缓存必须丢掉，否则卡片下一次刷新还读旧的。
+          credits.invalidate(id)
+        }
+        results.push({
+          id,
+          ok: outcome.state !== 'failed',
+          claimed: outcome.state === 'claimed',
+          state: outcome.state,
+          amount: outcome.amount,
+          message: outcome.message,
+        })
+      } catch (error: unknown) {
+        results.push({
+          id,
+          ok: false,
+          claimed: false,
+          state: 'failed',
+          amount: 0,
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return summarizeClaims(results)
+  }
+
   ctx.inject(['webServer'], webCtx => registerCodeArtsStatusRoute(webCtx, {
     store,
     models: () => catalog.current(),
@@ -246,59 +345,17 @@ export function apply(ctx: Context, rawConfig: Config): void {
     },
     dock,
     setDock,
-    claim: async (accountId?: string) => {
-      const ids = accountId === undefined ? await store.ids() : [accountId]
-      if (ids.length === 0) {
-        return { ok: false, claimed: false, state: 'failed' as const, amount: 0, message: 'no usable credential' }
+    claim: claimAll,
+    autoClaim: async () => {
+      const outcome = await claimAll()
+      lastAutoClaim = {
+        at: Date.now(),
+        claimed: outcome.claimed,
+        state: outcome.state,
+        amount: outcome.amount,
+        message: outcome.message,
       }
-      // 逐号串行领：签到是轻量操作，串行能避免同一时刻对福利中心打一串并发。
-      const results: CodeArtsClaimAccountResult[] = []
-      for (const id of ids) {
-        try {
-          const stored = await store.credential(id)
-          if (stored === undefined || stored.stale === true) {
-            results.push({
-              id,
-              ok: false,
-              claimed: false,
-              state: 'failed',
-              amount: 0,
-              message: stored === undefined ? 'account not found' : 'account needs sign-in',
-            })
-            continue
-          }
-          const resolved = await store.resolve(id)
-          if (resolved === undefined) {
-            results.push({ id, ok: false, claimed: false, state: 'failed', amount: 0, message: 'no usable credential' })
-            continue
-          }
-          // 应用内点「领取」拿的是福利中心的每日签到活动（/v1/ops/delivery + /v1/ops/claim），
-          // 不是 claimBenefit 那条限时福利免费模型渠道 —— 后者不发积分。
-          const outcome = await claimDailyWelfare(resolved, AbortSignal.timeout(20_000))
-          if (outcome.state === 'claimed') {
-            // 余额真的变了，缓存必须丢掉，否则卡片下一次刷新还读旧的。
-            credits.invalidate(id)
-          }
-          results.push({
-            id,
-            ok: outcome.state !== 'failed',
-            claimed: outcome.state === 'claimed',
-            state: outcome.state,
-            amount: outcome.amount,
-            message: outcome.message,
-          })
-        } catch (error: unknown) {
-          results.push({
-            id,
-            ok: false,
-            claimed: false,
-            state: 'failed',
-            amount: 0,
-            message: error instanceof Error ? error.message : String(error),
-          })
-        }
-      }
-      return summarizeClaims(results)
+      return outcome
     },
     refreshModels: async () => {
       const outcome = await refreshCatalog(store, catalog, AbortSignal.timeout(MANUAL_REFRESH_MS))
@@ -317,9 +374,12 @@ export function apply(ctx: Context, rawConfig: Config): void {
   installSettingsSectionCompat(ctx, CODEARTS_SETTINGS_NS, Config, config, {
     setSource(source) {
       current = () => unwrapConfig(source())
+      // 开关一变就按新状态重排自动领取：打开了要立刻跟上，关掉了要立刻停手。
+      armAutoClaim()
     },
     onChange() {
-      // authFile had no analogue here; nothing else to react to for MVP.
+      // 设置项变化时同样重排（有些宿主的 setSource 不会因值变化重新触发）。
+      armAutoClaim()
     },
   })
 
@@ -387,6 +447,115 @@ export function apply(ctx: Context, rawConfig: Config): void {
     if (discoveryTimer !== undefined) clearTimeout(discoveryTimer)
   })
 
+  /**
+   * 凭证保活：每 20 分钟把所有「快过期」的账号提前续掉。
+   *
+   * 为什么必须有这个循环：上游签发的 token 有效期是固定的 2 小时（实测，见
+   * `auth.ts` 的 `REFRESH_SKEW_MS` 注释），而 `ensureFresh` 只在「有请求进来」时才被
+   * 触发。用户开着 DSH 却不聊天时没有任何请求，凭证就一路裸奔到过期 —— 表现就是
+   * 「隔天就要重新登录」。有了这个循环，只要 DSH 活着，凭证就不会真的到期。
+   *
+   * 间隔 20 分钟 + 续期阈值 30 分钟 = 剩 30 分钟以内一定会被扫到至少一次。
+   * 关掉 DSH 就无从保活（插件不在进程里），那部分只能靠下次启动时重新登录，
+   * 这是纯客户端方案的硬边界，卡片文案里必须讲明白。
+   */
+  const KEEP_ALIVE_INTERVAL_MS = 20 * 60 * 1000
+  let keepAliveTimer: ReturnType<typeof setTimeout> | undefined
+  const keepAliveLoop = async (): Promise<void> => {
+    if (stopped) return
+    try {
+      const outcome = await store.keepAlive()
+      if (outcome.refreshed > 0) {
+        ctx.logger.debug(`dsh-codearts: refreshed ${outcome.refreshed} credential(s) in the background`)
+      }
+      if (outcome.needsLogin.length > 0) {
+        ctx.logger.debug(`dsh-codearts: ${outcome.needsLogin.length} account(s) need a fresh sign-in`)
+      }
+    } catch (error: unknown) {
+      // 保活失败不能影响聊天：下一轮再试就是。
+      ctx.logger.debug('dsh-codearts: credential keep-alive failed; will retry', error)
+    }
+    if (stopped) return
+    keepAliveTimer = setTimeout(() => void keepAliveLoop(), KEEP_ALIVE_INTERVAL_MS)
+    keepAliveTimer.unref?.()
+  }
+
+  /**
+   * 自动领取每日签到积分。
+   *
+   * 节奏的取舍：上游按天去重（重复领返回 40001 → already），所以多领不会出事；
+   * 但也正因为幂等，**没必要**高频轮询 —— 单号一天只值 200 分，每 10 秒刷一次的
+   * 上行成本和风控风险都远大于收益。取「启动后 30 秒试一次 + 失败才退避重试
+   * （30 分钟一次、最多 3 次）」：装了就领到，领不到也不无限缠着上游。
+   *
+   * 终止条件：任意一轮里「有号真领到」或「所有号都是 already/unavailable」就停。
+   * 只有 genuinely 失败（网络、凭据异常）才值得再试。
+   */
+  const AUTO_CLAIM_FIRST_DELAY_MS = 30 * 1000
+  const AUTO_CLAIM_RETRY_MS = 30 * 60 * 1000
+  const AUTO_CLAIM_MAX_TRIES = 3
+  let autoClaimTimer: ReturnType<typeof setTimeout> | undefined
+  let autoClaimTries = 0
+  /** 自我重排的自动领取循环；开关关掉时直接不排下一轮，下次打开才重新开始。 */
+  const autoClaimLoop = async (): Promise<void> => {
+    if (stopped) return
+    if (!dock().autoClaim) {
+      // 开关关着：不排下一轮。用户中途打开时由设置变更路径重新拉起（见下方 onChange）。
+      autoClaimTimer = undefined
+      return
+    }
+    autoClaimTries += 1
+    let retry = false
+    try {
+      const outcome = await claimAll()
+      lastAutoClaim = {
+        at: Date.now(),
+        claimed: outcome.claimed,
+        state: outcome.state,
+        amount: outcome.amount,
+        message: outcome.message,
+      }
+      if (outcome.claimed) {
+        ctx.logger.debug(`dsh-codearts: auto-claimed daily credits (${outcome.amount})`)
+      } else if (outcome.state === 'failed') {
+        // 真失败（网络/凭据）才重试；already/unavailable 说明今天没什么可领的，别再缠上游。
+        retry = true
+      }
+    } catch (error: unknown) {
+      retry = true
+      ctx.logger.debug('dsh-codearts: auto-claim failed; will retry', error)
+    }
+    if (stopped) return
+    if (!retry || autoClaimTries >= AUTO_CLAIM_MAX_TRIES) {
+      autoClaimTimer = undefined
+      return
+    }
+    autoClaimTimer = setTimeout(() => void autoClaimLoop(), AUTO_CLAIM_RETRY_MS)
+    autoClaimTimer.unref?.()
+  }
+
+  /** 按当前开关状态（重新）拉起自动领取；开关关掉时把在等的定时器撤掉。 */
+  const armAutoClaim = (): void => {
+    if (stopped) return
+    if (!dock().autoClaim) {
+      if (autoClaimTimer !== undefined) clearTimeout(autoClaimTimer)
+      autoClaimTimer = undefined
+      autoClaimTries = 0
+      return
+    }
+    if (autoClaimTimer !== undefined) return
+    autoClaimTries = 0
+    autoClaimTimer = setTimeout(() => void autoClaimLoop(), AUTO_CLAIM_FIRST_DELAY_MS)
+    autoClaimTimer.unref?.()
+  }
+
+  // 上面两个循环都是自我重排的，必须在这里统一收口：插件停用时残留的定时器
+  // 会在 nextTick 里继续访问已卸载的 store。
+  ctx.effect(() => () => {
+    if (keepAliveTimer !== undefined) clearTimeout(keepAliveTimer)
+    if (autoClaimTimer !== undefined) clearTimeout(autoClaimTimer)
+  })
+
   // Build the loopback shim first; the adapter reads its origin at construction.
   const shim = createCodeArtsShim({ store, catalog, pool, usage, queue, logger: ctx.logger })
 
@@ -398,6 +567,10 @@ export function apply(ctx: Context, rawConfig: Config): void {
       if (stopped) return
       // 先让 provider 挂上，再异步跑第一次发现 —— 目录是空起步的，模型要等这一轮填进来。
       void discoverLoop()
+      // 凭证保活与自动领取跟模型发现一起起步：它们的首轮都带延迟（保活立即跑一次，
+      // 领取等 30 秒），不会和启动瞬间的目录请求抢上游。
+      void keepAliveLoop()
+      armAutoClaim()
       // 版本不兼容时每条消息都会死在出网之前，所以要在这里说明白（卡片上也显示）。
       const incompatible = await probePiAiCompat()
       if (incompatible !== undefined) ctx.logger.error(`dsh-codearts: ${incompatible}`)

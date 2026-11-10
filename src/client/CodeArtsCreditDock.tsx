@@ -22,7 +22,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactElement, type MouseEvent } from 'react'
 import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { CodeArtsDockFlags, CodeArtsWebStatus } from '../web-status.ts'
+import { DEFAULT_DOCK_FLAGS, type CodeArtsDockFlags, type CodeArtsWebStatus } from '../web-status.ts'
 import type { UsageTotals } from '../usage.ts'
 import { stripModelSuffixes } from '../catalog.ts'
 import { buildDockLine, DOCK_SEGMENT_SEPARATOR } from './dock-line.ts'
@@ -241,7 +241,7 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
    * 名字用 `stripModelSuffixes` 剥掉尾巴，倍率直接用服务端算好的 `ratio`。
    */
   const [modelInfo, setModelInfo] = useState<Record<string, { name: string; ratio?: string }>>({})
-  const [flags, setFlags] = useState<CodeArtsDockFlags>({ credits: true, queue: true, sidebar: false })
+  const [flags, setFlags] = useState<CodeArtsDockFlags>(DEFAULT_DOCK_FLAGS)
   const [queued, setQueued] = useState<QueueEntry | null>(null)
   const [anchor, setAnchor] = useState<Anchor | null>(null)
   /**
@@ -275,7 +275,7 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
       if (!res.ok) return
       const data = (await res.json().catch(() => undefined)) as CodeArtsWebStatus | undefined
       if (data === undefined || !mounted.current) return
-      setFlags(data.dock ?? { credits: true, queue: true, sidebar: false })
+      setFlags(data.dock ?? DEFAULT_DOCK_FLAGS)
       setRows(rowsOf(data))
       setModelInfo(Object.fromEntries((data.models ?? []).map(model => [model.id, {
         name: model.name,
@@ -416,6 +416,9 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
   const showCredits = flags.credits && remain !== null
   const showQueue = flags.queue && queued !== null
   // 工具行那个实例没有积分就什么都不画，别留一个零宽的 flex 子节点占位。
+  // 「Model 及其右侧」关掉时，输入框下方那行只剩 Provider CodeArts 一段 —— 和
+  // 「这一步没有可显示的东西」是两回事，所以这里不能连 provider 一起收掉，交给
+  // buildDockLine 决定画几段。
   if (zone === 'bar' && !showCredits) return null
 
   // 一行分段，与 dsh-codebuddy-cli 的底栏同构（`积分 1,642 · Provider CodeBuddy ·
@@ -443,7 +446,8 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
     ...zone === 'dock' && showQueue && queued !== null
       ? { queue: t('queueDock', { position: queued.position }) }
       : {},
-  }, t)
+  // 「Model 及其右侧」开关：只管 model/ratio/queue 三段，provider 永远在。
+  }, t, flags.modelDetail !== false)
 
   const fetchedAt = rows.reduce((latest, row) => Math.max(latest, row.fetchedAt ?? 0), 0)
   const lastUpdated = fetchedAt > 0 ? formatClock(fetchedAt) : ''

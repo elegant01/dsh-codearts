@@ -94,3 +94,41 @@ describe('对话底部那一行的分段', () => {
     expect(DOCK_SEGMENT_SEPARATOR).toBe(' · ')
   })
 })
+
+/**
+ * 「Model 及其右侧」开关：只收模型名、倍率、排队三段。
+ * `Provider CodeArts` 是插件的身份标识，**永远显示** —— 这是用户点名要的行为，
+ * 所以在这里钉死：哪怕开关关掉、哪怕积分也关掉，provider 这一段都不能消失。
+ */
+describe('Model 及其右侧的显隐', () => {
+  it('关掉之后只剩 Provider，整行是「积分 · Provider」', () => {
+    const line = buildDockLine({
+      credits: t('creditsDock', { remain: '24,091' }),
+      provider: 'CodeArts',
+      model: 'DeepSeek-V4.1-Flash-1017',
+      ratio: 'x0.18',
+      queue: t('queueDock', { position: 3 }),
+    }, t, false)
+    expect(line.credits).toBe('积分 24,091')
+    expect(line.rest).toBe('Provider CodeArts')
+    expect(visibleLine(line)).toBe('积分 24,091 · Provider CodeArts')
+  })
+
+  it('关掉之后连「未选择模型」也不印 —— 那一段属于被收掉的部分', () => {
+    expect(visibleLine(buildDockLine({ provider: 'CodeArts' }, t, false))).toBe('Provider CodeArts')
+  })
+
+  it('关掉之后排队段也一起收掉（它在 Model 的右边）', () => {
+    const line = buildDockLine({
+      provider: 'CodeArts',
+      model: 'GLM-5.3',
+      queue: t('queueDock', { position: 2 }),
+    }, t, false)
+    expect(line.rest.includes('排队')).toBe(false)
+  })
+
+  it('打开时与省略该参数完全一致', () => {
+    const parts = { provider: 'CodeArts', model: 'GLM-5.3', ratio: 'x0.79' }
+    expect(buildDockLine(parts, t, true)).toEqual(buildDockLine(parts, t))
+  })
+})

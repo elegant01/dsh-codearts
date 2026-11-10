@@ -165,8 +165,19 @@ async function claimIfPossible(cred: CodeArtsCredential): Promise<void> {
   }
 }
 
-/** 续期判定：距过期不足 5 分钟就去刷。 */
-const REFRESH_SKEW_MS = 5 * 60 * 1000
+/**
+ * 续期判定：距过期不足这个时长就去刷。
+ *
+ * 上游签发的 token 有效期是**固定的 2 小时**（实测 2026-11-10：落库 09:44:01、
+ * 过期 11:44:00），不会因为「一直在用」而顺延。所以「能连续十几天不用登录」
+ * 的前提是**总有人在过期前把它续掉**，一旦长时间没有请求进来（比如晚上关了 DSH
+ * 超过两小时），第二天必然过期 —— 表现就是「隔天就要重新登录」。
+ *
+ * 原先这里是 5 分钟，等于只在最后一刻才补救：进程稍一停顿、或者那 5 分钟里恰好
+ * 没有请求，这次续期窗口就整个错过了。放宽到 30 分钟，配合后台保活定时器
+ * （见 index.ts 的 keepAliveLoop），只要 DSH 开着就几乎不可能真的到期。
+ */
+const REFRESH_SKEW_MS = 30 * 60 * 1000
 
 export class CodeArtsCredentialStore {
   private _current: CodeArtsCredential | undefined
@@ -249,7 +260,7 @@ export class CodeArtsCredentialStore {
   }
 
   /**
-   * 自动续期：若距过期不足 5 分钟且具备 refresh 条件，则刷新并落库。
+   * 自动续期：若距过期不足 `REFRESH_SKEW_MS` 且具备 refresh 条件，则刷新并落库。
    * 返回当前（可能已刷新）凭证。
    */
   async ensureFresh(): Promise<CodeArtsCredential | undefined> {
@@ -263,7 +274,9 @@ export class CodeArtsCredentialStore {
     if (!cred) return undefined
     if (!cred.refreshToken || !cred.dpopPrivateKey || !cred.clientId) return cred
     const exp = cred.expiration ? Date.parse(cred.expiration) : NaN
-    const soon = Number.isNaN(exp) ? false : exp - Date.now() < 5 * 60 * 1000
+    // 这里必须走同一个 REFRESH_SKEW_MS：早先是硬编码的 5 分钟，和常量各自漂移，
+    // 改常量对这条路径不生效。
+    const soon = Number.isNaN(exp) ? false : exp - Date.now() < REFRESH_SKEW_MS
     if (!soon) return cred
     // 并发请求不能各刷一次：refresh_token 会轮换，后一次刷新会作废前一次刚拿到
     // 的 AK/SK。实测症状就是一串 "Incorrect IAM authentication" + 凭证被写脏。
@@ -811,5 +824,41 @@ export class CodeArtsAccountStore {
     if (slot === undefined) return undefined
     if (seenToken !== undefined && slot.credential.token !== seenToken) return slot.credential
     return slot.forceRefresh()
+  }
+
+  /**
+   * 后台保活：把所有**还能续**的账号过一遍 `ensureFresh`。
+   *
+   * 为什么需要它：`ensureFresh` 只会被「有请求进来」这条路径触发，而凭证有效期是
+   * 固定的 2 小时。用户开着 DSH 但不聊天时，没有任何请求 → 凭证裸奔到过期 → 下一次
+   * 发消息前必须先重新登录。定时调这里，只要 DSH 活着凭证就一直被续上。
+   *
+   * 只刷「距过期不足 `REFRESH_SKEW_MS`」的那些，刚从上游拿到的号不会被白刷一次：
+   * `refresh_token` 是一次性的，多余的刷新只会多一份失败风险。
+   * `stale` 的号（已确认必须重新登录）直接跳过——空转只会白烧请求。
+   */
+  async keepAlive(): Promise<{ checked: number; refreshed: number; needsLogin: string[] }> {
+    await this.loaded()
+    const needsLogin: string[] = []
+    let refreshed = 0
+    let checked = 0
+    for (const [id, slot] of this._slots) {
+      const before = slot.credential
+      if (before.stale === true) {
+        needsLogin.push(id)
+        continue
+      }
+      if (!before.refreshToken || !before.dpopPrivateKey || !before.clientId) continue
+      const exp = before.expiration ? Date.parse(before.expiration) : NaN
+      // 过期时间读不出来就别乱刷：宁可等真正要用的时候走 invalid_iam_token 兜底。
+      if (Number.isNaN(exp)) continue
+      // 还没进续期窗口：跳过，别为了「保活」无谓地轮换 refresh_token。
+      if (exp - Date.now() >= REFRESH_SKEW_MS) continue
+      checked += 1
+      const after = await slot.ensureFresh().catch(() => before)
+      if (after.token !== before.token) refreshed += 1
+      if (after.stale === true) needsLogin.push(id)
+    }
+    return { checked, refreshed, needsLogin }
   }
 }

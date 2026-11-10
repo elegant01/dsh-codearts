@@ -138,15 +138,21 @@ type CardTab = 'accounts' | 'models' | 'usage' | 'display'
 
 /** GET/POST /api/codearts/dock 的文档（后端契约见 web-status.ts 的 CodeArtsDockFlags）。 */
 interface DockDoc {
-  dock?: { credits: boolean; queue: boolean; sidebar?: boolean }
+  dock?: {
+    credits: boolean
+    queue: boolean
+    sidebar?: boolean
+    modelDetail?: boolean
+    autoClaim?: boolean
+  }
   writable?: boolean
 }
 
 /**
  * 开关的兜底值：后端没这条路由（老版本）时按「都显示」渲染，与原有行为一致。
- * 侧边栏那一格相反 —— 缺省关闭。
+ * 侧边栏那一格相反 —— 缺省关闭；自动领取也缺省关（不替用户动余额）。
  */
-const DOCK_DEFAULT = { credits: true, queue: true, sidebar: false }
+const DOCK_DEFAULT = { credits: true, queue: true, sidebar: false, modelDetail: true, autoClaim: false }
 
 /**
  * 上一次读到的状态。`/api/codearts/status` 会顺带去上游拉积分（有 TTL 缓存），
@@ -988,7 +994,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
    * 这里不像模型勾选那样攒草稿再点保存 —— 只有几个布尔，攒草稿反而让用户猜
    * 「我刚才那一下到底生效没有」。
    */
-  async function toggleDock(key: 'credits' | 'queue' | 'sidebar', on: boolean): Promise<void> {
+  async function toggleDock(key: 'credits' | 'queue' | 'sidebar' | 'modelDetail' | 'autoClaim', on: boolean): Promise<void> {
     const previous = dock
     setDock({ ...dock, [key]: on })
     setDockSaving(true)
@@ -1812,9 +1818,45 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                       label={t('displayQueueToggle')}
                     />
                   </div>
+                  {/*
+                    「Model 及其右侧」：只收模型名、倍率、排队这三段。`Provider CodeArts`
+                    是插件的身份标识，永远显示 —— 关掉之后那一行是
+                    `积分 24,091 · Provider CodeArts`。
+                  */}
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.modelDetail}
+                      disabled={!dockWritable || dockSaving}
+                      onChange={on => void toggleDock('modelDetail', on)}
+                      label={t('displayModelDetailToggle')}
+                    />
+                  </div>
                 </div>
                 {!dockWritable && <p className={styles.hint}>{t('displayNotWritable')}</p>}
                 {dockError !== null && <p className={styles.error}>{t('displayFailed', { message: dockError })}</p>}
+              </div>
+
+              {/*
+                自动领取单独一段：它不是「显不显示」，而是在后台动账号余额，所以要有
+                自己的说明（什么时候跑、失败怎么退避），并且默认关闭。
+              */}
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displayAutoClaimTitle')}</span>
+                </div>
+                <p className={styles.hint}>{t('displayAutoClaimHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.autoClaim}
+                      disabled={!dockWritable || dockSaving}
+                      onChange={on => void toggleDock('autoClaim', on)}
+                      label={t('displayAutoClaimToggle')}
+                    />
+                  </div>
+                </div>
               </div>
 
               {/*

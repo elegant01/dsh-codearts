@@ -227,17 +227,33 @@ export interface CodeArtsAccountCredits {
 export interface CodeArtsDockFlags {
   /** 剩余积分那一行。 */
   credits: boolean
-  /** 上游排队位置提示。 */
+  /** 上游排队位置提示（属于「Model 及其右侧」那一段，与 modelDetail 同进同退）。 */
   queue: boolean
   /** DSH 侧边栏里的 CodeArts 入口。 */
   sidebar: boolean
+  /**
+   * 「Model 及其右侧」（模型名、倍率、排队）。
+   *
+   * 只控制这一段：`Provider CodeArts` 是插件的身份标识，**常驻显示**，不受任何开关
+   * 控制（用户点名要求）。关掉之后整行长这样：`积分 24,091 · Provider CodeArts`。
+   */
+  modelDetail: boolean
+  /** 后台自动领取每日签到积分。缺省关：别默认替用户改动账号余额状态。 */
+  autoClaim: boolean
 }
 
 /**
  * 开关的默认值：没有 settings provider（或老配置没这两个键）时保持原有行为 ——
  * 底部两行都显示；侧边栏相反，缺省不开（那一格是所有插件共用的全局座位）。
+ * `modelDetail` 缺省开（保持老版本的样子），`autoClaim` 缺省关。
  */
-export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = { credits: true, queue: true, sidebar: false }
+export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = {
+  credits: true,
+  queue: true,
+  sidebar: false,
+  modelDetail: true,
+  autoClaim: false,
+}
 
 /**
  * 把逐账号的领取结果汇总成一条：HTTP 层只看 ok，卡片看 results 逐号展示。
@@ -395,6 +411,13 @@ export interface CodeArtsStatusRouteOptions {
    * 省略 id 时逐个可用账号都领一遍；上游按天去重，重复领返回 already。
    */
   claim?: (accountId?: string) => Promise<CodeArtsClaimResult>
+  /**
+   * 后台自动领取那一轮的结果：先跑一次全量领取，再把它记成「上次自动领取」。
+   *
+   * 与 `claim` 分开是为了留痕：自动领取在用户看不见的时候动他的余额，卡片必须能
+   * 说清「上次是什么时候领的、领到没有、领了多少」，否则这个开关等于黑箱。
+   */
+  autoClaim?: () => Promise<CodeArtsClaimResult>
   /**
    * 立刻重拉一次模型目录（不等每小时那一次）。
    *
@@ -807,11 +830,19 @@ function dockHandler(deps: CodeArtsStatusRouteOptions) {
         return
       }
       try {
-        const body = JSON.parse(await readBody(req)) as { credits?: unknown; queue?: unknown; sidebar?: unknown }
-        const keys = ['credits', 'queue', 'sidebar'] as const
+        const body = JSON.parse(await readBody(req)) as {
+          credits?: unknown
+          queue?: unknown
+          sidebar?: unknown
+          modelDetail?: unknown
+          autoClaim?: unknown
+        }
+        const keys = ['credits', 'queue', 'sidebar', 'modelDetail', 'autoClaim'] as const
         const touched = keys.filter(key => body[key] !== undefined)
         if (touched.length === 0 || touched.some(key => typeof body[key] !== 'boolean')) {
-          json(res, 400, { error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean}' })
+          json(res, 400, {
+            error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean, "modelDetail"?: boolean, "autoClaim"?: boolean}',
+          })
           return
         }
         const ok = await deps.setDock(Object.fromEntries(

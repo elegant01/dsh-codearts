@@ -187,6 +187,10 @@ export interface CodeArtsSettingsKey {
   displayHint: string
   displayCreditsToggle: string
   displayQueueToggle: string
+  displayModelDetailToggle: string
+  displayAutoClaimTitle: string
+  displayAutoClaimHint: string
+  displayAutoClaimToggle: string
   displayNotWritable: string
   displayFailed: string
   displaySidebarTitle: string
@@ -372,9 +376,13 @@ export const zh: CodeArtsSettingsKey = {
   dockNoModel: '未选择模型',
   tabDisplay: '显示',
   displayTitle: '输入框两侧显示',
-  displayHint: '这两项只管输入框下方那一行的积分与排队两段；中间那段「Provider CodeArts · Model 模型 · 倍率」一直显示，不受开关影响。底部那条每 60 秒读一次设置，所以关掉最多要等一分钟才见效。',
+  displayHint: '这几项只管输入框上下那两行显示什么，不影响任何请求。`Provider CodeArts` 是插件的身份标识，一直显示，不受开关控制；「显示模型与倍率」只收掉它右边那段（模型名、倍率、排队）。底部那条每 60 秒读一次设置，所以关掉最多要等一分钟才见效。',
   displayCreditsToggle: '在输入框工具行显示剩余积分（点开可看各账号明细）',
   displayQueueToggle: '显示上游排队位置',
+  displayModelDetailToggle: '显示模型与倍率（Provider CodeArts 不受影响，始终显示）',
+  displayAutoClaimTitle: '每日签到积分',
+  displayAutoClaimHint: '打开后，DSH 启动约 30 秒会自动把每个已登录账号的每日签到积分领一遍；没领到会隔 30 分钟再试，最多 3 次。上游按天去重，重复领取不会出错。领取结果可以点开积分条查看。注意：这个功能只在 DSH 运行时生效，关掉 DSH 后不会替你领。',
+  displayAutoClaimToggle: '自动领取每日签到积分（默认关闭）',
   displayNotWritable: '这个宿主没给插件开配置存储，开关只能看不能改。',
   displayFailed: '保存失败：{message}',
   displaySidebarTitle: '侧边栏图标',
@@ -559,9 +567,13 @@ export const en: CodeArtsSettingsKey = {
   dockNoModel: 'No model selected',
   tabDisplay: 'Display',
   displayTitle: 'Around the chat input box',
-  displayHint: 'These two only control the credits and queue segments of that line under the input box; the middle “Provider CodeArts · Model … · rate” segments always show. The bar re-reads settings every 60 seconds, so hiding the rest can take up to a minute.',
+  displayHint: 'These only change what the two lines around the input box show; nothing here touches a request. "Provider CodeArts" identifies the plugin and always shows. "Model and rate" hides only the part to its right (model name, rate, queue). The bar re-reads settings every 60 seconds, so a change can take up to a minute.',
   displayCreditsToggle: 'Show remaining credits in the composer tool row (click for per-account details)',
   displayQueueToggle: 'Show the upstream queue position',
+  displayModelDetailToggle: 'Show the model and rate (Provider CodeArts is not affected and always shows)',
+  displayAutoClaimTitle: 'Daily sign-in credits',
+  displayAutoClaimHint: 'When on, about 30 seconds after DSH starts the plugin claims the daily sign-in credits for every signed-in account; if nothing was claimed it retries after 30 minutes, up to 3 times. Upstream deduplicates by day, so claiming twice is harmless. Open the credits bar to see the result. Note: this only runs while DSH is running — it cannot claim for you once DSH is closed.',
+  displayAutoClaimToggle: 'Claim daily sign-in credits automatically (off by default)',
   displayNotWritable: 'This host gives the plugin nowhere to persist settings, so the switches are read-only.',
   displayFailed: 'Failed to save: {message}',
   displaySidebarTitle: 'Sidebar icon',

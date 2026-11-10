@@ -6,6 +6,9 @@
  * （`积分 24,091 · Provider CodeArts · Model DeepSeek-V4.1-Flash-1017 · x0.18`）。
  * 用连接符而不是 flex gap 是有意的：邻居那一行也是这么拼的，观感才对得上。
  *
+ * `showModelDetail` 只控制 **Model 及其右侧**（倍率、排队）：provider 段是插件的身份
+ * 标识，永远显示。所以「关掉」之后这一行长这样：`积分 24,091 · Provider CodeArts`。
+ *
  * 为什么积分段要**单独**返回（而不是跟其余各段拼成一串）：底部那一行里只有积分那段
  * 是可点击的（点开逐号明细），模型/倍率那几段是纯文本。所以这里把可点击的那一段与
  * 其余各段分开给出去，组件照着渲染就行 —— 「哪段能点」由触摸得到的结构决定，不是
@@ -19,7 +22,7 @@
 export interface DockLineParts {
   /** 已格式化的积分段（`积分 24,091`）；「显示剩余积分」关掉时省略。 */
   credits?: string
-  /** 段里出现的 provider 名（`CodeArts`）。 */
+  /** 段里出现的 provider 名（`CodeArts`）。**常驻**，不受任何开关控制。 */
   provider: string
   /** 剥掉倍率尾巴的模型名；未选择模型时省略（改印「未选择模型」）。 */
   model?: string
@@ -41,12 +44,17 @@ export const DOCK_SEGMENT_SEPARATOR = ' · '
 export function buildDockLine(
   parts: DockLineParts,
   t: (key: string, params?: Record<string, unknown>) => string,
+  /** 是否显示「Model / 倍率 / 排队」这一段；provider 段不受它控制，永远显示。 */
+  showModelDetail = true,
 ): DockLine {
   const rest: string[] = []
+  // provider 是插件的身份标识，常驻显示：用户点名要求「Provider CodeArts 固定，不被开关控制」。
   rest.push(t('dockProvider', { provider: parts.provider }))
-  rest.push(parts.model === undefined ? t('dockNoModel') : t('dockModel', { model: parts.model }))
-  if (parts.ratio !== undefined) rest.push(parts.ratio)
-  if (parts.queue !== undefined) rest.push(parts.queue)
+  if (showModelDetail) {
+    rest.push(parts.model === undefined ? t('dockNoModel') : t('dockModel', { model: parts.model }))
+    if (parts.ratio !== undefined) rest.push(parts.ratio)
+    if (parts.queue !== undefined) rest.push(parts.queue)
+  }
   return {
     ...parts.credits === undefined ? {} : { credits: parts.credits },
     rest: rest.join(DOCK_SEGMENT_SEPARATOR),
