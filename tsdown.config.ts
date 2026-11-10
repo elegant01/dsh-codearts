@@ -28,7 +28,10 @@ const CLIENT_ENV_DEFINE = {
 // DSH UI packages are left external (provided by the host shell).
 export default defineConfig([
   {
-    entry: ['src/index.ts', 'src/bin.ts'],
+    // supervisor: 主 bundle（lib/index.mjs）+ CLI（lib/bin.mjs）+ 常驻守护进程（lib/keeper.mjs）。
+    // 守护进程必须是独立入口：它由 detached spawn 拉起、在 DSH 之外运行，不能和主 bundle
+    // 混在一起（否则会把整个宿主侧依赖拖进一个常驻进程）。
+    entry: ['src/index.ts', 'src/bin.ts', 'src/keeper-main.ts'],
     format: ['esm'],
     target: 'node22',
     dts: true,

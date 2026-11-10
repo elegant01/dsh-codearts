@@ -52,6 +52,7 @@ import {
   CODEARTS_REFRESH_MODELS_PATH,
   CODEARTS_STATUS_PATH,
   CODEARTS_DOCK_PATH,
+  CODEARTS_KEEPER_STOP_PATH,
   CODEARTS_TEST_MODEL_PATH,
   CODEARTS_TOKEN_PATH,
   registerCodeArtsStatusRoute,
@@ -599,15 +600,29 @@ describe('GET /api/codearts/status', () => {
   // 底部积分条靠这一份开关决定画不画，所以它必须搭 /status 的车 —— 为两个布尔
   // 多开一条轮询链路没道理。没接 settings 的宿主上 deps.dock 缺席，字段就该整个没有。
   it('carries the dock visibility flags so the composer bar does not need its own poll', async () => {
-    const flags = { credits: false, queue: true, sidebar: false, modelDetail: true, autoClaim: false }
+    const flags = { credits: false, queue: true, sidebar: false, modelDetail: true, autoClaim: false, keepAliveDaemon: false }
     const scoped = mountRoutes({ store, models: () => [], dock: () => flags })
     const res = await call(scoped.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)
     expect(res.body?.dock).toEqual(flags)
     expect((await call(routes.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)).body?.dock).toBeUndefined()
   })
 
-  // 弹层上那个「刷新积分」点了必须打上游：不绕开 60 秒缓存的话数字不动，
-  // 那个按钮就是在骗人。
+  // 守护进程状态跟着 /status 走：卡片要显示 pid 与心跳，还要能分辨「还没起来」和
+  // 「已经死了」—— 后者意味着开关该被关掉。
+  it('carries the keeper view so the card can show the pid', async () => {
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      keeper: async () => ({ alive: true, pid: 4242, heartbeatAt: 1_700_000_000_000, logPath: 'C:\\x.log' }),
+    })
+    const res = await call(scoped.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)
+    const keeper = res.body?.keeper as Record<string, unknown>
+    expect(keeper.alive).toBe(true)
+    expect(keeper.pid).toBe(4242)
+    expect(keeper.logPath).toBe('C:\\x.log')
+    // 没接 keeper 的注入方（老宿主）字段整个缺席，卡片就不画那一段。
+    expect((await call(routes.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)).body?.keeper).toBeUndefined()
+  })
   it('takes the force path through refreshCredits instead of the cached loader', async () => {
     const cached = vi.fn(async () => [])
     const forced = vi.fn(async () => [])
@@ -623,7 +638,7 @@ describe('GET /api/codearts/status', () => {
 
 describe('/api/codearts/dock', () => {
   it('answers the current flags and reports writability', async () => {
-    const flags = { credits: true, queue: false, sidebar: true, modelDetail: false, autoClaim: true }
+    const flags = { credits: true, queue: false, sidebar: true, modelDetail: false, autoClaim: true, keepAliveDaemon: true }
     const scoped = mountRoutes({ store, models: () => [], dock: () => flags })
     const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, GET, CODEARTS_DOCK_PATH)
     expect(res.body?.dock).toEqual(flags)
@@ -632,7 +647,14 @@ describe('/api/codearts/dock', () => {
     // 自动领取缺省关（不替用户动余额）。
     expect((await call(routes.get(CODEARTS_DOCK_PATH)!, GET, CODEARTS_DOCK_PATH)).body?.dock)
       .toEqual(DEFAULT_DOCK_FLAGS)
-    expect(DEFAULT_DOCK_FLAGS).toEqual({ credits: true, queue: true, sidebar: false, modelDetail: true, autoClaim: false })
+    expect(DEFAULT_DOCK_FLAGS).toEqual({
+      credits: true,
+      queue: true,
+      sidebar: false,
+      modelDetail: true,
+      autoClaim: false,
+      keepAliveDaemon: false,
+    })
   })
 
   it('writes one flag without touching the others', async () => {
@@ -748,6 +770,73 @@ describe('/api/codearts/dock', () => {
   it('rejects a cross-origin request', async () => {
     const res = await call(routes.get(CODEARTS_DOCK_PATH)!, GET, CODEARTS_DOCK_PATH, { origin: 'https://evil.example' })
     expect(res.status).toBe(403)
+  })
+})
+
+// 结束守护进程必须和关开关原子地一起做：只杀进程会留下「开关开着却没进程」的状态，
+// 插件下次启动还会把它拉起来 —— 用户刚 kill 掉的东西自己回来了。
+describe('POST /api/codearts/keeper/stop', () => {
+  it('stops the process and turns the switch off in one call', async () => {
+    let flags: CodeArtsDockFlags = { ...DEFAULT_DOCK_FLAGS, keepAliveDaemon: true }
+    const patches: Partial<CodeArtsDockFlags>[] = []
+    const stop = vi.fn(async () => ({ ok: true, pid: 4242 }))
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      dock: () => flags,
+      setDock: async patch => {
+        patches.push(patch)
+        flags = { ...flags, ...patch }
+        return true
+      },
+      stopKeeper: stop,
+    })
+    const res = await call(scoped.get(CODEARTS_KEEPER_STOP_PATH)!, POST, CODEARTS_KEEPER_STOP_PATH)
+    expect(res.status).toBe(200)
+    expect(stop).toHaveBeenCalledTimes(1)
+    expect(patches).toEqual([{ keepAliveDaemon: false }])
+    expect(res.body?.pid).toBe(4242)
+    expect((res.body?.dock as CodeArtsDockFlags).keepAliveDaemon).toBe(false)
+  })
+
+  // kill 失败（比如没权限）也要把开关关掉：用户点结束的意图是明确的，留着「开着却没
+  // 进程」比关掉更糟。失败原因必须回给卡片，不能吞掉。
+  it('still turns the switch off when the kill fails', async () => {
+    let flags: CodeArtsDockFlags = { ...DEFAULT_DOCK_FLAGS, keepAliveDaemon: true }
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      dock: () => flags,
+      setDock: async patch => {
+        flags = { ...flags, ...patch }
+        return true
+      },
+      stopKeeper: async () => ({ ok: false, pid: 7, reason: 'access denied' }),
+    })
+    const res = await call(scoped.get(CODEARTS_KEEPER_STOP_PATH)!, POST, CODEARTS_KEEPER_STOP_PATH)
+    expect(res.status).toBe(500)
+    expect(res.body?.reason).toBe('access denied')
+    expect(flags.keepAliveDaemon).toBe(false)
+  })
+
+  it('answers 503 when the host never wired keeper control', async () => {
+    const scoped = mountRoutes({ store, models: () => [] })
+    const res = await call(scoped.get(CODEARTS_KEEPER_STOP_PATH)!, POST, CODEARTS_KEEPER_STOP_PATH)
+    expect(res.status).toBe(503)
+    expect(res.body?.error).toBe('keeper-control-unavailable')
+  })
+
+  it('rejects a GET and a cross-origin request', async () => {
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      stopKeeper: async () => ({ ok: true }),
+      setDock: async () => true,
+    })
+    expect((await call(scoped.get(CODEARTS_KEEPER_STOP_PATH)!, 'GET', CODEARTS_KEEPER_STOP_PATH)).status).toBe(405)
+    expect((await call(scoped.get(CODEARTS_KEEPER_STOP_PATH)!, POST, CODEARTS_KEEPER_STOP_PATH, {
+      origin: 'https://evil.example',
+    })).status).toBe(403)
   })
 })
 

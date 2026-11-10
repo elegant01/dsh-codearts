@@ -36,8 +36,23 @@ import { createCodeArtsAdapter, CODEARTS_PROVIDER } from './adapter.ts'
 import { probePiAiCompat } from './pi-ai-compat.ts'
 import { createCodeArtsShim, recentRequestShapes, recentUsageShapes } from './shim.ts'
 import { registerCodeArtsStatusRoute, summarizeClaims } from './web-status.ts'
-import type { CodeArtsAccountCredits, CodeArtsClaimAccountResult, CodeArtsClaimResult, CodeArtsDockFlags } from './web-status.ts'
+import type {
+  CodeArtsAccountCredits,
+  CodeArtsClaimAccountResult,
+  CodeArtsClaimResult,
+  CodeArtsDockFlags,
+  CodeArtsKeeperView,
+} from './web-status.ts'
 import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
+import {
+  KEEPER_STALE_MS,
+  keeperLogPath,
+  keeperScriptPath,
+  keeperStats,
+  spawnKeeper,
+  stopKeeper as stopKeeperProcess,
+} from './keeper.ts'
+import { CODEARTS_VERSION } from './version.ts'
 
 export { CODEARTS_PROVIDER, createCodeArtsAdapter, type CodeArtsAdapter } from './adapter.ts'
 export { createCodeArtsShim, type CodeArtsShim } from './shim.ts'
@@ -126,6 +141,14 @@ export interface Config {
    * 结果会留在卡片上给用户看。
    */
   autoClaim?: boolean
+  /**
+   * 常驻凭证守护进程：让 refresh_token 在 **DSH 关掉之后**也继续被续期。
+   *
+   * 缺省 = **关**。理由：它会在 DSH 之外留一个后台进程（用宿主 exe 以 node 形态跑，
+   * 不额外依赖 node 安装），属于用户应当知情并主动选择的东西，不能默认替他开。
+   * 打开后卡片上会显示它的 pid，并给一个「结束」按钮。
+   */
+  keepAliveDaemon?: boolean
 }
 
 interface VolatileValue<T> {
@@ -153,6 +176,7 @@ export const Config: z<Config> = z.object({
   showSidebarPanel: z.boolean().default(false).description('Show a CodeArts icon in the DSH sidebar icon column, opening this page in the middle column').volatile(),
   showModelDetailDock: z.boolean().default(true).description('Show "Model … · x ratio" on the line under the chat input box (Provider CodeArts always shows)').volatile(),
   autoClaim: z.boolean().default(false).description('Automatically claim the daily sign-in credits for every signed-in account').volatile(),
+  keepAliveDaemon: z.boolean().default(false).description('Keep a detached background process that refreshes the OAuth credential while DSH is closed').volatile(),
 }) as unknown as z<Config>
 
 function settingsCompatNamespace(ctx: Context): SettingsNamespace {
@@ -235,6 +259,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     sidebar: current().showSidebarPanel === true,
     modelDetail: current().showModelDetailDock !== false,
     autoClaim: current().autoClaim === true,
+    keepAliveDaemon: current().keepAliveDaemon === true,
   })
 
   const setDock = async (patch: Partial<CodeArtsDockFlags>): Promise<boolean> => {
@@ -246,6 +271,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
       ...patch.sidebar === undefined ? {} : { showSidebarPanel: patch.sidebar },
       ...patch.modelDetail === undefined ? {} : { showModelDetailDock: patch.modelDetail },
       ...patch.autoClaim === undefined ? {} : { autoClaim: patch.autoClaim },
+      ...patch.keepAliveDaemon === undefined ? {} : { keepAliveDaemon: patch.keepAliveDaemon },
     })
     return true
   }
@@ -262,6 +288,132 @@ export function apply(ctx: Context, rawConfig: Config): void {
    * 会看到积分莫名其妙变多（或者没变），无从判断这个功能到底有没有在工作。
    */
   let lastAutoClaim: { at: number; claimed: boolean; state: string; amount: number; message: string } | undefined
+
+  /**
+   * 守护进程：当前活着吗。
+   *
+   * 「活着」= 状态文件里心跳新鲜 **且** 那个 pid 真能探到（`keeper.ts` 里两个条件都查）。
+   * 只看心跳会把刚被 kill 的进程当成活的 —— 心跳是它死前 30 秒内写的，不会自己消失。
+   */
+  const keeperRunning = (): boolean => keeperStats().alive
+
+  /**
+   * 刚点开开关、守护进程还没写出状态文件的那段时间。
+   *
+   * 秒级的进程启动 + 首次 `writeKeeperState` 之间确实有一段「探不到活」的窗口。
+   * 不区分的话，卡片刚被勾上就会因为「没探到进程」而自己把开关关掉 —— 用户看到的是
+   * 勾了一下马上弹回去。这段时间里 `alive` 仍是 false（它确实还没活），但带 `starting`。
+   */
+  const KEEPER_START_GRACE_MS = KEEPER_STALE_MS
+
+  const keeperView = async (): Promise<CodeArtsKeeperView> => {
+    const logPath = keeperLogPath()
+    const stats = keeperStats()
+    if (stats.alive && stats.state !== undefined) {
+      keeperLastError = undefined
+      return {
+        alive: true,
+        pid: stats.state.pid,
+        startedAt: stats.state.startedAt,
+        heartbeatAt: stats.state.heartbeatAt,
+        ...stats.state.lastPass === undefined ? {} : { lastPass: stats.state.lastPass },
+        logPath,
+      }
+    }
+    const wanted = current().keepAliveDaemon === true
+    if (!wanted) return { alive: false, logPath }
+    // 开关开着却没进程，两种可能：刚拉起（等一会儿就好）、进程被杀了（要把开关关掉）。
+    if (Date.now() - keeperSpawnedAt < KEEPER_START_GRACE_MS) {
+      return { alive: false, starting: true, ...keeperLastError === undefined ? {} : { error: keeperLastError }, logPath }
+    }
+    // 被 kill 了（或者是启动失败）。用户点过「结束」的情况由 keeper/stop 路由负责，
+    // 这里是「进程在别处消失」—— 开关必须跟着关，否则界面会永远顶着一个空 pid。
+    try {
+      await setDock({ keepAliveDaemon: false })
+    } catch {
+      // 写不进去也不影响返回：卡片照样知道它没活着。
+    }
+    return {
+      alive: false,
+      error: keeperLastError ?? '守护进程已退出，已自动关闭保活开关',
+      logPath,
+    }
+  }
+
+  /**
+   * 常驻守护进程：在 DSH 之外续 refresh_token。
+   *
+   * 与上面 `keepAliveLoop` 的分工：那个只在 DSH 活着时有用，关掉 DSH 就没了；这个起的是
+   * 一个 detached 进程，DSH 退出后它还在，20 分钟续一次，把 30 天有效期的 refresh_token
+   * 一直续下去 —— 这才是「十几天不用重新登录」的正解。
+   *
+   * refresh_token 是一次性的：两边同时刷会让后刷的一方拿着作废的 token 失败。所以开关
+   * 打开时 `keepAliveLoop` 会主动让路（只从磁盘重读），刷新权独占在守护进程手里。
+   */
+  const KEEPER_ENSURE_MS = 60 * 1000
+  let keeperSpawnedAt = 0
+  let keeperLastError: string | undefined
+  let keeperTimer: ReturnType<typeof setTimeout> | undefined
+
+  /**
+   * 按开关状态把守护进程拉起来。
+   *
+   * 只在「开关刚被打开」时调用（`armKeepAliveDaemon`）。**不做定时重起**：用户明确要求
+   * 「被 kill 了开关就关掉」，而不是「被 kill 了自己又冒出来」—— 后者正是用户按了结束
+   * 却看到进程又活了的那种体验。
+   */
+  const ensureKeeper = (): void => {
+    if (stopped) return
+    if (current().keepAliveDaemon !== true) return
+    if (keeperRunning()) return
+    const outcome = spawnKeeper({ scriptPath: keeperScriptPath(), pluginVersion: CODEARTS_VERSION })
+    keeperSpawnedAt = Date.now()
+    if (outcome.ok) {
+      keeperLastError = undefined
+      ctx.logger.debug(`dsh-codearts: credential keeper running (pid ${outcome.pid ?? '?'})`)
+    } else {
+      keeperLastError = outcome.reason ?? 'spawn failed'
+      ctx.logger.debug(`dsh-codearts: credential keeper failed to start: ${keeperLastError}`)
+    }
+  }
+
+  /**
+   * 守护巡检：只在旁边看着，不重起。
+   *
+   * 三种结局：开关被关掉 → 收工；进程还活着 → 继续看；进程没了（超出启动宽限期）→
+   * 把开关关掉并收工。判死必须在服务端做，不能只靠卡片轮询 —— 卡片没打开时也得让
+   * 那个「开着却空转」的开关自己消失。
+   */
+  const keeperLoop = async (): Promise<void> => {
+    if (stopped) return
+    if (current().keepAliveDaemon !== true) {
+      keeperTimer = undefined
+      return
+    }
+    if (!keeperRunning() && Date.now() - keeperSpawnedAt >= KEEPER_START_GRACE_MS) {
+      keeperTimer = undefined
+      keeperSpawnedAt = 0
+      await setDock({ keepAliveDaemon: false }).catch(() => false)
+      return
+    }
+    keeperTimer = setTimeout(() => void keeperLoop(), KEEPER_ENSURE_MS)
+    keeperTimer.unref?.()
+  }
+
+  /** 开关变化时立刻响应：打开就马上起，关掉就撤掉巡检（进程本身留给「结束」按钮）。 */
+  const armKeepAliveDaemon = (): void => {
+    if (stopped) return
+    if (current().keepAliveDaemon !== true) {
+      if (keeperTimer !== undefined) clearTimeout(keeperTimer)
+      keeperTimer = undefined
+      keeperSpawnedAt = 0
+      return
+    }
+    if (keeperTimer !== undefined) return
+    ensureKeeper()
+    keeperTimer = setTimeout(() => void keeperLoop(), KEEPER_ENSURE_MS)
+    keeperTimer.unref?.()
+  }
 
   /**
    * 逐号领取每日签到积分。
@@ -345,6 +497,14 @@ export function apply(ctx: Context, rawConfig: Config): void {
     },
     dock,
     setDock,
+    keeper: keeperView,
+    stopKeeper: async () => {
+      const outcome = await stopKeeperProcess()
+      // 自愈：不管 kill 结果如何，先把「刚拉起」的宽限计时清掉，免得下一次对账把它当
+      // 成启动中而漏掉关开关。
+      keeperSpawnedAt = 0
+      return outcome
+    },
     claim: claimAll,
     autoClaim: async () => {
       const outcome = await claimAll()
@@ -376,10 +536,12 @@ export function apply(ctx: Context, rawConfig: Config): void {
       current = () => unwrapConfig(source())
       // 开关一变就按新状态重排自动领取：打开了要立刻跟上，关掉了要立刻停手。
       armAutoClaim()
+      armKeepAliveDaemon()
     },
     onChange() {
       // 设置项变化时同样重排（有些宿主的 setSource 不会因值变化重新触发）。
       armAutoClaim()
+      armKeepAliveDaemon()
     },
   })
 
@@ -463,17 +625,24 @@ export function apply(ctx: Context, rawConfig: Config): void {
   let keepAliveTimer: ReturnType<typeof setTimeout> | undefined
   const keepAliveLoop = async (): Promise<void> => {
     if (stopped) return
-    try {
-      const outcome = await store.keepAlive()
-      if (outcome.refreshed > 0) {
-        ctx.logger.debug(`dsh-codearts: refreshed ${outcome.refreshed} credential(s) in the background`)
+    // 让路：守护进程活着时续期的独占权在它手里。refresh_token 一次性，两边同时刷
+    // 会让后刷的那次拿着已作废的 token 失败，直接把号写成 stale —— 这正是「隔天就要
+    // 重新登录」的成因之一。所以我们只从磁盘重读它写回的结果，自己不发刷新请求。
+    if (keeperRunning()) {
+      await store.reloadFromDisk().catch(() => {})
+    } else {
+      try {
+        const outcome = await store.keepAlive()
+        if (outcome.refreshed > 0) {
+          ctx.logger.debug(`dsh-codearts: refreshed ${outcome.refreshed} credential(s) in the background`)
+        }
+        if (outcome.needsLogin.length > 0) {
+          ctx.logger.debug(`dsh-codearts: ${outcome.needsLogin.length} account(s) need a fresh sign-in`)
+        }
+      } catch (error: unknown) {
+        // 保活失败不能影响聊天：下一轮再试就是。
+        ctx.logger.debug('dsh-codearts: credential keep-alive failed; will retry', error)
       }
-      if (outcome.needsLogin.length > 0) {
-        ctx.logger.debug(`dsh-codearts: ${outcome.needsLogin.length} account(s) need a fresh sign-in`)
-      }
-    } catch (error: unknown) {
-      // 保活失败不能影响聊天：下一轮再试就是。
-      ctx.logger.debug('dsh-codearts: credential keep-alive failed; will retry', error)
     }
     if (stopped) return
     keepAliveTimer = setTimeout(() => void keepAliveLoop(), KEEP_ALIVE_INTERVAL_MS)
@@ -554,6 +723,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
   ctx.effect(() => () => {
     if (keepAliveTimer !== undefined) clearTimeout(keepAliveTimer)
     if (autoClaimTimer !== undefined) clearTimeout(autoClaimTimer)
+    if (keeperTimer !== undefined) clearTimeout(keeperTimer)
   })
 
   // Build the loopback shim first; the adapter reads its origin at construction.
@@ -571,6 +741,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
       // 领取等 30 秒），不会和启动瞬间的目录请求抢上游。
       void keepAliveLoop()
       armAutoClaim()
+      // 守护进程跟着启动：开关开着才起，关着什么都不做。
+      armKeepAliveDaemon()
       // 版本不兼容时每条消息都会死在出网之前，所以要在这里说明白（卡片上也显示）。
       const incompatible = await probePiAiCompat()
       if (incompatible !== undefined) ctx.logger.error(`dsh-codearts: ${incompatible}`)

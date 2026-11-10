@@ -144,15 +144,24 @@ interface DockDoc {
     sidebar?: boolean
     modelDetail?: boolean
     autoClaim?: boolean
+    keepAliveDaemon?: boolean
   }
   writable?: boolean
 }
 
 /**
  * 开关的兜底值：后端没这条路由（老版本）时按「都显示」渲染，与原有行为一致。
- * 侧边栏那一格相反 —— 缺省关闭；自动领取也缺省关（不替用户动余额）。
+ * 侧边栏那一格相反 —— 缺省关闭；自动领取与常驻保活也缺省关（不替用户动余额、
+ * 不替用户在系统里留后台进程）。
  */
-const DOCK_DEFAULT = { credits: true, queue: true, sidebar: false, modelDetail: true, autoClaim: false }
+const DOCK_DEFAULT = {
+  credits: true,
+  queue: true,
+  sidebar: false,
+  modelDetail: true,
+  autoClaim: false,
+  keepAliveDaemon: false,
+}
 
 /**
  * 上一次读到的状态。`/api/codearts/status` 会顺带去上游拉积分（有 TTL 缓存），
@@ -961,6 +970,10 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [dockWritable, setDockWritable] = useState(false)
   const [dockSaving, setDockSaving] = useState(false)
   const [dockError, setDockError] = useState<string | null>(null)
+  /** 「结束守护进程」按钮在飞，防止连点。 */
+  const [keeperStopping, setKeeperStopping] = useState(false)
+  /** 结束按钮的结果/失败原因（成功也留一句，让用户知道进程真没了）。 */
+  const [keeperNotice, setKeeperNotice] = useState<string | null>(null)
   /**
    * 首次读取状态的三态。为什么要单独记：`status === null` 只说明「还没读到」，
    * 直接按它画就会先闪一下「未登录」，等数据回来再翻成「已登录」—— 看起来像
@@ -994,7 +1007,10 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
    * 这里不像模型勾选那样攒草稿再点保存 —— 只有几个布尔，攒草稿反而让用户猜
    * 「我刚才那一下到底生效没有」。
    */
-  async function toggleDock(key: 'credits' | 'queue' | 'sidebar' | 'modelDetail' | 'autoClaim', on: boolean): Promise<void> {
+  async function toggleDock(
+    key: 'credits' | 'queue' | 'sidebar' | 'modelDetail' | 'autoClaim' | 'keepAliveDaemon',
+    on: boolean,
+  ): Promise<void> {
     const previous = dock
     setDock({ ...dock, [key]: on })
     setDockSaving(true)
@@ -1023,6 +1039,44 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       setDockError(error instanceof Error ? error.message : String(error))
     } finally {
       setDockSaving(false)
+    }
+  }
+
+  /**
+   * 结束守护进程。
+   *
+   * 服务端在kill之后**顺手把开关写成 false**（见 web-status.ts 的 keeperStopHandler）：
+   * 只杀进程不改开关会留下「开关开着却没进程」的矛盾状态，插件下次启动还会把它拉起来。
+   * 这里拿响应里的 `dock` 直接覆盖本地状态，不等下一轮 refreshDock —— 否则按钮点完
+   * 界面上开关还亮着，用户会以为没生效。
+   */
+  async function stopKeeper(): Promise<void> {
+    setKeeperStopping(true)
+    setKeeperNotice(null)
+    try {
+      const res = await fetch('/api/codearts/keeper/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: '{}',
+      })
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean
+        reason?: string
+        dock?: DockDoc['dock']
+        error?: string
+      }
+      if (data.dock !== undefined) setDock({ ...DOCK_DEFAULT, ...data.dock })
+      if (!res.ok || data.ok === false) {
+        setKeeperNotice(t('displayKeeperStopFailed', { message: data.reason ?? data.error ?? `HTTP ${res.status}` }))
+      } else {
+        setKeeperNotice(t('displayKeeperStopped'))
+      }
+    } catch (error: unknown) {
+      setKeeperNotice(t('displayKeeperStopFailed', { message: error instanceof Error ? error.message : String(error) }))
+    } finally {
+      setKeeperStopping(false)
+      // 无论成败都再读一次真相：状态页可能已经因为「进程没了」把开关关了。
+      await Promise.all([refreshDock(), refresh()])
     }
   }
 
@@ -1860,9 +1914,60 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
               </div>
 
               {/*
-                侧边栏图标单独一段：它和上面两个「对话里的行」不是同一类东西 ——
-                占的是全宿主共用的图标列，所以默认关闭，且说明白它做什么。
+                常驻保活：在 DSH 之外起一个后台进程续 refresh_token。
+                和上面几段不同，这一段要显示**进程号**和**结束**按钮 —— 用户必须能确认
+                「它真的在跑」，也必须能亲手停掉一个不经他同意就在系统里活着的进程。
               */}
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displayKeeperTitle')}</span>
+                  {/*
+                    结束按钮只在「开关开着」时出现：开关关着就说明本来不该有进程，
+                    再给一个结束按钮反而让人以为有东西在跑。开关开着却没探到活进程
+                    （被 kill 了/启动失败）时也显示 —— 那时正需要点一下把状态清干净。
+                  */}
+                  {dock.keepAliveDaemon && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={keeperStopping}
+                      onClick={() => void stopKeeper()}
+                    >
+                      {keeperStopping ? t('displayKeeperStopping') : t('displayKeeperStop')}
+                    </Button>
+                  )}
+                </div>
+                <p className={styles.hint}>{t('displayKeeperHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.keepAliveDaemon}
+                      disabled={!dockWritable || dockSaving}
+                      onChange={on => void toggleDock('keepAliveDaemon', on)}
+                      label={t('displayKeeperToggle')}
+                    />
+                  </div>
+                </div>
+                {/* 进程状态：活着的给 pid 与心跳，没活的把原因讲清楚，别只是留一个空标签。 */}
+                {dock.keepAliveDaemon && (
+                  <p className={styles.hint}>
+                    {status?.keeper?.alive === true
+                      ? t('displayKeeperRunning', {
+                        pid: status.keeper.pid ?? '?',
+                        time: formatStored(status.keeper.heartbeatAt),
+                      })
+                      : status?.keeper?.starting === true
+                        ? t('displayKeeperStarting')
+                        : t('displayKeeperDown', { message: status?.keeper?.error ?? '' })}
+                  </p>
+                )}
+                {keeperNotice !== null && <p className={styles.hint}>{keeperNotice}</p>}
+                {status?.keeper?.logPath !== undefined && dock.keepAliveDaemon && (
+                  <p className={styles.hint}>{t('displayKeeperLog', { path: status.keeper.logPath })}</p>
+                )}
+              </div>
+
               <div className={styles.section}>
                 <div className={styles.sectionHead}>
                   <span className={styles.sectionLabel}>{t('displaySidebarTitle')}</span>

@@ -78,6 +78,15 @@ export const CODEARTS_QUEUE_PATH = '/api/codearts/queue'
  * GET 给当前值与 writable，POST 收 `{credits?, queue?}` 写进 settings。
  */
 export const CODEARTS_DOCK_PATH = '/api/codearts/dock'
+/**
+ * POST /api/codearts/keeper/stop — 结束常驻守护进程，并把开关**同时**关掉。
+ *
+ * 为什么必须在服务端把开关一起关：进程被 kill 之后，「开关开着但没进程」是个自相
+ * 矛盾的状态。若只杀进程不改开关，用户下次打开 DSH 会看到开关还是开的、PID 却是空
+ * 的，以为功能坏了；而且插件会按「开关是开的」去重起它 —— 用户刚 kill 掉的东西自己
+ * 又回来了。所以这两件事必须原子地一起做。
+ */
+export const CODEARTS_KEEPER_STOP_PATH = '/api/codearts/keeper/stop'
 /** 最近出站请求的**形状**摘要（只有 role 名与计数，不含内容），排障用。 */
 export const CODEARTS_DEBUG_PATH = '/api/codearts/debug'
 /**
@@ -240,6 +249,42 @@ export interface CodeArtsDockFlags {
   modelDetail: boolean
   /** 后台自动领取每日签到积分。缺省关：别默认替用户改动账号余额状态。 */
   autoClaim: boolean
+  /**
+   * 常驻凭证守护进程（在 DSH 之外续 refresh_token）。
+   *
+   * 缺省关：它会在系统里留一个后台进程，必须由用户主动打开。打开后 `/status` 的
+   * `keeper` 字段会带上 pid 与最近一轮结果；进程被 kill 掉时这里会自动翻回 false。
+   */
+  keepAliveDaemon: boolean
+}
+
+/**
+ * 守护进程在卡片上的样子。
+ *
+ * 只放能给人看的东西：pid、启动时刻、心跳、上一轮续期结果。**绝不含任何 token**。
+ */
+export interface CodeArtsKeeperView {
+  /** 进程真的活着（心跳新鲜 **且** pid 还存活，两个条件都满足）。 */
+  alive: boolean
+  /**
+   * 刚请求拉起、状态文件还没写出来。
+   *
+   * 与 `alive: false` 的区别很重要：这时候「没探到活」是正常的启动延迟，不能据此
+   * 判定「被 kill 了」而把开关关掉。
+   */
+  starting?: boolean
+  pid?: number
+  startedAt?: number
+  heartbeatAt?: number
+  /** 最近一轮续期：检查了几个、续了几个、哪些号需要重新登录。 */
+  lastPass?: { at: number; checked: number; refreshed: number; needsLogin: readonly string[] }
+  /**
+   * 打开了开关但进程没起来时，这里说明原因（脚本缺失、spawn 失败……）。
+   * 有值 = 开关看着是开的，实际没在保活，卡片必须把这个冲突讲明白。
+   */
+  error?: string
+  /** 守护进程自己的日志路径，出问题让用户能找过去。 */
+  logPath?: string
 }
 
 /**
@@ -253,6 +298,7 @@ export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = {
   sidebar: false,
   modelDetail: true,
   autoClaim: false,
+  keepAliveDaemon: false,
 }
 
 /**
@@ -299,6 +345,8 @@ export interface CodeArtsWebStatus {
    * 底部条本来就在轮询这个接口，所以开关搭车下发，不用多开一条链路。
    */
   dock?: CodeArtsDockFlags
+  /** 常驻凭证守护进程的状态（只在打开了 `dock.keepAliveDaemon` 时有意义）。 */
+  keeper?: CodeArtsKeeperView
   /**
    * 运行时解析到的 `@earendil-works/pi-ai` 不满足要求时的说明。
    * 有值 = 模型全跑不动（每条消息在出网前就失败），且这是版本装配问题，不是账号或网络。
@@ -442,6 +490,24 @@ export interface CodeArtsStatusRouteOptions {
   dock?: () => CodeArtsDockFlags
   /** 写入显隐开关。返回 false 表示没接 settings provider，卡片据此把勾选框置灰。 */
   setDock?: (patch: Partial<CodeArtsDockFlags>) => Promise<boolean>
+  /**
+   * 守护进程的当前状态（pid、心跳、上一轮续期结果）。
+   *
+   * 每次 `/status` 都现算：pid 可能刚被用户 kill 掉，缓存一个「上次还是活的」快照
+   * 会让卡片一直显示一个已经不存在的进程号。
+   *
+   * 允许返回 Promise，是因为实现方要在这条路径上做一次状态对账 —— 「开关开着但进程
+   * 没了」必须当场把开关关掉，而写开关是异步的。
+   */
+  keeper?: () => CodeArtsKeeperView | Promise<CodeArtsKeeperView>
+  /**
+   * 结束守护进程（卡片上那个「结束」按钮）。
+   *
+   * 只杀进程、不改开关的话会留下「开关开着却没进程」的自相矛盾状态，而且插件下次
+   * 启动会按开关把它重新拉起来 —— 用户刚 kill 掉的东西自己回来了。所以处理函数杀完
+   * 会**紧接着**把 `keepAliveDaemon` 写成 false，见 `keeperStopHandler`。
+   */
+  stopKeeper?: () => Promise<{ ok: boolean; pid?: number; reason?: string }>
   /**
    * 丢掉积分缓存后重拉一次（弹层上那个「刷新积分」按钮）。
    * 省略时 `?force=1` 退回普通缓存读取 —— 顶多是不新鲜，不该报错。
@@ -671,13 +737,17 @@ async function buildStatus(deps: CodeArtsStatusRouteOptions, force = false): Pro
   const cred = await deps.store.current()
   const usage = usageOf(deps)
   const dock = deps.dock === undefined ? {} : { dock: deps.dock() }
+  // 守护进程状态每次现算：用户随时可能从卡片上把它 kill 掉，缓存一份「上次还活着」
+  // 的快照会让界面一直显示一个已经不存在的 pid。这里 await，是因为实现方在这条路径上
+  // 会顺手把「开关开着但进程已死」的开关关掉（对账是异步的）。
+  const keeperView = deps.keeper === undefined ? {} : { keeper: await deps.keeper() }
   // pi-ai 版本不兼容时模型全不可用，但状态接口本身还能用 —— 原因必须在这里给出去，
   // 否则用户只看到每条消息一句「本轮运行失败」。
   const piAi = await probePiAiCompat()
   const compat = piAi === undefined ? {} : { piAiError: piAi }
 
   if (accounts.length === 0 || cred === undefined) {
-    return { status: 'signed-out', models, accounts, usage, ...dock, ...compat }
+    return { status: 'signed-out', models, accounts, usage, ...dock, ...keeperView, ...compat }
   }
   // 只要还有**任意一个**账号能用就算登录中 —— 别的号过期了不影响轮转。
   const usable = accounts.some(accountUsable)
@@ -688,6 +758,7 @@ async function buildStatus(deps: CodeArtsStatusRouteOptions, force = false): Pro
     accounts,
     usage,
     ...dock,
+    ...keeperView,
   }
   // 没有可用账号时不问积分：凭证都过期了，问了也是白跑一趟（还得等超时）。
   if (!usable) return { status: 'expired', ...identity, ...compat }
@@ -836,12 +907,13 @@ function dockHandler(deps: CodeArtsStatusRouteOptions) {
           sidebar?: unknown
           modelDetail?: unknown
           autoClaim?: unknown
+          keepAliveDaemon?: unknown
         }
-        const keys = ['credits', 'queue', 'sidebar', 'modelDetail', 'autoClaim'] as const
+        const keys = ['credits', 'queue', 'sidebar', 'modelDetail', 'autoClaim', 'keepAliveDaemon'] as const
         const touched = keys.filter(key => body[key] !== undefined)
         if (touched.length === 0 || touched.some(key => typeof body[key] !== 'boolean')) {
           json(res, 400, {
-            error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean, "modelDetail"?: boolean, "autoClaim"?: boolean}',
+            error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean, "modelDetail"?: boolean, "autoClaim"?: boolean, "keepAliveDaemon"?: boolean}',
           })
           return
         }
@@ -859,6 +931,47 @@ function dockHandler(deps: CodeArtsStatusRouteOptions) {
       return
     }
     json(res, 405, { error: 'method not allowed' })
+  }
+}
+
+/**
+ * POST /api/codearts/keeper/stop — 结束守护进程，并把开关一起关掉。
+ *
+ * 顺序不能反：先杀进程、再写开关。反过来的话，写开关的那一瞬间如果正好触发了插件的
+ * 重排（`armKeepAliveDaemon`），它会按「开关是开的」再起一个 —— 用户点一次结束，
+ * 结果又冒出来一个新 pid。杀完再写，重排看到的是 false，自然什么都不做。
+ */
+function keeperStopHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (deps.stopKeeper === undefined) {
+      json(res, 503, { error: 'keeper-control-unavailable' })
+      return
+    }
+    try {
+      const outcome = await deps.stopKeeper()
+      // 即使 kill 失败（比如没权限）也把开关关掉：留着「开着却没进程」比关掉更糟 ——
+      // 用户点结束的意图是明确的，失败原因在 outcome.reason 里给出去。
+      const writable = deps.setDock === undefined
+        ? false
+        : await deps.setDock({ keepAliveDaemon: false }).catch(() => false)
+      json(res, outcome.ok ? 200 : 500, {
+        ok: outcome.ok,
+        ...outcome.pid === undefined ? {} : { pid: outcome.pid },
+        ...outcome.reason === undefined ? {} : { reason: outcome.reason },
+        writable,
+        dock: deps.dock?.() ?? DEFAULT_DOCK_FLAGS,
+      })
+    } catch (error: unknown) {
+      json(res, 500, { error: safeMessage(error) })
+    }
   }
 }
 
@@ -1337,6 +1450,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_DOCK_PATH,
       handler: dockHandler(deps),
     })
+    const disposeKeeperStop = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_KEEPER_STOP_PATH,
+      handler: keeperStopHandler(deps),
+    })
     const disposeDebug = ctx.webServer.register({
       kind: 'exact',
       path: CODEARTS_DEBUG_PATH,
@@ -1360,6 +1478,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeTestModel()
       disposeQueue()
       disposeDock()
+      disposeKeeperStop()
       disposeDebug()
       disposeDoctor()
       for (const s of activeLogins.values()) s.close()

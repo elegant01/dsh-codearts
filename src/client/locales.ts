@@ -191,6 +191,17 @@ export interface CodeArtsSettingsKey {
   displayAutoClaimTitle: string
   displayAutoClaimHint: string
   displayAutoClaimToggle: string
+  displayKeeperTitle: string
+  displayKeeperHint: string
+  displayKeeperToggle: string
+  displayKeeperRunning: string
+  displayKeeperStarting: string
+  displayKeeperDown: string
+  displayKeeperStop: string
+  displayKeeperStopping: string
+  displayKeeperStopped: string
+  displayKeeperStopFailed: string
+  displayKeeperLog: string
   displayNotWritable: string
   displayFailed: string
   displaySidebarTitle: string
@@ -383,6 +394,17 @@ export const zh: CodeArtsSettingsKey = {
   displayAutoClaimTitle: '每日签到积分',
   displayAutoClaimHint: '打开后，DSH 启动约 30 秒会自动把每个已登录账号的每日签到积分领一遍；没领到会隔 30 分钟再试，最多 3 次。上游按天去重，重复领取不会出错。领取结果可以点开积分条查看。注意：这个功能只在 DSH 运行时生效，关掉 DSH 后不会替你领。',
   displayAutoClaimToggle: '自动领取每日签到积分（默认关闭）',
+  displayKeeperTitle: '常驻保活（DSH 关掉后仍续登录）',
+  displayKeeperHint: '上游给的登录凭证只活 2 小时，但要靠它换新的登录凭证（refresh token），那个能活 30 天。打开这一项后，DSH 会在系统里另起一个独立的后台进程，每 20 分钟替你续一次——所以哪怕 DSH 关着、好几天不开，回来也不用重新登录。这个进程不随 DSH 退出，要用下面的「结束」按钮手动停。默认关闭：不经你同意就在系统里留一个常驻进程不合适。',
+  displayKeeperToggle: '开启常驻保活进程（默认关闭）',
+  displayKeeperRunning: '后台进程运行中 · PID {pid} · 最近心跳 {time}',
+  displayKeeperStarting: '后台进程正在启动……稍等几秒刷新这一页。',
+  displayKeeperDown: '后台进程没有在跑（可能被你结束或启动失败），保活开关已关闭。{message}',
+  displayKeeperStop: '结束进程',
+  displayKeeperStopping: '正在结束……',
+  displayKeeperStopped: '后台进程已结束，保活开关已同时关闭。',
+  displayKeeperStopFailed: '结束失败：{message}',
+  displayKeeperLog: '进程日志：{path}',
   displayNotWritable: '这个宿主没给插件开配置存储，开关只能看不能改。',
   displayFailed: '保存失败：{message}',
   displaySidebarTitle: '侧边栏图标',
@@ -574,6 +596,17 @@ export const en: CodeArtsSettingsKey = {
   displayAutoClaimTitle: 'Daily sign-in credits',
   displayAutoClaimHint: 'When on, about 30 seconds after DSH starts the plugin claims the daily sign-in credits for every signed-in account; if nothing was claimed it retries after 30 minutes, up to 3 times. Upstream deduplicates by day, so claiming twice is harmless. Open the credits bar to see the result. Note: this only runs while DSH is running — it cannot claim for you once DSH is closed.',
   displayAutoClaimToggle: 'Claim daily sign-in credits automatically (off by default)',
+  displayKeeperTitle: 'Keep-alive process (stays signed in while DSH is closed)',
+  displayKeeperHint: 'The login token upstream hands out only lives 2 hours, but the refresh token behind it lives 30 days. With this on, DSH starts a separate background process that refreshes the credential every 20 minutes — so even after DSH has been closed for days, you come back without signing in again. That process outlives DSH; stop it with the button below. Off by default: leaving a resident process on your machine without asking is not something a plugin should do.',
+  displayKeeperToggle: 'Run the keep-alive background process (off by default)',
+  displayKeeperRunning: 'Background process running · PID {pid} · last heartbeat {time}',
+  displayKeeperStarting: 'The background process is starting… refresh this page in a few seconds.',
+  displayKeeperDown: 'The background process is not running (stopped by you, or it failed to start); the keep-alive switch has been turned off. {message}',
+  displayKeeperStop: 'Stop process',
+  displayKeeperStopping: 'Stopping…',
+  displayKeeperStopped: 'Background process stopped and the keep-alive switch turned off.',
+  displayKeeperStopFailed: 'Failed to stop: {message}',
+  displayKeeperLog: 'Process log: {path}',
   displayNotWritable: 'This host gives the plugin nowhere to persist settings, so the switches are read-only.',
   displayFailed: 'Failed to save: {message}',
   displaySidebarTitle: 'Sidebar icon',

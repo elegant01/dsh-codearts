@@ -526,7 +526,13 @@ class AccountSlot {
   }
 }
 
-async function readAccountDocument(path: string): Promise<CodeArtsAccountDocument | undefined> {
+/**
+ * 读账号文档。
+ *
+ * 导出给守护进程（`keeper-main.ts`）用：它跑在 DSH 之外的独立进程里，只做「读文档 →
+ * 续期 → 写回」这一件事，不需要 `CodeArtsAccountStore` 那套槽位/冷却/单飞状态。
+ */
+export async function readAccountDocument(path: string): Promise<CodeArtsAccountDocument | undefined> {
   try {
     const parsed = JSON.parse(await readFile(path, 'utf8')) as Partial<CodeArtsAccountDocument>
     if (typeof parsed !== 'object' || parsed === null) return undefined
@@ -824,6 +830,25 @@ export class CodeArtsAccountStore {
     if (slot === undefined) return undefined
     if (seenToken !== undefined && slot.credential.token !== seenToken) return slot.credential
     return slot.forceRefresh()
+  }
+
+  /**
+   * 从磁盘重读账号文档，丢掉内存里的槽位缓存。
+   *
+   * 给「常驻守护进程」（`keeper-main.ts`）用：它在 DSH 之外续期并写回同一个文档，
+   * 所以插件这边必须定期重读，否则会一直用启动时那份快照 —— 表现为「守护进程明明
+   * 续上了，卡片还显示快过期」，更糟的是插件下一次落库会把守护进程刚写的新
+   * refresh_token 覆盖回旧的，那个号就再也续不上了。
+   *
+   * 只在**没有**在飞的续期时调用（`keepAliveLoop` 里与 `keepAlive` 互斥）；
+   * 重读会把所有槽位重建，正在跑的刷新结果会被代际号拦下，不会写回。
+   */
+  async reloadFromDisk(): Promise<boolean> {
+    const doc = await readAccountDocument(this.path)
+    if (doc === undefined) return false
+    for (const slot of this._slots.values()) slot.invalidate()
+    this.adopt(doc)
+    return true
   }
 
   /**
