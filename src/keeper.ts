@@ -172,12 +172,14 @@ export interface KeeperSpawnResult {
  * 子进程会被一起带走（Windows 上尤其明显），守护也就没有意义了。
  */
 export function spawnKeeper(options: { scriptPath: string; pluginVersion?: string }): KeeperSpawnResult {
+  // 先判脚本、再判「是否已在跑」。反过来的话，本机恰好有一个健康的守护进程时，
+  // 「产物缺了 keeper-main.mjs」这种打包事故会被前面的判活吞掉、谎报成功。
+  if (!existsSync(options.scriptPath)) {
+    return { ok: false, reason: `keeper script missing: ${options.scriptPath}` }
+  }
   const running = keeperStats()
   if (running.alive && running.state !== undefined) {
     return { ok: true, pid: running.state.pid }
-  }
-  if (!existsSync(options.scriptPath)) {
-    return { ok: false, reason: `keeper script missing: ${options.scriptPath}` }
   }
   const { command, env } = nodeLauncher()
   try {
