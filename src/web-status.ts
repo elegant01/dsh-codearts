@@ -241,6 +241,14 @@ export interface CodeArtsDockFlags {
   /** DSH 侧边栏里的 CodeArts 入口。 */
   sidebar: boolean
   /**
+   * 设置左侧导航里的 CodeArts 入口（点开即整页版卡片）。
+   *
+   * 缺省 **显示**：用户找插件的第一反应是「设置里从左列找」，只挂在「内置插件 →
+   * 详情页」里等于默认找不到（issue #7）。这一格与侧边栏那格不同 —— 设置导航本来就是
+   * 给各个插件分组的，多一项不会挤到主界面。
+   */
+  settingsEntry: boolean
+  /**
    * 「Model 及其右侧」（模型名、倍率、排队）。
    *
    * 只控制这一段：`Provider CodeArts` 是插件的身份标识，**常驻显示**，不受任何开关
@@ -296,6 +304,7 @@ export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = {
   credits: true,
   queue: true,
   sidebar: false,
+  settingsEntry: true,
   modelDetail: true,
   autoClaim: false,
   keepAliveDaemon: false,
@@ -905,15 +914,16 @@ function dockHandler(deps: CodeArtsStatusRouteOptions) {
           credits?: unknown
           queue?: unknown
           sidebar?: unknown
+          settingsEntry?: unknown
           modelDetail?: unknown
           autoClaim?: unknown
           keepAliveDaemon?: unknown
         }
-        const keys = ['credits', 'queue', 'sidebar', 'modelDetail', 'autoClaim', 'keepAliveDaemon'] as const
+        const keys = ['credits', 'queue', 'sidebar', 'settingsEntry', 'modelDetail', 'autoClaim', 'keepAliveDaemon'] as const
         const touched = keys.filter(key => body[key] !== undefined)
         if (touched.length === 0 || touched.some(key => typeof body[key] !== 'boolean')) {
           json(res, 400, {
-            error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean, "modelDetail"?: boolean, "autoClaim"?: boolean, "keepAliveDaemon"?: boolean}',
+            error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean, "settingsEntry"?: boolean, "modelDetail"?: boolean, "autoClaim"?: boolean, "keepAliveDaemon"?: boolean}',
           })
           return
         }

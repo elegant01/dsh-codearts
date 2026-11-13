@@ -9,7 +9,8 @@ import type {
   CodeArtsWelfareState,
 } from '../web-status.ts'
 import { stripModelSuffixes } from '../catalog.ts'
-import { setSidebarPanelWanted } from './panel-switch.ts'
+import { setSettingsEntryWanted, setSidebarPanelWanted } from './panel-switch.ts'
+import { dockSnapshot, publishDock, subscribeDock } from './dock-store.ts'
 import { latencyP95Label } from './latency-label.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
@@ -136,31 +137,21 @@ type Translate = CodeArtsPluginCardInjected['t']
 
 type CardTab = 'accounts' | 'models' | 'usage' | 'display'
 
+/** 「显示」页的开关键（与 CodeArtsDockFlags 一一对应）。 */
+type DockKey = 'credits' | 'queue' | 'sidebar' | 'settingsEntry' | 'modelDetail' | 'autoClaim' | 'keepAliveDaemon'
+
 /** GET/POST /api/codearts/dock 的文档（后端契约见 web-status.ts 的 CodeArtsDockFlags）。 */
 interface DockDoc {
   dock?: {
     credits: boolean
     queue: boolean
     sidebar?: boolean
+    settingsEntry?: boolean
     modelDetail?: boolean
     autoClaim?: boolean
     keepAliveDaemon?: boolean
   }
   writable?: boolean
-}
-
-/**
- * 开关的兜底值：后端没这条路由（老版本）时按「都显示」渲染，与原有行为一致。
- * 侧边栏那一格相反 —— 缺省关闭；自动领取与常驻保活也缺省关（不替用户动余额、
- * 不替用户在系统里留后台进程）。
- */
-const DOCK_DEFAULT = {
-  credits: true,
-  queue: true,
-  sidebar: false,
-  modelDetail: true,
-  autoClaim: false,
-  keepAliveDaemon: false,
 }
 
 /**
@@ -318,6 +309,8 @@ function CreditBlock({
   if (credits === undefined && error === undefined) return null
   const c = credits?.credits
   const claimedToday = justClaimed || credits?.welfare?.claimedToday === true
+  /** 上游当前每日签到活动给多少分；没有就退回不带数字的文案。 */
+  const claimAmount = credits?.welfare?.amount ?? 0
   const expiring = c?.total.expiring ?? 0
   const expiringRatio = c !== undefined && c.total.total > 0
     ? Math.min(100, Math.max(0, (expiring / c.total.total) * 100))
@@ -400,7 +393,16 @@ function CreditBlock({
         </Button>
         {c !== undefined && <Tag tone="quiet">{c.planName}</Tag>}
       </div>
-      <p className={styles.creditHint}>{claimResult ?? t('claimHint')}</p>
+      {/*
+        金额别写死：上游的每日签到活动会变（2026-11-13 实测已经是「每日签到领100积分」，
+        而文案还写着 1000 —— 那是另一条「推荐码上有礼」活动的数）。welfare.amount 就来自
+        同一次 delivery 请求，直接用；拉不到时才退回到不带数字的说法。
+      */}
+      <p className={styles.creditHint}>
+        {claimResult ?? (claimAmount > 0
+          ? t('claimHintAmount', { amount: formatCredits(claimAmount) })
+          : t('claimHint'))}
+      </p>
     </div>
   )
 }
@@ -966,9 +968,15 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [tab, setTab] = useState<CardTab>('accounts')
   const tabIdBase = useId()
   /** 对话底部那一行的两个显隐开关（后端 = 插件 settings 里的两个布尔）。 */
-  const [dock, setDock] = useState(DOCK_DEFAULT)
-  const [dockWritable, setDockWritable] = useState(false)
-  const [dockSaving, setDockSaving] = useState(false)
+  const [dock, setDock] = useState(() => dockSnapshot().dock)
+  const [dockWritable, setDockWritable] = useState(() => dockSnapshot().writable)
+  /**
+   * 正在保存的开关（按键记录）。
+   *
+   * 早先是一个共享布尔：点任何一个勾选框都会把**全部**勾选框置灰，POST 回来再恢复 ——
+   * 肉眼就是「整个配置页的勾选都在闪」。现在只有被点的那一个在处理中。
+   */
+  const [dockSavingKeys, setDockSavingKeys] = useState<ReadonlySet<DockKey>>(() => new Set())
   const [dockError, setDockError] = useState<string | null>(null)
   /** 「结束守护进程」按钮在飞，防止连点。 */
   const [keeperStopping, setKeeperStopping] = useState(false)
@@ -990,12 +998,12 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       if (!res.ok) return
       const data = (await res.json()) as DockDoc
       if (data.dock !== undefined) {
-        // 老后端只回 credits/queue：缺的键用兜底值补齐，别把 undefined 塞进 state。
-        const next = { ...DOCK_DEFAULT, ...data.dock }
-        setDock(next)
-        setSidebarPanelWanted(next.sidebar)
+        // 写进共享状态：另一张开着的卡片（设置页 / 侧边栏）会立刻跟着变。
+        publishDock({ dock: data.dock })
+        setSidebarPanelWanted(data.dock.sidebar === true)
+        setSettingsEntryWanted(data.dock.settingsEntry !== false)
       }
-      setDockWritable(data.writable === true)
+      publishDock({ writable: data.writable === true })
     } catch {
       // 老后端没这条路由：保持默认（都显示 / 侧边栏关闭），勾选框置灰，别把整张卡片报成出错。
     }
@@ -1007,15 +1015,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
    * 这里不像模型勾选那样攒草稿再点保存 —— 只有几个布尔，攒草稿反而让用户猜
    * 「我刚才那一下到底生效没有」。
    */
-  async function toggleDock(
-    key: 'credits' | 'queue' | 'sidebar' | 'modelDetail' | 'autoClaim' | 'keepAliveDaemon',
-    on: boolean,
-  ): Promise<void> {
+  async function toggleDock(key: DockKey, on: boolean): Promise<void> {
     const previous = dock
     setDock({ ...dock, [key]: on })
-    setDockSaving(true)
+    setDockSavingKeys(current => new Set(current).add(key))
     setDockError(null)
     // 侧边栏开关要立刻反映到导航行上，不等 POST 回来（乐观更新，失败再退回去）。
+    // 设置左侧入口不能这么做：一改就要把承载本卡片的设置页整段拆掉（组件卸载），
+    // POST 失败时连错误提示都没机会画出来 —— 表现为「闪一下又变回勾选」。
     if (key === 'sidebar') setSidebarPanelWanted(on)
     try {
       const res = await fetch('/api/codearts/dock', {
@@ -1029,16 +1036,22 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       }
       const data = (await res.json()) as DockDoc
       if (data.dock !== undefined) {
-        const next = { ...DOCK_DEFAULT, ...data.dock }
-        setDock(next)
-        setSidebarPanelWanted(next.sidebar)
+        // 成功后写共享状态：别的卡片实例（设置页 / 侧边栏）立刻同步。
+        publishDock({ dock: data.dock })
+        setSidebarPanelWanted(data.dock.sidebar === true)
+        setSettingsEntryWanted(data.dock.settingsEntry !== false)
       }
     } catch (error: unknown) {
       setDock(previous)
       if (key === 'sidebar') setSidebarPanelWanted(previous.sidebar)
       setDockError(error instanceof Error ? error.message : String(error))
     } finally {
-      setDockSaving(false)
+      setDockSavingKeys(current => {
+        if (!current.has(key)) return current
+        const next = new Set(current)
+        next.delete(key)
+        return next
+      })
     }
   }
 
@@ -1065,7 +1078,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
         dock?: DockDoc['dock']
         error?: string
       }
-      if (data.dock !== undefined) setDock({ ...DOCK_DEFAULT, ...data.dock })
+      if (data.dock !== undefined) publishDock({ dock: data.dock })
       if (!res.ok || data.ok === false) {
         setKeeperNotice(t('displayKeeperStopFailed', { message: data.reason ?? data.error ?? `HTTP ${res.status}` }))
       } else {
@@ -1168,6 +1181,12 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   useEffect(() => {
     void refreshDock()
   }, [])
+
+  // 共享状态变了（另一张卡片改了开关）就跟着刷新，别一直显示旧快照。
+  useEffect(() => subscribeDock(() => {
+    setDock(dockSnapshot().dock)
+    setDockWritable(dockSnapshot().writable)
+  }), [])
 
   useEffect(() => {
     if (status?.status === 'signed-in') void refreshSelection()
@@ -1858,7 +1877,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     <Checkbox
                       className={styles.check}
                       checked={dock.credits}
-                      disabled={!dockWritable || dockSaving}
+                      disabled={!dockWritable || dockSavingKeys.has('credits')}
                       onChange={on => void toggleDock('credits', on)}
                       label={t('displayCreditsToggle')}
                     />
@@ -1867,7 +1886,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     <Checkbox
                       className={styles.check}
                       checked={dock.queue}
-                      disabled={!dockWritable || dockSaving}
+                      disabled={!dockWritable || dockSavingKeys.has('queue')}
                       onChange={on => void toggleDock('queue', on)}
                       label={t('displayQueueToggle')}
                     />
@@ -1881,7 +1900,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     <Checkbox
                       className={styles.check}
                       checked={dock.modelDetail}
-                      disabled={!dockWritable || dockSaving}
+                      disabled={!dockWritable || dockSavingKeys.has('modelDetail')}
                       onChange={on => void toggleDock('modelDetail', on)}
                       label={t('displayModelDetailToggle')}
                     />
@@ -1905,7 +1924,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     <Checkbox
                       className={styles.check}
                       checked={dock.autoClaim}
-                      disabled={!dockWritable || dockSaving}
+                      disabled={!dockWritable || dockSavingKeys.has('autoClaim')}
                       onChange={on => void toggleDock('autoClaim', on)}
                       label={t('displayAutoClaimToggle')}
                     />
@@ -1943,7 +1962,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     <Checkbox
                       className={styles.check}
                       checked={dock.keepAliveDaemon}
-                      disabled={!dockWritable || dockSaving}
+                      disabled={!dockWritable || dockSavingKeys.has('keepAliveDaemon')}
                       onChange={on => void toggleDock('keepAliveDaemon', on)}
                       label={t('displayKeeperToggle')}
                     />
@@ -1968,6 +1987,28 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 )}
               </div>
 
+              {/*
+                设置导航入口：默认显示。用户找插件的第一反应是「设置里从左列找」，
+                只挂在「内置插件 → 详情页」里等于默认找不到（issue #7）。
+              */}
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displaySettingsEntryTitle')}</span>
+                </div>
+                <p className={styles.hint}>{t('displaySettingsEntryHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.settingsEntry}
+                      disabled={!dockWritable || dockSavingKeys.has('settingsEntry')}
+                      onChange={on => void toggleDock('settingsEntry', on)}
+                      label={t('displaySettingsEntryToggle')}
+                    />
+                  </div>
+                </div>
+              </div>
+
               <div className={styles.section}>
                 <div className={styles.sectionHead}>
                   <span className={styles.sectionLabel}>{t('displaySidebarTitle')}</span>
@@ -1978,7 +2019,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     <Checkbox
                       className={styles.check}
                       checked={dock.sidebar}
-                      disabled={!dockWritable || dockSaving}
+                      disabled={!dockWritable || dockSavingKeys.has('sidebar')}
                       onChange={on => void toggleDock('sidebar', on)}
                       label={t('displaySidebarToggle')}
                     />

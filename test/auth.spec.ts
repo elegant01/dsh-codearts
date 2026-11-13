@@ -27,6 +27,7 @@ import {
   saveCredential,
   tokensEqual,
 } from '../src/auth.ts'
+import { OAuthTokenError } from '../src/oauth.ts'
 
 let dir: string
 let authPath: string
@@ -157,8 +158,8 @@ describe('CodeArtsCredentialStore', () => {
 
   // The card shows "expired, sign in again" off this flag; silently serving a
   // dead token would surface as an opaque upstream 401 instead.
-  it('marks the credential stale and persists it when refresh fails', async () => {
-    refreshTokenMock.mockRejectedValue(new Error('refresh rejected'))
+  it('marks the credential stale and persists it when the refresh token is invalid', async () => {
+    refreshTokenMock.mockRejectedValue(new OAuthTokenError('refresh', 400, '{"error":"invalid_grant"}'))
     const store = new CodeArtsCredentialStore(authPath)
     await saveCredential(authPath, credentialFromOAuth(
       oauthToken({ expiration: new Date(Date.now() + 60_000).toISOString() }),
@@ -166,6 +167,51 @@ describe('CodeArtsCredentialStore', () => {
 
     expect((await store.ensureFresh())?.stale).toBe(true)
     expect((await loadCredential(authPath))?.stale).toBe(true)
+    // 凭证真失效时没有重试的意义：只打一次上游。
+    expect(refreshTokenMock).toHaveBeenCalledTimes(1)
+  })
+
+  // issue #8：网络抖动/超时/5xx 一次都不能把凭证判死。以前任何 catch 都写 stale
+  // 并落库，重启也救不回来，只能手工重新登录。
+  it('keeps the credential alive across a transient refresh failure', async () => {
+    refreshTokenMock.mockRejectedValue(new TypeError('fetch failed'))
+    const store = new CodeArtsCredentialStore(authPath)
+    await saveCredential(authPath, credentialFromOAuth(
+      oauthToken({ expiration: new Date(Date.now() + 60_000).toISOString() }),
+    ))
+
+    const cred = await store.ensureFresh()
+    expect(cred?.token).toBe('sts-token')
+    expect(cred?.stale).toBeUndefined()
+    expect((await loadCredential(authPath))?.stale).toBeUndefined()
+    // 瞬时失败给有限次重试，不是打一次就放弃。
+    expect(refreshTokenMock.mock.calls.length).toBeGreaterThan(1)
+  })
+
+  it('does not retry a 5xx forever and still refuses to brick the credential', async () => {
+    refreshTokenMock.mockRejectedValue(new OAuthTokenError('refresh', 503, 'service unavailable'))
+    const store = new CodeArtsCredentialStore(authPath)
+    await saveCredential(authPath, credentialFromOAuth(
+      oauthToken({ expiration: new Date(Date.now() + 60_000).toISOString() }),
+    ))
+
+    expect((await store.ensureFresh())?.stale).toBeUndefined()
+    expect(refreshTokenMock.mock.calls.length).toBe(3)
+  })
+
+  // 瞬时失败之后的冷却：token 已过期时不能每个请求都再刷一遍，否则上游抖动期间
+  // 会把一次性的 refresh_token 反复烧掉。
+  it('stops touching the refresh token for a while after transient failures', async () => {
+    refreshTokenMock.mockRejectedValue(new TypeError('fetch failed'))
+    const store = new CodeArtsCredentialStore(authPath)
+    await saveCredential(authPath, credentialFromOAuth(
+      oauthToken({ expiration: new Date(Date.now() + 60_000).toISOString() }),
+    ))
+
+    await store.ensureFresh()
+    const calls = refreshTokenMock.mock.calls.length
+    await store.ensureFresh()
+    expect(refreshTokenMock).toHaveBeenCalledTimes(calls)
   })
 })
 

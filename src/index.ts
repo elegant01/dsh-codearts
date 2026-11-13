@@ -22,10 +22,11 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { appendFileSync, statSync, writeFileSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { CodeArtsAccountStore, codeartsAccountsPath } from './auth.ts'
+import { CodeArtsAccountStore, codeartsAccountsPath, codeartsDebugLogPath, codeartsRefreshLogPath } from './auth.ts'
 import { CodeArtsAccountPool } from './account-pool.ts'
 import { CodeArtsCatalog, filterEnabledModels, isBenefitModel } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
@@ -127,6 +128,14 @@ export interface Config {
    */
   showSidebarPanel?: boolean
   /**
+   * 是否在 DSH 设置左侧导航里加一个 CodeArts 入口（点开是整页版卡片）。
+   *
+   * 缺省 = **显示**。插件自带的配置页挂在「内置插件 → bundle 详情页」里，这条路径
+   * 对第一次用的人基本等于找不到（issue #7）。设置导航本来就是按插件分组的，
+   * 多一项不会挤占主界面，所以缺省开；不想要的人可以在卡片的「显示」页关掉。
+   */
+  showSettingsEntry?: boolean
+  /**
    * 对话底部的「Model 模型 · x 倍率 · 排队」这几段是否显示。缺省 = 显示。
    *
    * 只管 **Model 及其右侧**：`Provider CodeArts` 是插件的身份标识，永远显示，
@@ -174,6 +183,7 @@ export const Config: z<Config> = z.object({
   showCreditDock: z.boolean().default(true).description('Show the remaining-credits line under the chat input box').volatile(),
   showQueueDock: z.boolean().default(true).description('Show the upstream queue position under the chat input box').volatile(),
   showSidebarPanel: z.boolean().default(false).description('Show a CodeArts icon in the DSH sidebar icon column, opening this page in the middle column').volatile(),
+  showSettingsEntry: z.boolean().default(true).description('Show a CodeArts entry in the left navigation of DSH Settings (default: shown)').volatile(),
   showModelDetailDock: z.boolean().default(true).description('Show "Model … · x ratio" on the line under the chat input box (Provider CodeArts always shows)').volatile(),
   autoClaim: z.boolean().default(false).description('Automatically claim the daily sign-in credits for every signed-in account').volatile(),
   keepAliveDaemon: z.boolean().default(false).description('Keep a detached background process that refreshes the OAuth credential while DSH is closed').volatile(),
@@ -186,8 +196,28 @@ function settingsCompatNamespace(ctx: Context): SettingsNamespace {
 export function apply(ctx: Context, rawConfig: Config): void {
   const config = unwrapConfig(rawConfig)
   const accountsPath = codeartsAccountsPath()
+  /**
+   * 续期失败日志。
+   *
+   * 宿主对插件的 `info`/`debug` 没有任何出口，`warn` 会变成系统通知 —— 一次网络抖动
+   * 就弹一次窗口显然不行。所以失败原因写插件自己的文件（issue #8 里 03:22 那次续期
+   * 失败就是因为零日志而永远无法取证）。1MB 截断重来，避免长期运行无限增长。
+   */
+  const appendRefreshLog = (message: string): void => {
+    try {
+      const path = codeartsRefreshLogPath()
+      try {
+        if (statSync(path).size > 1_000_000) writeFileSync(path, '')
+      } catch {
+        // 文件还不存在：append 会创建它。
+      }
+      appendFileSync(path, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 })
+    } catch {
+      // 日志写不进去不能影响续期本身。
+    }
+  }
   // 多账号：池与账号文档分离——文档管凭证，池管「谁现在能接活」。
-  const store = new CodeArtsAccountStore(accountsPath)
+  const store = new CodeArtsAccountStore(accountsPath, undefined, { log: appendRefreshLog })
   const pool = new CodeArtsAccountPool([])
   const catalog = new CodeArtsCatalog()
   // 用量账本：记本机经插件发出的请求（账号总额度见 credits.ts，这里只记本机）。
@@ -257,6 +287,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     credits: current().showCreditDock !== false,
     queue: current().showQueueDock !== false,
     sidebar: current().showSidebarPanel === true,
+    settingsEntry: current().showSettingsEntry !== false,
     modelDetail: current().showModelDetailDock !== false,
     autoClaim: current().autoClaim === true,
     keepAliveDaemon: current().keepAliveDaemon === true,
@@ -269,6 +300,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
       ...patch.credits === undefined ? {} : { showCreditDock: patch.credits },
       ...patch.queue === undefined ? {} : { showQueueDock: patch.queue },
       ...patch.sidebar === undefined ? {} : { showSidebarPanel: patch.sidebar },
+      ...patch.settingsEntry === undefined ? {} : { showSettingsEntry: patch.settingsEntry },
       ...patch.modelDetail === undefined ? {} : { showModelDetailDock: patch.modelDetail },
       ...patch.autoClaim === undefined ? {} : { autoClaim: patch.autoClaim },
       ...patch.keepAliveDaemon === undefined ? {} : { keepAliveDaemon: patch.keepAliveDaemon },
@@ -727,7 +759,28 @@ export function apply(ctx: Context, rawConfig: Config): void {
   })
 
   // Build the loopback shim first; the adapter reads its origin at construction.
-  const shim = createCodeArtsShim({ store, catalog, pool, usage, queue, logger: ctx.logger })
+  /**
+   * 槽位取证日志：acquire/release 的时间点与在飞计数。
+   *
+   * 默认关闭（只有 `DSH_CODEARTS_DEBUG=1` 时写）。issue #8 里「只剩一个在飞请求，
+   * 但所有 acquire 都失败」的怀疑，只能靠这份日志证实或排除。
+   */
+  const writeDebugLog = process.env.DSH_CODEARTS_DEBUG === '1'
+    ? (message: string): void => {
+      try {
+        const path = codeartsDebugLogPath()
+        try {
+          if (statSync(path).size > 2_000_000) writeFileSync(path, '')
+        } catch {
+          // 文件还不存在：append 会创建它。
+        }
+        appendFileSync(path, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 })
+      } catch {
+        // 取证日志失败绝不能影响转发。
+      }
+    }
+    : undefined
+  const shim = createCodeArtsShim({ store, catalog, pool, usage, queue, logger: ctx.logger, debug: writeDebugLog })
 
   // 账本懒加载：读盘失败/文件不存在都不影响插件启动。
   void usage.load().catch(() => {})

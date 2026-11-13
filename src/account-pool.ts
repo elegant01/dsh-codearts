@@ -91,6 +91,8 @@ export class CodeArtsAccountPool {
   private readonly preferred = new Set<string>()
   private readonly maxConcurrent: number
   private readonly now: () => number
+  /** 等槽位的唤醒器：槽位释放 / 池里新增账号 / 账号复活时逐个唤醒。 */
+  private readonly waiters = new Set<() => void>()
 
   constructor(ids: readonly string[], options: PoolOptions = {}) {
     this.maxConcurrent = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT
@@ -101,6 +103,7 @@ export class CodeArtsAccountPool {
   /** 让池与账号文档对齐：新增的进来，删掉的出去。已有账号的运行时状态保留。 */
   sync(ids: readonly string[]): void {
     const wanted = new Set(ids)
+    const before = this.accounts.size
     for (const id of [...this.accounts.keys()]) {
       if (!wanted.has(id)) this.accounts.delete(id)
     }
@@ -119,6 +122,8 @@ export class CodeArtsAccountPool {
         errorCount: 0,
       })
     }
+    // 新增的号自带空槽位：正在等槽位的请求应该立刻醒过来。
+    if (this.accounts.size !== before) this.notifyWaiters()
   }
 
   list(): AccountRuntime[] {
@@ -151,6 +156,13 @@ export class CodeArtsAccountPool {
   setPaused(ids: readonly string[]): void {
     this.paused.clear()
     for (const id of ids) this.paused.add(id)
+    // 取消暂停可能正好给了等槽位的请求一个可用账号。
+    this.notifyWaiters()
+  }
+
+  /** 当前被用户暂停的账号 id（报错文案要把「暂停」与「槽位满」分开说）。 */
+  pausedIds(): string[] {
+    return [...this.paused]
   }
 
   /** 设置置顶集合（账号 id）。置顶只在「同时可用」时改变先后，不会绕过冷却/上限。 */
@@ -188,6 +200,67 @@ export class CodeArtsAccountPool {
     const account = this.accounts.get(id)
     if (account === undefined) return
     if (account.activeConcurrent > 0) account.activeConcurrent -= 1
+    this.notifyWaiters()
+  }
+
+  private notifyWaiters(): void {
+    // 逐个 try：一个唤醒器抛错不该让别的等待者错过这次释放。
+    for (const waiter of [...this.waiters]) {
+      try {
+        waiter()
+      } catch {
+        // 等待器自己负责兜底；这里只保证通知链不断。
+      }
+    }
+  }
+
+  /** 现在是否有一个真正能接活的空槽位（禁用/暂停/冷却中的号不算）。 */
+  hasFreeSlot(): boolean {
+    const now = this.now()
+    return this.list().some(a => !a.disabled && !this.paused.has(a.id) && now >= a.coolUntil && a.activeConcurrent < a.maxConcurrent)
+  }
+
+  /**
+   * 有没有「健康、但本地槽位被占满」的号。
+   *
+   * 只有这一种情况值得等一会儿：禁用要重新登录、暂停是用户自己停的、冷却有明确
+   * 截止时间 —— 等它们都不会在预算内自己好。
+   */
+  hasBusyWaitable(): boolean {
+    const now = this.now()
+    return this.list().some(a => !a.disabled && !this.paused.has(a.id) && now >= a.coolUntil && a.activeConcurrent >= a.maxConcurrent)
+  }
+
+  /**
+   * 等一个本地槽位空出来，最多 `maxWaitMs`。
+   *
+   * 返回 true = 等到了；false = 超时、被中止，或者池里根本没有「等一会儿就会空」的号。
+   * issue #8：本地槽位满以前是立刻回 429「没有可用账号」，并发场景下（一次派 5 个
+   * subagent）必然误伤；现在与上游排队对齐 —— 先短时等待，等不到再报错。
+   */
+  waitForFreeSlot(maxWaitMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (this.hasFreeSlot()) return Promise.resolve(true)
+    if (!this.hasBusyWaitable() || maxWaitMs <= 0) return Promise.resolve(false)
+    if (signal?.aborted === true) return Promise.resolve(false)
+    return new Promise<boolean>(resolve => {
+      let settled = false
+      const finish = (value: boolean): void => {
+        if (settled) return
+        settled = true
+        this.waiters.delete(check)
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        resolve(value)
+      }
+      const check = (): void => {
+        if (this.hasFreeSlot()) finish(true)
+      }
+      const onAbort = (): void => finish(false)
+      const timer = setTimeout(() => finish(false), maxWaitMs)
+      timer.unref?.()
+      this.waiters.add(check)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 
   /**
@@ -246,6 +319,7 @@ export class CodeArtsAccountPool {
     account.lastCapAt = 0
     account.errorCount = 0
     account.lastError = undefined
+    this.notifyWaiters()
   }
 
   /** 上游 5xx / 软限流：短时冷却。 */

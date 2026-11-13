@@ -30,7 +30,7 @@ import {
   type CodeArtsKeeperState,
 } from './keeper.ts'
 import { readAccountDocument, writeJsonAtomic, codeartsAccountsPath } from './auth.ts'
-import { refreshToken, defaultLoginConfig } from './oauth.ts'
+import { refreshToken, defaultLoginConfig, OAuthTokenError } from './oauth.ts'
 
 /** 单次续期的预算：慢请求不能把整轮堵死。 */
 const REFRESH_TIMEOUT_MS = 30_000
@@ -138,11 +138,28 @@ async function tick(state: CodeArtsKeeperState): Promise<void> {
       refreshed += 1
       log(`refreshed ${id.slice(0, 12)} → expires ${next.expiration}`)
     } catch (error: unknown) {
-      // 续期失败标记 stale 落库：让卡片明确提示「要重新登录」，而不是拿过期凭证硬用。
-      doc.accounts[id] = { ...cred, stale: true }
-      dirty = true
-      needsLogin.push(id)
-      log(`refresh FAILED ${id.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`)
+      // refresh token 一次性：插件那边先刷了，我们手里的就是「已用掉」。重读一次
+      // 文档看有没有更新的令牌；有就留到下一轮，别把刚写好的新令牌判死。
+      const used = error instanceof OAuthTokenError && error.refreshTokenUsed
+      if (used) {
+        const fresh = await readAccountDocument(accountsPath)
+        const advanced = fresh !== undefined && fresh.accounts[id]?.refreshToken !== undefined
+          && fresh.accounts[id]?.refreshToken !== cred.refreshToken
+        log(`refresh SKIPPED ${id.slice(0, 12)} (refresh token already used${advanced ? ', newer token on disk' : ''})`)
+        if (advanced) continue
+      }
+      // 只有 invalid_grant 这一类才把号判死。网络/超时/5xx/429 留到下一轮（20 分钟）
+      // 再试 —— 任何失败就写 stale 会让一次网络抖动变成「必须重新登录」（issue #8）。
+      const permanent = !used && error instanceof OAuthTokenError && error.permanent
+      if (permanent) {
+        doc.accounts[id] = { ...cred, stale: true }
+        dirty = true
+        needsLogin.push(id)
+      }
+      const reason = error instanceof OAuthTokenError
+        ? `HTTP ${error.status} ${error.body.slice(0, 200)}`
+        : error instanceof Error ? error.message : String(error)
+      log(`refresh FAILED ${id.slice(0, 12)} (${permanent ? 'permanent, marked stale' : 'transient, retry next pass'}): ${reason}`)
     }
   }
 

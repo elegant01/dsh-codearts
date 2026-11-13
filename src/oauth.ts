@@ -86,6 +86,50 @@ function buildTokenBody(cfg: LoginConfig, params: Record<string, string>): strin
   return form.toString()
 }
 
+/**
+ * 华为 STS 的 token 端点错误。
+ *
+ * 必须把 HTTP 状态带出来：续期失败到底该不该把账号判死，全看这一层 —— 网络抖动 /
+ * 5xx / 429 是可以重试的，`invalid_grant`（refresh_token 真失效）才必须重新登录。
+ * 早先这里抛的是拼好的字符串，调用方只能整段 `catch {}`，于是任何一次抖动都会把
+ * 凭证永久写成 stale（issue #8）。
+ */
+export class OAuthTokenError extends Error {
+  readonly status: number
+  readonly body: string
+
+  constructor(action: 'exchange' | 'refresh', status: number, body: string) {
+    super(`${action === 'refresh' ? 'refresh token' : 'exchange code'} failed: ${status} ${body}`)
+    this.name = 'OAuthTokenError'
+    this.status = status
+    this.body = body
+  }
+
+  /**
+   * 凭证本身失效（只能重新登录），而不是这一趟请求/网络的问题。
+   *
+   * 4xx 里除了 408（超时）和 429（限流）都属于这一类：`invalid_grant` /
+   * `invalid_request` / 401 / 403 重试多少次都是同一个结果。
+   */
+  get permanent(): boolean {
+    if (this.status === 408 || this.status === 429) return false
+    return this.status >= 400 && this.status < 500
+  }
+
+  /**
+   * refresh_token 已经被别处用掉（一次性令牌的轮换现象）。
+   *
+   * 这**不等于**凭证失效：守护进程（keeper）和插件各有一份同一账号的刷新权时，
+   * 先刷的一方拿走了新令牌，后刷的一方必然撞上这个码。处理方式是重读磁盘拿新令牌
+   * 再试，而不是把账号判死（2026-11-13 实测：判死的同时还把 keeper 刚写回来的新
+   * refresh_token 覆盖成了旧的，只能重新登录）。
+   */
+  get refreshTokenUsed(): boolean {
+    if (this.status !== 400) return false
+    return this.body.includes('STS5.1806') || /has been used/i.test(this.body)
+  }
+}
+
 /** 用授权 code 换 token。 */
 export async function exchangeCode(
   cfg: LoginConfig,
@@ -116,7 +160,7 @@ export async function exchangeCode(
   })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(`exchange code failed: ${res.status} ${text}`)
+    throw new OAuthTokenError('exchange', res.status, text)
   }
   return parseToken(await res.json(), dpopJWK, cfg.clientId)
 }
@@ -146,7 +190,7 @@ export async function refreshToken(
   })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(`refresh token failed: ${res.status} ${text}`)
+    throw new OAuthTokenError('refresh', res.status, text)
   }
   return parseToken(await res.json(), prev.dpopPrivateKey, prev.clientId, prev)
 }

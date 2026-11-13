@@ -472,8 +472,8 @@ describe('no-account error message', () => {
   })
 
   it('says the local slots are full when every healthy account is busy', async () => {
-    // 两个在飞请求占满 A 的本地槽位（每账号 2 个），第三个应当立刻拿到
-    // 「槽位已满」而不是笼统的「没有可用账号」。
+    // 两个在飞请求占满 A 的本地槽位（每账号 2 个）。等一小会儿仍没空位，第三个
+    // 应当拿到「账号忙 / 槽位已满」而不是笼统的「没有可用账号」。
     ids = ['A']
     seenTokens = []
     vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => {
@@ -489,6 +489,8 @@ describe('no-account error message', () => {
       store: { ids: async () => ids, pausedIds: async () => [], pinnedIds: async () => [], resolve: async (id: string) => credentialFor(id) } as never,
       catalog: { current: () => [] } as never,
       pool,
+      // 把「等槽位」压到 300ms，别让用例真的干等 30 秒。
+      localSlotWaitMs: 300,
     })
     await shim.ready
     port = Number(new URL(shim.baseUrl()).port)
@@ -502,6 +504,48 @@ describe('no-account error message', () => {
     expect(res.status).toBe(429)
     expect(res.text).toContain('槽位已满')
     expect(res.text).not.toContain('被禁用')
+
+    await Promise.all(inflight)
+  })
+
+  // issue #8：本地槽位满不该立刻失败 —— 一个长响应结束（或用户点了停止）就会空出
+  // 槽位，等一小会儿就能成功。以前这里直接 429，并发派发时整轮失败。
+  it('waits for a local slot to free up instead of failing the request', async () => {
+    ids = ['A']
+    seenTokens = []
+    let calls = 0
+    vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => {
+      seenTokens.push(authTokenOf(init as { headers?: unknown }))
+      calls += 1
+      if (calls <= 2) {
+        // 前两个请求占着槽位，直到客户端断开。
+        await new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+        })
+      }
+      return sseResponse(OK_CHUNKS)
+    }))
+    pool = new CodeArtsAccountPool([])
+    shim = createCodeArtsShim({
+      store: { ids: async () => ids, pausedIds: async () => [], pinnedIds: async () => [], resolve: async (id: string) => credentialFor(id) } as never,
+      catalog: { current: () => [] } as never,
+      pool,
+      localSlotWaitMs: 5_000,
+    })
+    await shim.ready
+    port = Number(new URL(shim.baseUrl()).port)
+    bearer = shim.token()
+
+    // 两个请求占满 A 的 2 个槽位，400ms 后一起断开（模拟「停止生成」）。
+    const inflight = [postAbortable(port, bearer, 400), postAbortable(port, bearer, 400)]
+    await vi.waitFor(() => { expect(seenTokens.length).toBe(2) })
+
+    const started = Date.now()
+    const res = await post(port, bearer)
+    expect(res.status).toBe(200)
+    // 确实等过槽位，而不是一开始就被挡回去。
+    expect(Date.now() - started).toBeGreaterThanOrEqual(300)
+    expect(seenTokens.length).toBe(3)
 
     await Promise.all(inflight)
   })

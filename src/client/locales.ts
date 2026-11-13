@@ -175,6 +175,8 @@ export interface CodeArtsSettingsKey {
   creditsDockPanelTitle: string
   creditsDockRefresh: string
   creditsDockRefreshing: string
+  creditsDockSettings: string
+  creditsDockSettingsFailed: string
   creditsDockNoTokens: string
   creditsDockEmpty: string
   creditsDockExpiring: string
@@ -204,6 +206,9 @@ export interface CodeArtsSettingsKey {
   displayKeeperLog: string
   displayNotWritable: string
   displayFailed: string
+  displaySettingsEntryTitle: string
+  displaySettingsEntryHint: string
+  displaySettingsEntryToggle: string
   displaySidebarTitle: string
   displaySidebarHint: string
   displaySidebarToggle: string
@@ -214,6 +219,8 @@ export interface CodeArtsSettingsKey {
   claimPending: string
   claimAll: string
   claimHint: string
+  /** 知道上游当前活动给多少分时用这条；{amount} 来自福利中心 delivery 的 benefitAmount。 */
+  claimHintAmount: string
   claimDone: string
   claimAlready: string
   claimUnavailable: string
@@ -378,6 +385,8 @@ export const zh: CodeArtsSettingsKey = {
   creditsDockPanelTitle: 'CodeArts 积分',
   creditsDockRefresh: '刷新积分',
   creditsDockRefreshing: '刷新中…',
+  creditsDockSettings: '设置',
+  creditsDockSettingsFailed: '打不开设置面板，请从「设置 → CodeArts」进入。',
   creditsDockNoTokens: '今天还没有经插件发出的请求',
   creditsDockEmpty: '暂时没有积分数据',
   creditsDockExpiring: '{account}：{expiring} 积分将在本周期结束时作废',
@@ -407,6 +416,9 @@ export const zh: CodeArtsSettingsKey = {
   displayKeeperLog: '进程日志：{path}',
   displayNotWritable: '这个宿主没给插件开配置存储，开关只能看不能改。',
   displayFailed: '保存失败：{message}',
+  displaySettingsEntryTitle: '设置左侧入口',
+  displaySettingsEntryHint: '勾上以后，DSH 设置左侧那一列里会多一项 CodeArts，点开就是当前这一页。默认勾上：插件自带的配置页本来挂在「内置插件」的详情页里，第一次用的人基本找不到。不想要可以在这里关掉，关掉后仍可从「内置插件 → dsh-codearts」进入。改完立刻生效。',
+  displaySettingsEntryToggle: '在设置左侧导航显示 CodeArts',
   displaySidebarTitle: '侧边栏图标',
   displaySidebarHint: '勾上以后，DSH 左侧那一列图标里会多一个 CodeArts，点它直接在中间列打开当前这一页，不必每次都绕进设置。默认不勾：这列图标是全宿主共用的，每个插件都来占一格很快就挤满了。改完立刻生效，没有保存步骤。',
   displaySidebarToggle: '在侧边栏图标列显示 CodeArts',
@@ -416,7 +428,8 @@ export const zh: CodeArtsSettingsKey = {
   claimButtonDone: '今日已领',
   claimPending: '领取中…',
   claimAll: '全部账号领取',
-  claimHint: '每天领一次 1000 积分，走官方福利中心接口（与客户端里那个「每日签到」同一件事）。',
+  claimHint: '每天可领一次签到积分，走官方福利中心接口（与客户端里那个「每日签到」同一件事）。',
+  claimHintAmount: '每天领一次 {amount} 积分，走官方福利中心接口（与客户端里那个「每日签到」同一件事）。',
   claimDone: '已领取 {amount} 积分',
   claimAlready: '今日已领，明天再来',
   claimUnavailable: '这个账号当前没有可领的签到活动',
@@ -580,6 +593,8 @@ export const en: CodeArtsSettingsKey = {
   creditsDockPanelTitle: 'CodeArts credits',
   creditsDockRefresh: 'Refresh credits',
   creditsDockRefreshing: 'Refreshing…',
+  creditsDockSettings: 'Settings',
+  creditsDockSettingsFailed: 'Could not open Settings. Open Settings → CodeArts instead.',
   creditsDockNoTokens: 'No requests through the plugin today yet',
   creditsDockEmpty: 'No credit data yet',
   creditsDockExpiring: '{account}: {expiring} credits expire when this cycle ends',
@@ -609,6 +624,9 @@ export const en: CodeArtsSettingsKey = {
   displayKeeperLog: 'Process log: {path}',
   displayNotWritable: 'This host gives the plugin nowhere to persist settings, so the switches are read-only.',
   displayFailed: 'Failed to save: {message}',
+  displaySettingsEntryTitle: 'Settings entry',
+  displaySettingsEntryHint: 'Once checked, a CodeArts item joins the left navigation of DSH Settings and opens this very page. On by default: the plugin-owned page otherwise lives inside the Built-in plugins detail page, which first-time users rarely find. Uncheck to hide it — the page stays reachable from Built-in plugins → dsh-codearts. Takes effect immediately.',
+  displaySettingsEntryToggle: 'Show CodeArts in the Settings navigation',
   displaySidebarTitle: 'Sidebar icon',
   displaySidebarHint: 'Once checked, a CodeArts icon joins the icon column on the left of DSH and opens this very page in the middle column, so you do not have to go through Settings each time. Off by default: that column is shared by the whole host, and it fills up quickly if every plugin claims a slot. Takes effect immediately — there is nothing to save.',
   displaySidebarToggle: 'Show CodeArts in the sidebar icon column',
@@ -618,7 +636,8 @@ export const en: CodeArtsSettingsKey = {
   claimButtonDone: 'Claimed today',
   claimPending: 'Claiming…',
   claimAll: 'Claim for all accounts',
-  claimHint: 'Claim 1,000 credits once a day through CodeArts’ welfare centre — the same check-in the official client does.',
+  claimHint: 'Claim your check-in credits once a day through CodeArts’ welfare centre — the same check-in the official client does.',
+  claimHintAmount: 'Claim {amount} credits once a day through CodeArts’ welfare centre — the same check-in the official client does.',
   claimDone: 'Claimed {amount} credits',
   claimAlready: 'Already claimed today — come back tomorrow',
   claimUnavailable: 'No check-in campaign available for this account',

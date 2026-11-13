@@ -72,6 +72,16 @@ export interface CodeArtsShimOptions {
    */
   queue?: CodeArtsQueueGate
   logger?: ShimLogger
+  /**
+   * 调试日志（默认关闭）。
+   *
+   * 宿主对插件的 info/debug 没有出口，acquire/release 这类取证信息只能让宿主
+   * 注入一个落盘函数（见 index.ts 的 DSH_CODEARTS_DEBUG）。issue #8 的「槽位
+   * 疑似泄漏」没有这些日志就无法证实或排除。
+   */
+  debug?: (message: string) => void
+  /** 本地槽位满时最多等多久（缺省 30 秒）。测试用它把等待压到毫秒级。 */
+  localSlotWaitMs?: number
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -122,12 +132,17 @@ function queuedMessage(
  * 全部被禁用时回 401（宿主只自动重试 429，401 一次就把「去重新登录」说清）；
  * 只要还有会自己恢复的（冷却/槽位满）就回 429，宿主重试有概率直接救回来。
  */
-function noAccountError(accounts: readonly AccountRuntime[]): { status: number; kind: string; message: string } {
+function noAccountError(
+  accounts: readonly AccountRuntime[],
+  pausedIds: readonly string[] = [],
+): { status: number; kind: string; message: string } {
   const now = Date.now()
+  const paused = new Set(pausedIds)
   const disabled = accounts.filter(a => a.disabled)
   const cooling = accounts.filter(a => !a.disabled && now < a.coolUntil)
-  // 健康却没被选中：唯一剩下的原因就是本地槽位满了（pick/acquire 只拦这个）。
-  const busy = accounts.filter(a => !a.disabled && now >= a.coolUntil)
+  const idleButPaused = accounts.filter(a => !a.disabled && now >= a.coolUntil && paused.has(a.id))
+  // 健康、没暂停却没被选中：唯一剩下的原因就是本地槽位满了（pick/acquire 只拦这个）。
+  const busy = accounts.filter(a => !a.disabled && now >= a.coolUntil && !paused.has(a.id))
   const parts: string[] = []
   if (disabled.length > 0) {
     const reasons = disabled
@@ -139,10 +154,18 @@ function noAccountError(accounts: readonly AccountRuntime[]): { status: number; 
     const secs = Math.max(1, Math.ceil((Math.min(...cooling.map(a => a.coolUntil)) - now) / 1000))
     parts.push(`${cooling.length} 个在短时冷却中（约 ${secs} 秒后恢复）`)
   }
-  if (busy.length > 0) {
-    parts.push(`${busy.length} 个的本地并发槽位已满（每账号最多 ${busy[0]?.maxConcurrent ?? 2} 个在飞请求），等几秒再发`)
+  if (idleButPaused.length > 0) {
+    parts.push(`${idleButPaused.length} 个已被暂停（在卡片上取消暂停即可恢复）`)
   }
-  const message = `codearts 当前没有可用账号：${parts.join('；')}`
+  if (busy.length > 0) {
+    parts.push(`${busy.length} 个的本地并发槽位已满（每账号最多 ${busy[0]?.maxConcurrent ?? 2} 个在飞请求）`)
+  }
+  // 只是「都在忙」时别说成「没有账号」：账号是好的，只是被长响应占着。这句话
+  // 会被用户和 DSH 都当成故障信号（issue #8）。
+  const onlyBusy = disabled.length === 0 && cooling.length === 0 && idleButPaused.length === 0 && busy.length > 0
+  const message = onlyBusy
+    ? `codearts 账号忙：${parts.join('；')}，已等待仍没有空位，请稍后重试`
+    : `codearts 当前没有可用账号：${parts.join('；')}`
   return disabled.length === accounts.length
     ? { status: 401, kind: 'session_dead', message }
     : { status: 429, kind: 'soft_rate', message }
@@ -285,6 +308,17 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   const logger = options.logger
   const usage = options.usage
   const queue = options.queue
+  const debug = options.debug
+  /**
+   * 本地槽位满时的等待预算。
+   *
+   * 以前「本地 2 个槽位都占着」立刻回 429「没有可用账号」，而 DSH 的 llm-retry 对
+   * soft_rate 只有 5 次 / 最长 10s 间隔，熬不过一段流式响应 ⇒ 并发派发（一次 5 个
+   * subagent）必然有请求整轮失败（issue #8）。改成先等槽位释放，等不到再报错。
+   * 30 秒上限：pi-ai 的 90 秒 idle 超时还没有开始计时（我们连响应头都没发）。
+   */
+  const LOCAL_SLOT_WAIT_MS = 30_000
+  const localSlotWaitBudgetMs = options.localSlotWaitMs ?? LOCAL_SLOT_WAIT_MS
   // 账号池。空池起步，每次请求前用 store.ids() 对齐（新增/删除账号自动跟上）。
   const pool = options.pool ?? new CodeArtsAccountPool([])
 
@@ -549,6 +583,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     let cappedAccount: string | undefined
     let tpmAccount: string | undefined
     let queueWaitedMs = 0
+    let localSlotWaitedMs = 0
     let lastKind: UpstreamErrorKind | undefined
     let lastAccountId: string | undefined
     let lastStatus = 0
@@ -557,104 +592,132 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     // 轮换与下面的兜底排队共用这一个截止点。
     const rotateDeadline = Date.now() + CAP_WAIT_LIMIT
     const attempts = Math.min(Math.max(ids.length, ROTATE_MIN_ATTEMPTS), ROTATE_MAX_ATTEMPTS)
+    /** 日志里区分并发请求；没开调试时不生成。 */
+    const requestTag = debug === undefined ? '' : randomBytes(3).toString('hex')
 
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      // 剩下的预算还得够过一次挂号（queue.ts 的 maxWaitMs 默认 20 秒），否则这一试
-      // 自己就会把截止点拖过去，比直接报错更糟。
-      if (Date.now() + ATTEMPT_RESERVE_MS > rotateDeadline) break
-      const id = pool.pick(tried)
-      if (id === undefined) break
-      tried.add(id)
-      if (!pool.acquire(id)) continue
-      try {
-        const credential = await store.resolve(id)
-        if (credential === undefined) {
-          pool.disable(id, 'no credential')
+    /**
+     * 两轮：第一轮按账号轮换；如果全被「本地槽位满」挡住，就等一个槽位空出来
+     * 再跑第二轮。以前这里直接落到「没有可用账号」的 429，并发派发（一次 5 个
+     * subagent）必然误伤（issue #8）。
+     */
+    for (let round = 0; round < 2; round += 1) {
+      tried.clear()
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        // 剩下的预算还得够过一次挂号（queue.ts 的 maxWaitMs 默认 20 秒），否则这一试
+        // 自己就会把截止点拖过去，比直接报错更糟。
+        if (Date.now() + ATTEMPT_RESERVE_MS > rotateDeadline) break
+        const id = pool.pick(tried)
+        if (id === undefined) break
+        tried.add(id)
+        if (!pool.acquire(id)) {
+          debug?.(`acquire miss req=${requestTag} ${id} active=${pool.get(id)?.activeConcurrent ?? '?'}/${pool.get(id)?.maxConcurrent ?? '?'}`)
           continue
         }
-        // 上游排队要客户端自己挂号：先占号、轮询到 working 再发聊天请求。
-        // 只等一小会儿（闸门里的 maxWaitMs），还在队里就把位置回给用户 ——
-        // 挂着他二十几分钟不是产品，而且宿主的 90 秒流空闲超时也会先掐掉。
-        if (queue !== undefined) {
-          const gate = await queue.wait(credential, checked.chatId, checked.model, controller.signal)
-          if (controller.signal.aborted) return
-          if (gate.kind === 'queued') {
-            // 400 而不是 429：宿主的 classifyPiAiError 按状态码归类，429 会被判成
-            // RATE_LIMIT 并自动重试 5 次（实测），用户看到的是「一直转圈」而不是一句
-            // 「在排队，稍后再试」。INVALID_REQUEST 不在重试名单里，一次就把话说到。
-            usage?.noteFailure('queued', id)
-            writeOpenAIError(res, 400, 'queued', queuedMessage(checked.model, gate))
-            return
+        debug?.(`acquire ok req=${requestTag} ${id} active=${pool.get(id)?.activeConcurrent ?? '?'}/${pool.get(id)?.maxConcurrent ?? '?'}`)
+        try {
+          const credential = await store.resolve(id)
+          if (credential === undefined) {
+            pool.disable(id, 'no credential')
+            continue
           }
-          if (gate.kind === 'queue_full' || gate.kind === 'error') {
-            usage?.noteFailure(gate.kind, id)
-            writeOpenAIError(res, gate.kind === 'queue_full' ? 429 : 502, gate.kind, gate.message)
-            return
-          }
-        }
-        const opened = await openWithCeilingHeal(credential, raw, contextWindow, controller.signal)
-        const { prepared, result } = opened
-        // 用户点「停止生成」时这次上游调用会以 AbortError 失败。那**不是账号故障**，
-        // 必须在这里就返回：放它落到下面的分类里，每打断一次就会把这个账号冷却 30 秒，
-        // 几次之后 pick() 选不出账号，表现就是「打断之后再也问不动了」。
-        if (controller.signal.aborted) {
-          if (result.ok) await result.stream.cancel().catch(() => {})
-          return
-        }
-        if (result.ok) {
-          pool.noteSuccess(id)
-          await pipeToResponse(res, result.stream, controller.signal, { accountId: id, model: prepared.model, startedAt: requestStartedAt }, opened.head)
-          return
-        }
-        lastKind = result.kind
-        lastAccountId = id
-        lastStatus = result.status
-        lastMessage = result.message
-
-        if (isConcurrencyCap(result)) {
-          // 账号没坏，只是槽位暂时满了：记一个「优先避开」的提示，换下一个号。
-          // 明确**不**冷却 —— 冷却会让它在接下来一分钟彻底不可用，误伤后续请求。
-          pool.noteConcurrencyCap(id)
-          cappedAccount = id
-          continue
-        }
-        if (isTpmLimit(result)) {
-          // TPM 是模型级配额，换号也只是换个账号去撞同一堵墙；原地排队等窗口。
-          // 账号本身完全健康，不要标记 capped/冷却。
-          tpmAccount = id
-          break
-        }
-        if (result.kind === 'iam_stale') {
-          // token 可能被提前作废，而 expiration 还写着几小时后：强制续期一次，
-          // 然后让同一个号再试一次。续期失败的话，resolve 会带着 stale 的凭证
-          // 继续失败，下一轮就走冷却/换号。
-          if (!refreshed.has(id)) {
-            refreshed.add(id)
-            logger?.warn(`dsh-codearts: ${id} 的 IAM token 被判失效，强制续期后重试`)
-            const next = await store.forceRefresh(id, credential.token)
-            if (next !== undefined) {
-              tried.delete(id)
-              continue
+          // 上游排队要客户端自己挂号：先占号、轮询到 working 再发聊天请求。
+          // 只等一小会儿（闸门里的 maxWaitMs），还在队里就把位置回给用户 ——
+          // 挂着他二十几分钟不是产品，而且宿主的 90 秒流空闲超时也会先掐掉。
+          if (queue !== undefined) {
+            const gate = await queue.wait(credential, checked.chatId, checked.model, controller.signal)
+            if (controller.signal.aborted) return
+            if (gate.kind === 'queued') {
+              // 400 而不是 429：宿主的 classifyPiAiError 按状态码归类，429 会被判成
+              // RATE_LIMIT 并自动重试 5 次（实测），用户看到的是「一直转圈」而不是一句
+              // 「在排队，稍后再试」。INVALID_REQUEST 不在重试名单里，一次就把话说到。
+              usage?.noteFailure('queued', id)
+              writeOpenAIError(res, 400, 'queued', queuedMessage(checked.model, gate))
+              return
+            }
+            if (gate.kind === 'queue_full' || gate.kind === 'error') {
+              usage?.noteFailure(gate.kind, id)
+              writeOpenAIError(res, gate.kind === 'queue_full' ? 429 : 502, gate.kind, gate.message)
+              return
             }
           }
-          pool.cooldown(id, SERVER_COOLDOWN_MS, result.message)
-          continue
-        }
-        if (result.kind === 'session_dead') {
-          // 凭据失效，这个号得重新登录了，换下一个。
-          pool.disable(id, result.message)
-          continue
-        }
-        if (result.kind === 'server' || result.kind === 'soft_rate') {
-          pool.cooldown(id, SERVER_COOLDOWN_MS, result.message)
+          const opened = await openWithCeilingHeal(credential, raw, contextWindow, controller.signal)
+          const { prepared, result } = opened
+          // 用户点「停止生成」时这次上游调用会以 AbortError 失败。那**不是账号故障**，
+          // 必须在这里就返回：放它落到下面的分类里，每打断一次就会把这个账号冷却 30 秒，
+          // 几次之后 pick() 选不出账号，表现就是「打断之后再也问不动了」。
+          if (controller.signal.aborted) {
+            if (result.ok) await result.stream.cancel().catch(() => {})
+            return
+          }
+          if (result.ok) {
+            pool.noteSuccess(id)
+            await pipeToResponse(res, result.stream, controller.signal, { accountId: id, model: prepared.model, startedAt: requestStartedAt }, opened.head)
+            return
+          }
+          lastKind = result.kind
+          lastAccountId = id
+          lastStatus = result.status
+          lastMessage = result.message
+
+          if (isConcurrencyCap(result)) {
+            // 账号没坏，只是槽位暂时满了：记一个「优先避开」的提示，换下一个号。
+            // 明确**不**冷却 —— 冷却会让它在接下来一分钟彻底不可用，误伤后续请求。
+            pool.noteConcurrencyCap(id)
+            cappedAccount = id
+            continue
+          }
+          if (isTpmLimit(result)) {
+            // TPM 是模型级配额，换号也只是换个账号去撞同一堵墙；原地排队等窗口。
+            // 账号本身完全健康，不要标记 capped/冷却。
+            tpmAccount = id
+            break
+          }
+          if (result.kind === 'iam_stale') {
+            // token 可能被提前作废，而 expiration 还写着几小时后：强制续期一次，
+            // 然后让同一个号再试一次。续期失败时 `forceRefresh` 返回 undefined，
+            // 不会像 1.3.0 那样拿同一份死 token 再白打一次上游（issue #8）。
+            if (!refreshed.has(id)) {
+              refreshed.add(id)
+              logger?.warn(`dsh-codearts: ${id} 的 IAM token 被判失效，强制续期后重试`)
+              const next = await store.forceRefresh(id, credential.token)
+              if (next !== undefined) {
+                tried.delete(id)
+                continue
+              }
+            }
+            pool.cooldown(id, SERVER_COOLDOWN_MS, result.message)
+            continue
+          }
+          if (result.kind === 'session_dead') {
+            // 凭据失效，这个号得重新登录了，换下一个。
+            pool.disable(id, result.message)
+            continue
+          }
+          if (result.kind === 'server' || result.kind === 'soft_rate') {
+            pool.cooldown(id, SERVER_COOLDOWN_MS, result.message)
+            break
+          }
+          // 其余（400/404 等）：换号只会拿到同样的错，直接报。
+          pool.noteError(id, ERROR_THRESHOLD, ERROR_COOLDOWN_MS, result.message)
           break
+        } finally {
+          pool.release(id)
+          debug?.(`release req=${requestTag} ${id} active=${pool.get(id)?.activeConcurrent ?? '?'}/${pool.get(id)?.maxConcurrent ?? '?'}`)
         }
-        // 其余（400/404 等）：换号只会拿到同样的错，直接报。
-        pool.noteError(id, ERROR_THRESHOLD, ERROR_COOLDOWN_MS, result.message)
-        break
-      } finally {
-        pool.release(id)
       }
+
+      if (lastKind !== undefined || controller.signal.aborted) break
+      // 一个号都没选出来：先分辨是不是「全都只是本地槽位满」。是的话等一个槽位
+      // 空出来再跑一轮；预算从共用截止点里扣，等待期间不占任何槽位。
+      if (!pool.hasBusyWaitable()) break
+      const waitBudget = Math.min(localSlotWaitBudgetMs, rotateDeadline - ATTEMPT_RESERVE_MS - Date.now())
+      if (waitBudget <= 0) break
+      const waitingSince = Date.now()
+      debug?.(`slot wait start req=${requestTag} budget=${waitBudget}ms pool=${pool.list().map(a => `${a.id}:${a.activeConcurrent}/${a.maxConcurrent}`).join(',')}`)
+      const got = await pool.waitForFreeSlot(waitBudget, controller.signal)
+      localSlotWaitedMs += Date.now() - waitingSince
+      debug?.(`slot wait ${got ? 'done' : 'timeout'} req=${requestTag} waited=${Date.now() - waitingSince}ms`)
+      if (!got) break
     }
 
     if (controller.signal.aborted) return
@@ -700,14 +763,17 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     }
 
     if (lastKind === undefined) {
-      const none = noAccountError(pool.list())
+      const none = noAccountError(pool.list(), pool.pausedIds())
       usage?.noteFailure(none.kind)
       writeOpenAIError(res, none.status, none.kind, none.message)
       return
     }
     // 排队等过就明说等过多久：否则用户不知道插件已经努力过，只会觉得「又失败了」。
     const explanation = upstreamErrorMessage(lastMessage, lastStatus)
-    const waited = queueWaitedMs >= 1_000 ? `（本地已排队重试 ${Math.round(queueWaitedMs / 1000)} 秒）` : ''
+    const waits: string[] = []
+    if (queueWaitedMs >= 1_000) waits.push(`排队重试 ${Math.round(queueWaitedMs / 1000)} 秒`)
+    if (localSlotWaitedMs >= 1_000) waits.push(`等本地槽位 ${Math.round(localSlotWaitedMs / 1000)} 秒`)
+    const waited = waits.length > 0 ? `（本地已${waits.join('、')}）` : ''
     usage?.noteFailure(lastKind, lastAccountId)
     writeOpenAIError(res, KIND_STATUS[lastKind], lastKind, `${explanation}${waited}`)
   }

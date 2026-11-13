@@ -22,10 +22,11 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactElement, type MouseEvent } from 'react'
 import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
-import { DEFAULT_DOCK_FLAGS, type CodeArtsDockFlags, type CodeArtsWebStatus } from '../web-status.ts'
+import { type CodeArtsDockFlags, type CodeArtsWebStatus } from '../web-status.ts'
 import type { UsageTotals } from '../usage.ts'
 import { stripModelSuffixes } from '../catalog.ts'
 import { buildDockLine, DOCK_SEGMENT_SEPARATOR } from './dock-line.ts'
+import { dockSnapshot, publishDock, subscribeDock } from './dock-store.ts'
 import {
   ensureSuppressStyle,
   markForeignDockEntries,
@@ -46,7 +47,7 @@ const QUEUE_INTERVAL_MS = 5_000
  * `min(248px, …)`）取一档窄宽度 —— 这一层回答的是「哪个号还有多少积分」，
  * 用量数字不该把它撑成一张报表。
  */
-const PANEL_WIDTH = 260
+const PANEL_WIDTH = 280
 /** 弹层与那一行之间的缝隙。 */
 const PANEL_GAP = 8
 /**
@@ -123,6 +124,11 @@ export interface CodeArtsCreditDockProps {
    * 已经有 pill 了，再在工具行里写一遍就是重复占宽。
    */
   zone?: 'bar' | 'dock'
+  /**
+   * 打开「设置 → CodeArts」。弹层右上角的「设置」按钮用它。
+   * 返回 false = 两条路都没走通（宿主壳形状不认识），按钮旁边会留一句失败提示。
+   */
+  onOpenSettings?: () => boolean
 }
 
 function readSelection(useProjection: ((key: string) => unknown) | undefined): ModelSelection | undefined {
@@ -229,7 +235,7 @@ function placeAbove(rect: DOMRect): boolean {
   return rect.top > PANEL_MIN_ABOVE
 }
 
-export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArtsCreditDockProps): ReactElement | null {
+export function CodeArtsCreditDock({ useProjection, t, zone = 'dock', onOpenSettings }: CodeArtsCreditDockProps): ReactElement | null {
   const selection = readSelection(useProjection)
   const active = isCodeArts(selection)
   const [remain, setRemain] = useState<number | null>(null)
@@ -241,8 +247,12 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
    * 名字用 `stripModelSuffixes` 剥掉尾巴，倍率直接用服务端算好的 `ratio`。
    */
   const [modelInfo, setModelInfo] = useState<Record<string, { name: string; ratio?: string }>>({})
-  const [flags, setFlags] = useState<CodeArtsDockFlags>(DEFAULT_DOCK_FLAGS)
+  const [flags, setFlags] = useState<CodeArtsDockFlags>(() => dockSnapshot().dock)
+  /** 开关的共享状态：设置页改了「显示」里的勾选，弹层这边立刻跟上。 */
+  useEffect(() => subscribeDock(() => setFlags(dockSnapshot().dock)), [])
   const [queued, setQueued] = useState<QueueEntry | null>(null)
+  /** 「设置」按钮两条路都没走通时的提示（宿主壳形状不认识）。 */
+  const [settingsFailed, setSettingsFailed] = useState(false)
   const [anchor, setAnchor] = useState<Anchor | null>(null)
   /**
    * 弹层的包含块原点（视口坐标）。
@@ -275,7 +285,8 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
       if (!res.ok) return
       const data = (await res.json().catch(() => undefined)) as CodeArtsWebStatus | undefined
       if (data === undefined || !mounted.current) return
-      setFlags(data.dock ?? DEFAULT_DOCK_FLAGS)
+      // 开关也进共享状态：别的卡片实例（设置页 / 侧边栏）立即同步。
+      if (data.dock !== undefined) publishDock({ dock: data.dock })
       setRows(rowsOf(data))
       setModelInfo(Object.fromEntries((data.models ?? []).map(model => [model.id, {
         name: model.name,
@@ -556,11 +567,48 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock' }: CodeArts
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-            <span style={{ fontWeight: 600 }}>{t('creditsDockPanelTitle')}</span>
-            <Button variant="outline" size="sm" disabled={refreshing} onClick={() => void forceRefresh()}>
-              {refreshing ? t('creditsDockRefreshing') : t('creditsDockRefresh')}
-            </Button>
+            {/*
+              标题让位、按钮不让位：面板只有 260px，两个按钮一旦被压就会把
+              「设置」「刷新积分」折成竖排（实测）。标题用省略号收尾，按钮组固定宽度。
+            */}
+            <span
+              style={{
+                fontWeight: 600,
+                flex: '1 1 auto',
+                minWidth: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {t('creditsDockPanelTitle')}
+            </span>
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flex: '0 0 auto', whiteSpace: 'nowrap' }}>
+              {/*
+                常驻：不再依赖「设置左侧入口」的开关值。
+                入口关掉时 openSection 会落到设置第一项，但仍比「弹层里没有任何入口」好；
+                而且这条链路曾经因为开关值没同步过来而把按钮藏掉（实测）。
+              */}
+              {onOpenSettings !== undefined && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  style={{ whiteSpace: 'nowrap' }}
+                  onClick={() => setSettingsFailed(!onOpenSettings())}
+                >
+                  {t('creditsDockSettings')}
+                </Button>
+              )}
+              <Button variant="outline" size="sm" style={{ whiteSpace: 'nowrap' }} disabled={refreshing} onClick={() => void forceRefresh()}>
+                {refreshing ? t('creditsDockRefreshing') : t('creditsDockRefresh')}
+              </Button>
+            </span>
           </div>
+          {settingsFailed && (
+            <span style={{ fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }}>
+              {t('creditsDockSettingsFailed')}
+            </span>
+          )}
 
           <div
             style={{

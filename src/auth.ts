@@ -13,7 +13,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, writeFile, chmod, rename, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { refreshToken, defaultLoginConfig, type OAuthToken } from './oauth.ts'
+import { refreshToken, defaultLoginConfig, OAuthTokenError, type OAuthToken } from './oauth.ts'
 import type { CallerIdentity } from './upstream.ts'
 
 /** 福利领取的上限；失败无所谓，卡住登录才是问题。 */
@@ -179,11 +179,56 @@ async function claimIfPossible(cred: CodeArtsCredential): Promise<void> {
  */
 const REFRESH_SKEW_MS = 30 * 60 * 1000
 
+/**
+ * 一次续期最多试几次。
+ *
+ * 只对「可能自己好」的失败（网络、超时、5xx、429）重试；`invalid_grant` 这类
+ * 试多少次都一样，第一趟就收工。issue #8 之前是「任何失败一次就落 stale」，
+ * 一次网络抖动 = 永久失效，只能重新登录。
+ */
+const REFRESH_MAX_ATTEMPTS = 3
+/** 重试退避基数（250ms → 750ms），总等待不到 1 秒，不给请求路径添负担。 */
+const REFRESH_RETRY_BASE_MS = 250
+/**
+ * 瞬时失败用尽重试后，多久内不再碰 refresh_token。
+ *
+ * 不设这个闸门的话，token 已过期时每个请求都会再刷一遍 —— 上游抖动期间会把
+ * 一次性 refresh_token 反复烧掉，把「暂时失败」放大成「真的失效」。
+ */
+const REFRESH_TRANSIENT_BLOCK_MS = 60_000
+
+/** 失败是不是「凭证真的没了」；只有这一类才允许写 `stale`。 */
+function isPermanentRefreshFailure(error: unknown): boolean {
+  return error instanceof OAuthTokenError && error.permanent
+}
+
+/** 失败是不是「refresh_token 被别处用掉了」（一次性令牌轮换，可以重读磁盘恢复）。 */
+function isRefreshTokenUsed(error: unknown): boolean {
+  return error instanceof OAuthTokenError && error.refreshTokenUsed
+}
+
+/** 日志里只放原因与状态码，别把整段响应体抄进去（可能有账号信息）。 */
+function describeRefreshFailure(error: unknown): string {
+  if (error instanceof OAuthTokenError) return `HTTP ${error.status} ${error.body.slice(0, 200)}`
+  return error instanceof Error ? error.message : String(error)
+}
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+/** 续期结果：`ok` 为假时仍带当前凭证，调用方据此决定「继续用」还是「别重试」。 */
+type RefreshOutcome =
+  | { ok: true; cred: CodeArtsCredential }
+  | { ok: false; cred: CodeArtsCredential | undefined; permanent: boolean; reason: string }
+
 export class CodeArtsCredentialStore {
   private _current: CodeArtsCredential | undefined
   private _path: string
   /** 正在进行的刷新。并发请求必须共用它，不能各刷一次。 */
-  private _inflight: Promise<CodeArtsCredential> | undefined
+  private _inflight: Promise<RefreshOutcome> | undefined
+  /** 瞬时失败后的冷却：这之前不再拿 refresh_token 去撞上游。 */
+  private _refreshBlockedUntil = 0
+  /** 续期失败的落地日志（由宿主注入；测试里没有就是静默）。 */
+  private readonly log?: (message: string) => void
   /**
    * 凭证代际。重登/清除会推进它，让还在飞的刷新发现自己过期，
    * 从而不把刷新结果写回去覆盖掉刚拿到的新凭证。
@@ -194,10 +239,13 @@ export class CodeArtsCredentialStore {
   private invalidateInflight(): void {
     this._gen += 1
     this._inflight = undefined
+    // 换了新凭证就不该再背上一份「上次瞬时失败」的冷却。
+    this._refreshBlockedUntil = 0
   }
 
-  constructor(path: string) {
+  constructor(path: string, log?: (message: string) => void) {
     this._path = path
+    this.log = log
   }
 
   setPath(path: string): void {
@@ -278,20 +326,23 @@ export class CodeArtsCredentialStore {
     // 改常量对这条路径不生效。
     const soon = Number.isNaN(exp) ? false : exp - Date.now() < REFRESH_SKEW_MS
     if (!soon) return cred
-    // 并发请求不能各刷一次：refresh_token 会轮换，后一次刷新会作废前一次刚拿到
-    // 的 AK/SK。实测症状就是一串 "Incorrect IAM authentication" + 凭证被写脏。
+    if (Date.now() < this._refreshBlockedUntil) return cred
+    return (await this.runRefresh(cred)).cred
+  }
+
+  /** 真正去刷一次；失败按错误类别决定「重试 / 冷却 / 落 stale」。 */
+  private async runRefresh(cred: CodeArtsCredential): Promise<RefreshOutcome> {
     const inflight = this._inflight ??= this.refresh(cred, {
-      refreshToken: cred.refreshToken,
-      dpopPrivateKey: cred.dpopPrivateKey,
-      clientId: cred.clientId,
+      refreshToken: cred.refreshToken ?? '',
+      dpopPrivateKey: cred.dpopPrivateKey as NonNullable<CodeArtsCredential['dpopPrivateKey']>,
+      clientId: cred.clientId ?? '',
     }).finally(() => {
       this._inflight = undefined
     })
     return inflight
   }
 
-  /** 真正去刷一次；失败则把凭证标成 stale 落库，让卡片提示重新登录。 */
-  private async refresh(cred: CodeArtsCredential, mat: RefreshMaterials): Promise<CodeArtsCredential> {
+  private async refresh(cred: CodeArtsCredential, mat: RefreshMaterials): Promise<RefreshOutcome> {
     const gen = this._gen
     /**
      * 这次刷新的结果还能不能往回写。光看代际号不够：重登是异步落库的，可能在
@@ -299,40 +350,68 @@ export class CodeArtsCredentialStore {
      * 确认「当前凭证仍然是这次刷新的那一份」。
      */
     const stillCurrent = (): boolean => this._gen === gen && this._current === cred
-    try {
-      const refreshed = await refreshToken(
-        defaultLoginConfig(),
-        {
-          userId: cred.userId ?? '',
-          userName: cred.userName ?? '',
-          domainId: '',
-          securityToken: cred.token,
-          accessKeyId: cred.accessKeyId ?? '',
-          secretAccessKey: cred.secretAccessKey ?? '',
-          expiration: cred.expiration ?? '',
-          refreshToken: mat.refreshToken,
-          clientId: mat.clientId,
-          dpopPrivateKey: mat.dpopPrivateKey,
-        },
-      )
-      const next = credentialFromOAuth(refreshed, cred.label)
-      if (!stillCurrent()) return next
-      await saveCredential(this._path, next)
-      this._current = next
-      await this.claimIfPossible(next)
-      return next
-    } catch {
-      // 刷新失败：标记 stale 并落库，让卡片提示用户重新登录，而不是静默用过期凭证。
+    let lastError: unknown
+    for (let attempt = 1; attempt <= REFRESH_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const refreshed = await refreshToken(
+          defaultLoginConfig(),
+          {
+            userId: cred.userId ?? '',
+            userName: cred.userName ?? '',
+            domainId: '',
+            securityToken: cred.token,
+            accessKeyId: cred.accessKeyId ?? '',
+            secretAccessKey: cred.secretAccessKey ?? '',
+            expiration: cred.expiration ?? '',
+            refreshToken: mat.refreshToken,
+            clientId: mat.clientId,
+            dpopPrivateKey: mat.dpopPrivateKey,
+          },
+        )
+        const next = credentialFromOAuth(refreshed, cred.label)
+        this._refreshBlockedUntil = 0
+        if (!stillCurrent()) return { ok: true, cred: next }
+        await saveCredential(this._path, next)
+        this._current = next
+        await this.claimIfPossible(next)
+        return { ok: true, cred: next }
+      } catch (error: unknown) {
+        lastError = error
+        // 凭证真失效：再试也是同一个结果，直接收工（下面落 stale）。
+        if (isPermanentRefreshFailure(error)) break
+        this.log?.(`[dsh-codearts] refresh ${cred.label ?? 'account'} attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed (transient): ${describeRefreshFailure(error)}`)
+        if (attempt < REFRESH_MAX_ATTEMPTS) {
+          await sleep(REFRESH_RETRY_BASE_MS * (2 ** (attempt - 1)))
+        }
+      }
+    }
+    const used = isRefreshTokenUsed(lastError)
+    const permanent = !used && isPermanentRefreshFailure(lastError)
+    const reason = describeRefreshFailure(lastError)
+    if (permanent) {
+      // 只有 invalid_grant 这一类才把账号判死：落 stale 让卡片提示重新登录，
+      // 而不是静默用过期凭证。
       cred.stale = true
-      if (!stillCurrent()) return cred
-      this._current = cred
+    } else if (used) {
+      // 令牌被别处用掉了：只冷却一会儿，别落 stale —— 也绝不能把这份旧凭证写回去，
+      // 那会把对方刚拿到的 refresh_token 覆盖掉（实测过一次，只能重新登录）。
+      this._refreshBlockedUntil = Date.now() + 10_000
+    } else {
+      // 网络/超时/5xx/429：凭证本身没坏，绝不能落 stale —— 那正是 issue #8 里
+      // 「一次抖动就必须重登」的根因。冷却一会儿，后面还有机会自己好。
+      this._refreshBlockedUntil = Date.now() + REFRESH_TRANSIENT_BLOCK_MS
+    }
+    this.log?.(`[dsh-codearts] refresh ${cred.label ?? 'account'} failed (${permanent ? 'permanent, marked stale' : used ? 'refresh token already used elsewhere, will reload' : `transient, retry in ${Math.round(REFRESH_TRANSIENT_BLOCK_MS / 1000)}s`}): ${reason}`)
+    if (!stillCurrent()) return { ok: false, cred: this._current, permanent, reason }
+    this._current = cred
+    if (permanent) {
       try {
         await saveCredential(this._path, cred)
       } catch {
         // 落库失败也不阻断，内存里已标记。
       }
-      return cred
     }
+    return { ok: false, cred, permanent, reason }
   }
 }
 
@@ -386,6 +465,28 @@ export function codeartsAccountsPath(home?: string): string {
 }
 
 /**
+ * 续期失败的落地日志路径。
+ *
+ * 宿主对插件 `info`/`debug` 日志没有出口，`warn` 会弹系统通知，所以「续期为什么失败」
+ * 只能写插件自己的文件。只记原因、状态码和是否落 stale，不含任何 token。
+ */
+export function codeartsRefreshLogPath(home?: string): string {
+  const base = home ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(base, '.codearts-refresh.log')
+}
+
+/**
+ * 槽位取证日志路径（只有 `DSH_CODEARTS_DEBUG=1` 时才写）。
+ *
+ * 记 acquire/release 的时间点与在飞计数，用来证实或排除「本地槽位泄漏」
+ * （issue #8）。默认关闭：正常使用不需要这份噪音。
+ */
+export function codeartsDebugLogPath(home?: string): string {
+  const base = home ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(base, '.codearts-debug.log')
+}
+
+/**
  * 账号的自然键，按稳定性依次退让：
  *
  * 1. `userId` —— 最理想，同一个人永远同一个键。
@@ -434,25 +535,48 @@ export function summarizeAccount(id: string, cred: CodeArtsCredential): CodeArts
  */
 class AccountSlot {
   private _cred: CodeArtsCredential
-  private _inflight: Promise<CodeArtsCredential> | undefined
+  private _inflight: Promise<RefreshOutcome> | undefined
   private _gen = 0
   // 不用 TS 参数属性（constructor(private x)）：本项目的探针脚本用
   // `node --experimental-strip-types` 直接跑源码，那个模式不支持参数属性。
   private readonly persist: (cred: CodeArtsCredential) => Promise<void>
+  private readonly log?: (message: string) => void
+  /** 瞬时失败后的冷却：这之前不再拿 refresh_token 去撞上游。 */
+  private _refreshBlockedUntil = 0
+  /** 最近一次续期失败的类型，供 store 判断要不要「重读磁盘再试一次」。 */
+  private _lastFailure: 'used' | 'permanent' | 'transient' | undefined
 
-  constructor(cred: CodeArtsCredential, persist: (cred: CodeArtsCredential) => Promise<void>) {
+  constructor(
+    cred: CodeArtsCredential,
+    persist: (cred: CodeArtsCredential) => Promise<void>,
+    log?: (message: string) => void,
+  ) {
     this._cred = cred
     this.persist = persist
+    this.log = log
   }
 
   get credential(): CodeArtsCredential {
     return this._cred
   }
 
+  /** 最近一次续期失败的类型（只在失败后读；下一次成功会清空）。 */
+  get lastFailure(): 'used' | 'permanent' | 'transient' | undefined {
+    return this._lastFailure
+  }
+
+  /** 把这份凭证标成 stale 并落库（store 在「令牌被别人用掉且磁盘也没有更新」时调）。 */
+  async markStale(): Promise<void> {
+    if (this._cred.stale === true) return
+    this._cred = { ...this._cred, stale: true }
+    await this.persist(this._cred)
+  }
+
   /** 账号被替换或删除：作废在飞的刷新，别让它回头写回旧值。 */
   invalidate(): void {
     this._gen += 1
     this._inflight = undefined
+    this._refreshBlockedUntil = 0
   }
 
   async ensureFresh(): Promise<CodeArtsCredential> {
@@ -463,7 +587,9 @@ class AccountSlot {
     const exp = cred.expiration ? Date.parse(cred.expiration) : NaN
     const soon = Number.isNaN(exp) ? false : exp - Date.now() < REFRESH_SKEW_MS
     if (!soon) return cred
-    return this.forceRefresh()
+    if (Date.now() < this._refreshBlockedUntil) return cred
+    await this.runRefresh(cred)
+    return this._cred
   }
 
   /**
@@ -472,57 +598,112 @@ class AccountSlot {
    * 给上游回 `invalid_iam_token` 时用：token 可能被提前作废（另一个客户端续期、
    * 上游轮换），而 `expiration` 还写着几小时之后，`ensureFresh` 根本不会动。
    * 仍然走单飞，避免并发请求把一次性的 refresh_token 烧掉。
+   *
+   * **失败返回 undefined**：调用方拿它判断「要不要用同一个号重试」。以前失败也
+   * 返回凭据（已 stale 的旧 token），`!== undefined` 恒成立 ⇒ 必然拿死 token 再打
+   * 一次上游（issue #8 的第二个根因）。
    */
-  async forceRefresh(): Promise<CodeArtsCredential> {
+  async forceRefresh(): Promise<CodeArtsCredential | undefined> {
     const cred = this._cred
-    if (cred.stale === true) return cred
-    if (!cred.refreshToken || !cred.dpopPrivateKey || !cred.clientId) return cred
+    if (cred.stale === true) return undefined
+    if (!cred.refreshToken || !cred.dpopPrivateKey || !cred.clientId) return undefined
+    if (Date.now() < this._refreshBlockedUntil) return undefined
+    const outcome = await this.runRefresh(cred)
+    return outcome.ok ? outcome.cred : undefined
+  }
+
+  /**
+   * 复验一个被判 stale 的账号：拿 refresh_token 再试一次。
+   *
+   * 只给后台保活循环用（20 分钟一轮）。为什么需要：1.3.0 及以前只要有**一次**续期
+   * 失败就永久落 stale，网络抖动也会 —— 那些被误判的账号不该逼用户重新登录。
+   * 真的 invalid_grant 会继续失败，一轮只多一个请求，代价可以忽略。
+   */
+  async verifyStale(): Promise<boolean> {
+    const cred = this._cred
+    if (cred.stale !== true) return true
+    if (!cred.refreshToken || !cred.dpopPrivateKey || !cred.clientId) return false
+    if (Date.now() < this._refreshBlockedUntil) return false
+    const outcome = await this.runRefresh(cred)
+    return outcome.ok
+  }
+
+  /** 单飞执行一次续期。 */
+  private async runRefresh(cred: CodeArtsCredential): Promise<RefreshOutcome> {
     const inflight = this._inflight ??= this.refresh(cred, {
-      refreshToken: cred.refreshToken,
-      dpopPrivateKey: cred.dpopPrivateKey,
-      clientId: cred.clientId,
+      refreshToken: cred.refreshToken ?? '',
+      dpopPrivateKey: cred.dpopPrivateKey as NonNullable<CodeArtsCredential['dpopPrivateKey']>,
+      clientId: cred.clientId ?? '',
     }).finally(() => {
       this._inflight = undefined
     })
     return inflight
   }
 
-  private async refresh(cred: CodeArtsCredential, mat: RefreshMaterials): Promise<CodeArtsCredential> {
+  private async refresh(cred: CodeArtsCredential, mat: RefreshMaterials): Promise<RefreshOutcome> {
     const gen = this._gen
     // 光看代际号不够：账号被替换是异步落库的，可能在本轮刷新启动**之后**才换掉
     // _cred，那时代际号已经来不及拦。所以还要确认「当前凭证仍是这一份」。
     const stillCurrent = (): boolean => this._gen === gen && this._cred === cred
-    try {
-      const refreshed = await refreshToken(defaultLoginConfig(), {
-        userId: cred.userId ?? '',
-        userName: cred.userName ?? '',
-        domainId: '',
-        securityToken: cred.token,
-        accessKeyId: cred.accessKeyId ?? '',
-        secretAccessKey: cred.secretAccessKey ?? '',
-        expiration: cred.expiration ?? '',
-        refreshToken: mat.refreshToken,
-        clientId: mat.clientId,
-        dpopPrivateKey: mat.dpopPrivateKey,
-      })
-      const next = credentialFromOAuth(refreshed, cred.label)
-      if (!stillCurrent()) return next
-      await this.persist(next)
-      this._cred = next
-      await claimIfPossible(next)
-      return next
-    } catch {
-      // 续期失败：标记 stale 落库，让卡片提示重新登录，而不是静默用过期凭证。
+    let lastError: unknown
+    for (let attempt = 1; attempt <= REFRESH_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const refreshed = await refreshToken(defaultLoginConfig(), {
+          userId: cred.userId ?? '',
+          userName: cred.userName ?? '',
+          domainId: '',
+          securityToken: cred.token,
+          accessKeyId: cred.accessKeyId ?? '',
+          secretAccessKey: cred.secretAccessKey ?? '',
+          expiration: cred.expiration ?? '',
+          refreshToken: mat.refreshToken,
+          clientId: mat.clientId,
+          dpopPrivateKey: mat.dpopPrivateKey,
+        })
+        const next = credentialFromOAuth(refreshed, cred.label)
+        this._refreshBlockedUntil = 0
+        this._lastFailure = undefined
+        if (!stillCurrent()) return { ok: true, cred: next }
+        await this.persist(next)
+        this._cred = next
+        await claimIfPossible(next)
+        return { ok: true, cred: next }
+      } catch (error: unknown) {
+        lastError = error
+        if (isPermanentRefreshFailure(error)) break
+        this.log?.(`[dsh-codearts] refresh ${cred.label ?? 'account'} attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed (transient): ${describeRefreshFailure(error)}`)
+        if (attempt < REFRESH_MAX_ATTEMPTS) {
+          await sleep(REFRESH_RETRY_BASE_MS * (2 ** (attempt - 1)))
+        }
+      }
+    }
+    const used = isRefreshTokenUsed(lastError)
+    const permanent = !used && isPermanentRefreshFailure(lastError)
+    const reason = describeRefreshFailure(lastError)
+    if (used) {
+      // 令牌被另一个写入方（守护进程）用掉：不能落 stale、更不能把这份旧凭证写回去
+      // —— 那会把对方刚拿到的 refresh_token 覆盖掉。留给 store 重读磁盘再试。
+      this._lastFailure = 'used'
+    } else if (permanent) {
+      // 只有 invalid_grant 这一类才把账号判死：落 stale 让卡片提示重新登录。
+      this._lastFailure = 'permanent'
       cred.stale = true
-      if (!stillCurrent()) return cred
-      this._cred = cred
+    } else {
+      // 网络/超时/5xx/429：凭证本身没坏，绝不能落 stale（issue #8 的根因）。
+      this._lastFailure = 'transient'
+      this._refreshBlockedUntil = Date.now() + REFRESH_TRANSIENT_BLOCK_MS
+    }
+    this.log?.(`[dsh-codearts] refresh ${cred.label ?? 'account'} failed (${used ? 'refresh token already used elsewhere, will reload from disk' : permanent ? 'permanent, marked stale' : `transient, retry in ${Math.round(REFRESH_TRANSIENT_BLOCK_MS / 1000)}s`}): ${reason}`)
+    if (!stillCurrent()) return { ok: false, cred: this._cred, permanent, reason }
+    this._cred = cred
+    if (permanent) {
       try {
         await this.persist(cred)
       } catch {
         // 落库失败也不阻断，内存里已标记。
       }
-      return cred
     }
+    return { ok: false, cred, permanent, reason }
   }
 }
 
@@ -559,10 +740,13 @@ export class CodeArtsAccountStore {
   private readonly path: string
   /** 旧版单凭证文件；新文档不存在时把它收编成第一个账号。 */
   private readonly legacyPath: string
+  /** 续期失败的落地日志（由宿主注入；测试里没有就是静默）。 */
+  private readonly log?: (message: string) => void
 
-  constructor(path: string, legacyPath?: string) {
+  constructor(path: string, legacyPath?: string, options: { log?: (message: string) => void } = {}) {
     this.path = path
     this.legacyPath = legacyPath ?? join(dirname(path), '.codearts-auth.json')
+    this.log = options.log
   }
 
   private async loaded(): Promise<void> {
@@ -592,7 +776,7 @@ export class CodeArtsAccountStore {
     this._doc = doc
     this._slots.clear()
     for (const [id, cred] of Object.entries(doc.accounts)) {
-      this._slots.set(id, new AccountSlot(cred, this.persisterFor(id)))
+      this._slots.set(id, new AccountSlot(cred, this.persisterFor(id), this.log))
     }
   }
 
@@ -650,7 +834,7 @@ export class CodeArtsAccountStore {
     this._slots.get(id)?.invalidate()
     doc.accounts[id] = cred
     if (!doc.order.includes(id)) doc.order.push(id)
-    this._slots.set(id, new AccountSlot(cred, this.persisterFor(id)))
+    this._slots.set(id, new AccountSlot(cred, this.persisterFor(id), this.log))
     await this.persistDoc()
     await claimIfPossible(cred)
     return id
@@ -698,7 +882,7 @@ export class CodeArtsAccountStore {
         ...identity.domainId === '' ? {} : { domainId: identity.domainId },
       }
       this._slots.get(id)?.invalidate()
-      this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id)))
+      this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log))
       await this.persistDoc()
       return 'noop'
     }
@@ -717,7 +901,7 @@ export class CodeArtsAccountStore {
     this._slots.get(id)?.invalidate()
     this._slots.delete(id)
     this._slots.get(targetKey)?.invalidate()
-    this._slots.set(targetKey, new AccountSlot(doc.accounts[targetKey], this.persisterFor(targetKey)))
+    this._slots.set(targetKey, new AccountSlot(doc.accounts[targetKey], this.persisterFor(targetKey), this.log))
     await this.persistDoc()
     return target === undefined ? 'moved' : 'merged'
   }
@@ -751,7 +935,7 @@ export class CodeArtsAccountStore {
     doc.accounts[id] = { ...cred, paused }
     const slot = this._slots.get(id)
     slot?.invalidate()
-    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id)))
+    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log))
     await this.persistDoc()
     return true
   }
@@ -765,7 +949,7 @@ export class CodeArtsAccountStore {
     doc.accounts[id] = { ...cred, pinned }
     const slot = this._slots.get(id)
     slot?.invalidate()
-    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id)))
+    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log))
     await this.persistDoc()
     return true
   }
@@ -807,9 +991,25 @@ export class CodeArtsAccountStore {
   /** 给 shim 用：解析某账号的签名材料（内部含续期）。 */
   async resolve(id: string): Promise<ResolvedCredential | undefined> {
     await this.loaded()
-    const slot = this._slots.get(id)
-    if (slot === undefined) return undefined
-    const cred = await slot.ensureFresh()
+    const first = this._slots.get(id)
+    if (first === undefined) return undefined
+    let cred = await first.ensureFresh()
+    // refresh_token 被守护进程先一步用掉：重读磁盘拿它刚写回的新令牌再试一次。
+    // 这一步同时修掉了「后刷的一方把对方的新令牌覆盖成旧的」。
+    if (first.lastFailure === 'used') {
+      const advanced = await this.reloadIfPeerAdvanced(id)
+      if (advanced) {
+        const retry = this._slots.get(id)
+        if (retry !== undefined) cred = await retry.ensureFresh()
+        if (retry?.lastFailure === 'used') {
+          await this.markStale(id)
+          cred = this._slots.get(id)?.credential ?? cred
+        }
+      } else {
+        await this.markStale(id)
+        cred = this._slots.get(id)?.credential ?? cred
+      }
+    }
     return {
       token: cred.token,
       accessKeyId: cred.accessKeyId,
@@ -826,10 +1026,60 @@ export class CodeArtsAccountStore {
    */
   async forceRefresh(id: string, seenToken?: string): Promise<CodeArtsCredential | undefined> {
     await this.loaded()
-    const slot = this._slots.get(id)
+    let slot = this._slots.get(id)
     if (slot === undefined) return undefined
-    if (seenToken !== undefined && slot.credential.token !== seenToken) return slot.credential
-    return slot.forceRefresh()
+    // 别的请求已经换过凭证：拿新的去重试；但新凭证自己也是 stale 的话就别再试了。
+    if (seenToken !== undefined && slot.credential.token !== seenToken) {
+      return slot.credential.stale === true ? undefined : slot.credential
+    }
+    let next = await slot.forceRefresh()
+    if (next === undefined && slot.lastFailure === 'used') {
+      if (await this.reloadIfPeerAdvanced(id)) {
+        slot = this._slots.get(id)
+        next = slot === undefined ? undefined : await slot.forceRefresh()
+      }
+      if (next === undefined) await this.markStale(id)
+    }
+    return next
+  }
+
+  /**
+   * 磁盘上的 refresh_token 和内存里不一样了 → 说明另一个写入方（肯家是守护进程）
+   * 已经续过：用磁盘那份重建槽位，返回 true。
+   *
+   * 只在续期失败后调用，重建会让在飞的刷新结果作废（代际号），这正是我们要的。
+   */
+  private async reloadIfPeerAdvanced(id: string): Promise<boolean> {
+    const doc = await readAccountDocument(this.path)
+    const next = doc?.accounts[id]?.refreshToken
+    if (doc === undefined || next === undefined) return false
+    if (next === this._slots.get(id)?.credential.refreshToken) return false
+    for (const slot of this._slots.values()) slot.invalidate()
+    this.adopt(doc)
+    return true
+  }
+
+  /**
+   * 把账号标成 stale。
+   *
+   * 必须先重读磁盘再写：内存里的 `_doc` 可能是几小时前的快照，直接落库会把另一个
+   * 账号（或本账号）刚被守护进程轮换出来的 refresh_token 覆盖回旧的 —— 2026-11-13
+   * 真踩过，代价是必须重新登录。
+   */
+  private async markStale(id: string): Promise<void> {
+    const doc = await readAccountDocument(this.path)
+    if (doc !== undefined && doc.accounts[id] !== undefined) {
+      if (doc.accounts[id].stale === true) return
+      doc.accounts[id] = { ...doc.accounts[id], stale: true }
+      this.adopt(doc)
+      try {
+        await this.persistDoc()
+      } catch {
+        // 落库失败不阻断：内存里已经是 stale。
+      }
+      return
+    }
+    await this._slots.get(id)?.markStale().catch(() => {})
   }
 
   /**
@@ -860,7 +1110,10 @@ export class CodeArtsAccountStore {
    *
    * 只刷「距过期不足 `REFRESH_SKEW_MS`」的那些，刚从上游拿到的号不会被白刷一次：
    * `refresh_token` 是一次性的，多余的刷新只会多一份失败风险。
-   * `stale` 的号（已确认必须重新登录）直接跳过——空转只会白烧请求。
+   *
+   * `stale` 的号会做一次**低成本复验**：1.3.0 及以前任何一次续期失败（含网络抖动）
+   * 都会永久落 stale，那些被误判的账号不该逼用户重新登录。真失效的话一轮只多一个
+   * 请求（20 分钟一次），代价可以忽略；复验成功即自动复活。
    */
   async keepAlive(): Promise<{ checked: number; refreshed: number; needsLogin: string[] }> {
     await this.loaded()
@@ -870,6 +1123,12 @@ export class CodeArtsAccountStore {
     for (const [id, slot] of this._slots) {
       const before = slot.credential
       if (before.stale === true) {
+        checked += 1
+        const revived = await slot.verifyStale().catch(() => false)
+        if (revived) {
+          refreshed += 1
+          continue
+        }
         needsLogin.push(id)
         continue
       }

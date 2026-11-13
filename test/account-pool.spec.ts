@@ -271,3 +271,52 @@ describe('paused and pinned', () => {
     expect(pool.pick()).toBe('a')
   })
 })
+
+// issue #8：本地槽位满以前是「立刻失败」，并发派发（一次 5 个 subagent）必然误伤。
+// 现在先短时等待槽位释放，等不到才报错。
+describe('waiting for a local slot', () => {
+  it('reports a free slot immediately when one exists', async () => {
+    const pool = poolOf(['a'], 2)
+    expect(pool.hasFreeSlot()).toBe(true)
+    await expect(pool.waitForFreeSlot(1_000)).resolves.toBe(true)
+  })
+
+  it('wakes up as soon as a slot is released', async () => {
+    const pool = poolOf(['a'], 1)
+    expect(pool.acquire('a')).toBe(true)
+    expect(pool.hasBusyWaitable()).toBe(true)
+    expect(pool.hasFreeSlot()).toBe(false)
+
+    const started = Date.now()
+    setTimeout(() => pool.release('a'), 20)
+    await expect(pool.waitForFreeSlot(5_000)).resolves.toBe(true)
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it('gives up when the budget runs out', async () => {
+    const pool = poolOf(['a'], 1)
+    pool.acquire('a')
+    await expect(pool.waitForFreeSlot(50)).resolves.toBe(false)
+  })
+
+  it('does not wait on accounts that only the user can revive', async () => {
+    const pool = poolOf(['a'], 1)
+    pool.setPaused(['a'])
+    // 暂停的号不会自己空出来：等它是白等。
+    await expect(pool.waitForFreeSlot(1_000)).resolves.toBe(false)
+  })
+
+  it('does not wait on a disabled account', async () => {
+    const pool = poolOf(['a'], 1)
+    pool.disable('a', 'needs sign-in')
+    await expect(pool.waitForFreeSlot(1_000)).resolves.toBe(false)
+  })
+
+  it('returns early when the request is cancelled', async () => {
+    const pool = poolOf(['a'], 1)
+    pool.acquire('a')
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 20)
+    await expect(pool.waitForFreeSlot(5_000, controller.signal)).resolves.toBe(false)
+  })
+})

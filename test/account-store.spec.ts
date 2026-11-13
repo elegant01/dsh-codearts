@@ -23,6 +23,7 @@ import {
   credentialFromOAuth,
   MANUAL_ACCOUNT_ID,
 } from '../src/auth.ts'
+import { OAuthTokenError } from '../src/oauth.ts'
 
 let dir: string
 let accountsPath: string
@@ -284,5 +285,97 @@ describe('per-account refresh', () => {
 
     expect((await store.credential('uid-a'))?.token).toBe('brand-new')
     expect(JSON.parse(await readFile(accountsPath, 'utf8')).accounts['uid-a'].token).toBe('brand-new')
+  })
+})
+
+// issue #8：`forceRefresh` 曾经的失败路径也返回凭据（已 stale 的旧 token），
+// shim 判 `!== undefined` 恒成立 ⇒ 必然拿死 token 再打一次上游。
+describe('forceRefresh', () => {
+  const soon = (): Record<string, unknown> => ({ expiration: new Date(Date.now() + 60_000).toISOString() })
+
+  it('returns the fresh credential when the refresh succeeds', async () => {
+    refreshTokenMock.mockResolvedValue(token({ userId: 'uid-a', securityToken: 'fresh' }))
+    const store = new CodeArtsAccountStore(accountsPath)
+    await store.upsert(credential('uid-a', soon()))
+
+    expect((await store.forceRefresh('uid-a'))?.token).toBe('fresh')
+  })
+
+  it('returns undefined when the refresh token is dead', async () => {
+    refreshTokenMock.mockRejectedValue(new OAuthTokenError('refresh', 400, '{"error":"invalid_grant"}'))
+    const store = new CodeArtsAccountStore(accountsPath)
+    await store.upsert(credential('uid-a', soon()))
+
+    expect(await store.forceRefresh('uid-a')).toBeUndefined()
+    // 凭证真失效才落 stale；卡片据此提示重新登录。
+    expect((await store.credential('uid-a'))?.stale).toBe(true)
+  })
+
+  it('returns undefined for a transient failure instead of handing back the dead token', async () => {
+    refreshTokenMock.mockRejectedValue(new TypeError('fetch failed'))
+    const store = new CodeArtsAccountStore(accountsPath)
+    await store.upsert(credential('uid-a', soon()))
+
+    expect(await store.forceRefresh('uid-a')).toBeUndefined()
+    // 临时失败不能把账号判死 —— 这正是 issue #8 里「重启也救不回来」的根因。
+    expect((await store.credential('uid-a'))?.stale).toBeUndefined()
+  })
+})
+
+// 2026-11-13 现场：守护进程和插件同时持有同一账号的刷新权。keeper 先刷成功、
+// 轮换了 refresh_token；插件拿着旧令牌去刷，上游回 STS5.1806「已经用过」。
+// 旧逻辑把它当永久失效，并且把带旧令牌的凭证写回磁盘，覆盖掉 keeper 刚写的新令牌。
+describe('refresh token rotated by another writer', () => {
+  const soon = (): Record<string, unknown> => ({ expiration: new Date(Date.now() + 60_000).toISOString() })
+  const USED = '{"error_code":"STS5.1806","error_msg":"invalid refresh token: \'the refresh token has been used\'"}'
+
+  /** 模拟 keeper 先一步把磁盘上的令牌换掉。 */
+  async function keeperRotated(): Promise<void> {
+    const doc = {
+      version: 1,
+      order: ['uid-a', 'uid-b'],
+      accounts: {
+        'uid-a': credential('uid-a', { ...soon(), refreshToken: 'refresh-a-new' }),
+        'uid-b': credential('uid-b', { ...soon(), refreshToken: 'refresh-b-new' }),
+      },
+    }
+    await writeFile(accountsPath, JSON.stringify(doc), 'utf8')
+  }
+
+  it('reloads the rotated token and succeeds instead of marking the account stale', async () => {
+    let calls = 0
+    refreshTokenMock.mockImplementation(async (_cfg: unknown, payload: { userId?: string }) => {
+      calls += 1
+      if (calls === 1) throw new OAuthTokenError('refresh', 400, USED)
+      return token({ userId: payload.userId, securityToken: 'fresh' })
+    })
+    const store = new CodeArtsAccountStore(accountsPath)
+    await store.upsert(credential('uid-a', soon()))
+    await store.upsert(credential('uid-b'))
+    await keeperRotated()
+
+    const resolved = await store.resolve('uid-a')
+    expect(resolved?.token).toBe('fresh')
+    expect(refreshTokenMock).toHaveBeenCalledTimes(2)
+    // 第二次必须用 keeper 写的新令牌，而不是旧的那份。
+    expect((refreshTokenMock.mock.calls[1]?.[1] as { refreshToken?: string }).refreshToken).toBe('refresh-a-new')
+    // 也不许把账号判死。
+    expect(JSON.parse(await readFile(accountsPath, 'utf8')).accounts['uid-a'].stale).toBeUndefined()
+    // 关键回归点：另一个账号刚被轮换出来的令牌不能被覆盖回旧的。
+    expect(JSON.parse(await readFile(accountsPath, 'utf8')).accounts['uid-b'].refreshToken).toBe('refresh-b-new')
+  })
+
+  it('marks the account stale only when the disk token did not move', async () => {
+    refreshTokenMock.mockRejectedValue(new OAuthTokenError('refresh', 400, USED))
+    const store = new CodeArtsAccountStore(accountsPath)
+    await store.upsert(credential('uid-a', soon()))
+    await store.upsert(credential('uid-b'))
+
+    await store.resolve('uid-a')
+
+    const doc = JSON.parse(await readFile(accountsPath, 'utf8'))
+    expect(doc.accounts['uid-a'].stale).toBe(true)
+    // 没动的账号照旧。
+    expect(doc.accounts['uid-b'].stale).toBeUndefined()
   })
 })

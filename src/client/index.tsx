@@ -10,7 +10,9 @@ import { CodeArtsPluginCard } from './CodeArtsPluginCard.tsx'
 import type { CodeArtsPluginCardInjected } from './CodeArtsPluginCard.tsx'
 import { CodeArtsCreditDock } from './CodeArtsCreditDock.tsx'
 import { CodeArtsPanelIcon, CodeArtsPanelPage } from './CodeArtsPanel.tsx'
-import { setSidebarPanelWanted, sidebarPanelWanted, subscribeSidebarPanelWanted } from './panel-switch.ts'
+import { setSettingsEntryWanted, setSidebarPanelWanted, sidebarPanelWanted, settingsEntryWanted, subscribeSettingsEntryWanted, subscribeSidebarPanelWanted } from './panel-switch.ts'
+import { dockSnapshot, subscribeDock } from './dock-store.ts'
+import { openPluginSettings } from './settings-route.ts'
 import { en, zh } from './locales.ts'
 import type { CodeArtsSettingsKey } from './locales.ts'
 
@@ -46,6 +48,14 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
       scope: 'root';
       owner: { children?: never };
     };
+    /**
+     * 设置左侧那一列导航（宿主 ui-settings 声明）。用户找插件的第一反应就是这里
+     * （issue #7），而「内置插件 → 详情页」那条路径对第一次用的人基本等于找不到。
+     */
+    'settings.section': {
+      kind: 'list';
+      scope: 'root';
+    };
   }
 }
 
@@ -78,6 +88,20 @@ export function apply(ctx: ClientContext): void {
     ctx.effect(() => ctx.locale.register(namespace, { zh, en }), 'dsh-codearts: settings copy')
     const t = ctx.locale.bind(namespace) as CodeArtsPluginCardInjected['t']
 
+    /**
+     * 打开「设置 → CodeArts」。
+     *
+     * 宿主没有直白的「打开某节设置」服务，走设置壳公开挂在 `sidebar.settings`
+     * 槽位上的 store seat（见 settings-route.ts 的说明）。点按钮时现取，不缓存：
+     * 那个槽位属于另一个 bundle，apply 顺序不是我们能假定的。
+     */
+    const openSettings = (): boolean => openPluginSettings({
+      slots: ctx.slots as unknown as { entries?: (key: string) => readonly unknown[] },
+      shortcuts: ctx.get('shortcuts') as { invoke?: (id: string, context?: unknown) => void } | undefined,
+      sectionId: PANEL_ID,
+      label: () => t('tabLabel'),
+    })
+
     ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
       name: 'plugins.bundle.config',
       key: 'dsh-codearts',
@@ -96,7 +120,7 @@ export function apply(ctx: ClientContext): void {
       id: 'codearts-credits-bar',
       order: 20,
       locale: namespace,
-      inject: () => ({ t, zone: 'bar' as const }),
+      inject: () => ({ t, zone: 'bar' as const, onOpenSettings: openSettings }),
     }, CodeArtsCreditDock))
 
     ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
@@ -104,7 +128,7 @@ export function apply(ctx: ClientContext): void {
       id: 'codearts-credits',
       order: 20,
       locale: namespace,
-      inject: () => ({ t, zone: 'dock' as const }),
+      inject: () => ({ t, zone: 'dock' as const, onOpenSettings: openSettings }),
     }, CodeArtsCreditDock))
 
     // 侧边栏入口：一排图标里的一个按钮（sidebar.panellist），配一页中间列面板
@@ -201,16 +225,90 @@ export function apply(ctx: ClientContext): void {
       }
     }, 'dsh-codearts: sidebar panel opt-in')
 
+    /**
+     * 设置左侧导航里的入口（settings.section）。
+     *
+     * 和侧边栏那格一样按「注册 / 拆注册」实现：宿主是按槽位条目画导航行的，
+     * 渲染 null 只会留下一个空白可点的行。缺省开 —— 这是用户找插件的主路径
+     * （issue #7），只有明确关掉才拆。
+     */
+    const settingsEntryClaims: Array<() => void> = []
+
+    const dropSettingsEntry = (): void => {
+      for (const dispose of settingsEntryClaims.splice(0)) {
+        try {
+          dispose()
+        } catch (error: unknown) {
+          console.error('[dsh-codearts] failed to release settings entry:', error)
+        }
+      }
+    }
+
+    const syncSettingsEntry = (): void => {
+      dropSettingsEntry()
+      if (!settingsEntryWanted()) return
+      try {
+        settingsEntryClaims.push(ctx.slots.inject('settings.section', () => {
+          try {
+            return ctx.slots.register({
+              name: 'settings.section',
+              id: PANEL_ID,
+              // 排在宿主自带那几节（通用设置 / 模型 / 内置插件 …）之后、
+              // 其他插件入口附近，不抢前几格。
+              order: 50,
+              label: () => t('tabLabel'),
+              locale: namespace,
+              inject: () => ({ t }),
+            }, CodeArtsPluginCard)
+          } catch (error: unknown) {
+            console.error('[dsh-codearts] settings entry unavailable:', error)
+            return () => {}
+          }
+        }))
+      } catch (error: unknown) {
+        console.error('[dsh-codearts] settings section slot unavailable:', error)
+      }
+    }
+
+    ctx.effect(() => {
+      const off = subscribeSettingsEntryWanted(syncSettingsEntry)
+      syncSettingsEntry()
+      return () => {
+        off()
+        dropSettingsEntry()
+      }
+    }, 'dsh-codearts: settings entry opt-out')
+
+    /**
+     * 共享的 dock 状态一变，两个入口的注册/拆注册跟着走。
+     *
+     * 以前只有「卡片挂载时」才把开关值写进 panel-switch；如果另一张卡片或 60 秒
+     * 轮询先拿到新值，就会出现「卡片上勾着、导航里却没有入口」（实测）。
+     */
+    ctx.effect(() => {
+      const apply = (): void => {
+        const { dock, loaded } = dockSnapshot()
+        if (!loaded) return
+        setSettingsEntryWanted(dock.settingsEntry !== false)
+        setSidebarPanelWanted(dock.sidebar === true)
+      }
+      const off = subscribeDock(apply)
+      apply()
+      return off
+    }, 'dsh-codearts: entry switches follow dock state')
+
     // 开关存在插件设置里，刷新页面后浏览器侧没有记忆，所以开局问一次状态接口。
-    // 失败静默 —— 读不到就是「不显示」，这正是默认值。
+    // 失败静默：侧边栏保持关闭（缺省），设置入口保持显示（缺省）。
     void (async () => {
       try {
         const res = await fetch('/api/codearts/dock', { headers: { Accept: 'application/json' } })
         if (!res.ok) return
-        const data = (await res.json()) as { dock?: { sidebar?: boolean } }
+        const data = (await res.json()) as { dock?: { sidebar?: boolean; settingsEntry?: boolean } }
         setSidebarPanelWanted(data.dock?.sidebar === true)
+        // 老后端没有这个字段：缺省仍是「显示」，别因为读不到就把它拆了。
+        setSettingsEntryWanted(data.dock?.settingsEntry !== false)
       } catch {
-        // 老后端没这条路由：保持关闭。
+        // 老后端没这条路由：保持两个缺省。
       }
     })()
   } catch (error: unknown) {

@@ -600,7 +600,7 @@ describe('GET /api/codearts/status', () => {
   // 底部积分条靠这一份开关决定画不画，所以它必须搭 /status 的车 —— 为两个布尔
   // 多开一条轮询链路没道理。没接 settings 的宿主上 deps.dock 缺席，字段就该整个没有。
   it('carries the dock visibility flags so the composer bar does not need its own poll', async () => {
-    const flags = { credits: false, queue: true, sidebar: false, modelDetail: true, autoClaim: false, keepAliveDaemon: false }
+    const flags = { credits: false, queue: true, sidebar: false, settingsEntry: true, modelDetail: true, autoClaim: false, keepAliveDaemon: false }
     const scoped = mountRoutes({ store, models: () => [], dock: () => flags })
     const res = await call(scoped.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)
     expect(res.body?.dock).toEqual(flags)
@@ -638,7 +638,7 @@ describe('GET /api/codearts/status', () => {
 
 describe('/api/codearts/dock', () => {
   it('answers the current flags and reports writability', async () => {
-    const flags = { credits: true, queue: false, sidebar: true, modelDetail: false, autoClaim: true, keepAliveDaemon: true }
+    const flags = { credits: true, queue: false, sidebar: true, settingsEntry: false, modelDetail: false, autoClaim: true, keepAliveDaemon: true }
     const scoped = mountRoutes({ store, models: () => [], dock: () => flags })
     const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, GET, CODEARTS_DOCK_PATH)
     expect(res.body?.dock).toEqual(flags)
@@ -651,6 +651,7 @@ describe('/api/codearts/dock', () => {
       credits: true,
       queue: true,
       sidebar: false,
+      settingsEntry: true,
       modelDetail: true,
       autoClaim: false,
       keepAliveDaemon: false,
@@ -695,6 +696,26 @@ describe('/api/codearts/dock', () => {
     }, JSON.stringify({ sidebar: true }))
     expect(res.status).toBe(200)
     expect(res.body?.dock).toEqual({ ...DEFAULT_DOCK_FLAGS, sidebar: true })
+  })
+
+  // 设置左侧入口默认显示（issue #7：默认关闭等于默认找不到）。
+  it('writes the settingsEntry flag', async () => {
+    let flags: CodeArtsDockFlags = { ...DEFAULT_DOCK_FLAGS }
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      dock: () => flags,
+      setDock: async patch => {
+        flags = { ...flags, ...patch }
+        return true
+      },
+    })
+    expect(flags.settingsEntry).toBe(true)
+    const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, POST, CODEARTS_DOCK_PATH, {
+      'content-type': 'application/json',
+    }, JSON.stringify({ settingsEntry: false }))
+    expect(res.status).toBe(200)
+    expect(res.body?.dock).toEqual({ ...DEFAULT_DOCK_FLAGS, settingsEntry: false })
   })
 
   // 「Model 及其右侧」是独立的一把开关：打开 provider 不受它影响，只关这一段。
