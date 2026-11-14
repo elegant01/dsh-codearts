@@ -27,6 +27,7 @@ import { hostIsLoopback, originIsLoopback } from './loopback.ts'
 import { probePiAiCompat } from './pi-ai-compat.ts'
 import {
   chatStream,
+  contextWindowOverrideFor,
   firstFrameError,
   isModelNotAccessible,
   modelUnavailableReasonText,
@@ -55,6 +56,11 @@ const IDENTITY_TIMEOUT_MS = 8_000
 export const CODEARTS_STATUS_PATH = '/api/codearts/status'
 export const CODEARTS_MODELS_PATH = '/api/codearts/models'
 export const CODEARTS_MODELS_SELECTION_PATH = '/api/codearts/enabled-models'
+/**
+ * POST /api/codearts/context-window — 按模型设置/清除上下文窗口覆盖（issue #9）。
+ * `{ id, window }`，`window: null` 表示删除覆盖、回到跟随上游。
+ */
+export const CODEARTS_CONTEXT_WINDOW_PATH = '/api/codearts/context-window'
 export const CODEARTS_TOKEN_PATH = '/api/codearts/token'
 export const CODEARTS_LOGIN_PATH = '/api/codearts/login'
 export const CODEARTS_LOGIN_STATUS_PATH = '/api/codearts/login/status'
@@ -110,11 +116,19 @@ export interface CodeArtsModelChoice {
   /** 支持图片输入（卡片据此挂「识图」Tag；纯文本模型缺省）。 */
   supportsImages?: boolean
   /**
-   * 上下文窗口（上游发现值；拿不到时是目录的兜底值 32768）。
+   * 上下文窗口（生效值：用户覆盖或实测上界压低之后的结果）。
    *
-   * 卡片用它显示「1M 上下文」这类规格 —— 这是选模型时最该看的数字，之前完全看不到。
+   * 卡片用它显示「1M 上下文」这类规格，也是窗口输入框的当前值。
    */
   contextWindow?: number
+  /**
+   * 上游标称的窗口（未被覆盖/学习改动过的原值）。
+   *
+   * 有它卡片才能判断「这个数字是不是用户自己设的」，以及把输入框清空后应该回到哪。
+   */
+  contextWindowDiscovered?: number
+  /** 用户给这个模型设的窗口覆盖值（issue #9）；undefined 表示跟随上游。 */
+  contextWindowOverride?: number
   /** 单次输出上限（endpoint 元数据或实测天花板）。 */
   maxTokens?: number
   /**
@@ -127,7 +141,7 @@ export interface CodeArtsModelChoice {
 
 /** enabled-models 路由返回的 selection 文档（与 codebuddy 的 shape 对齐）。 */
 export interface CodeArtsModelSelection {
-  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; contextWindow?: number; maxTokens?: number; error?: string }[]
+  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; contextWindow?: number; contextWindowDiscovered?: number; contextWindowOverride?: number; maxTokens?: number; error?: string }[]
   /** 已选子集是否小于全集（卡片据此显示不同提示）。 */
   restricted: boolean
   /** 是否可写（无 settings provider 时为 false，卡片只读）。 */
@@ -155,6 +169,8 @@ export function selectionOf(
     ratio: m.ratio,
     supportsImages: m.supportsImages,
     contextWindow: m.contextWindow,
+    contextWindowDiscovered: m.contextWindowDiscovered,
+    contextWindowOverride: m.contextWindowOverride,
     maxTokens: m.maxTokens,
     ...(m.error === undefined ? {} : { error: m.error }),
     enabled: restricted ? allowed.has(m.id) : true,
@@ -164,10 +180,12 @@ export function selectionOf(
 
 /** 目录 -> 勾选 UI 的选项（福利标记、今日不可用标记与倍率都在这里算）。 */
 function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
+  const overrides = deps.contextWindowOverrides?.()
   return deps.models().map(m => {
     const benefit = isBenefitModel(m.id)
     const ratio = creditRatioLabel(m.ratio, benefit)
     const error = modelUnavailableReason(m.id)
+    const override = contextWindowOverrideFor(overrides, m.id)
     return {
       id: m.id,
       name: m.name,
@@ -176,6 +194,9 @@ function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
       ...(ratio === undefined ? {} : { ratio }),
       ...(m.supportsImages === true ? { supportsImages: true } : {}),
       ...(m.contextWindowKnown === true ? { contextWindow: m.contextWindow } : {}),
+      // 生效值和上游标称值不同才带原值：卡片据此把输入框还原成「跟随上游」。
+      ...(m.contextWindowDiscovered === undefined ? {} : { contextWindowDiscovered: m.contextWindowDiscovered }),
+      ...(override === undefined ? {} : { contextWindowOverride: override }),
       ...(m.maxTokens > 0 ? { maxTokens: m.maxTokens } : {}),
       ...(error === undefined ? {} : { error }),
     }
@@ -493,6 +514,19 @@ export interface CodeArtsStatusRouteOptions {
    * attached, which the card renders as a read-only selection.
    */
   setEnabledModels?: (ids: readonly string[]) => Promise<boolean>
+  /**
+   * 用户按模型 id 配置的上下文窗口覆盖值（issue #9）。
+   *
+   * 免费档的真实窗口远小于目录标称的 1M，而且会漂 —— 没有覆盖项时用户只能等上游修。
+   * 省略则卡片不显示窗口输入框与滑块。
+   */
+  contextWindowOverrides?: () => Readonly<Record<string, number>> | undefined
+  /**
+   * 写入或清除某个模型的窗口覆盖（`window: null` = 回到跟随上游）。
+   *
+   * 返回 false 表示没接 settings provider，卡片据此把输入框置灰。
+   */
+  setContextWindowOverride?: (id: string, window: number | null) => Promise<boolean>
   /**
    * 对话底部那一行的显隐开关当前值。省略则 /status 不带 dock 字段（= 都显示）。
    */
@@ -1052,6 +1086,60 @@ function modelsSelectionHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/**
+ * POST /api/codearts/context-window { id, window } — 按模型覆盖上下文窗口。
+ *
+ * 存在的理由（issue #9）：目录给的是上游标称窗口，免费档实际能装下的往往差一半，
+ * 而超限时上游只回一句「参数非法」、不指名参数。`window: null` 删除覆盖、回到跟随上游。
+ */
+function contextWindowHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    if (deps.setContextWindowOverride === undefined) {
+      json(res, 403, { error: 'context-window-not-writable' })
+      return
+    }
+    const type = req.headers['content-type']
+    if (typeof type !== 'string' || !type.trim().toLowerCase().startsWith('application/json')) {
+      json(res, 415, { error: 'content-type must be application/json' })
+      return
+    }
+    try {
+      const body = JSON.parse(await readBody(req)) as { id?: unknown; window?: unknown }
+      const id = typeof body.id === 'string' ? body.id.trim() : ''
+      if (id === '') {
+        json(res, 400, { error: 'expected {"id": string, "window": number|null}' })
+        return
+      }
+      let window: number | null = null
+      if (body.window !== null && body.window !== undefined) {
+        if (typeof body.window !== 'number' || !Number.isFinite(body.window) || body.window <= 0) {
+          json(res, 400, { error: 'window must be a positive number or null' })
+          return
+        }
+        window = Math.floor(body.window)
+      }
+      const ok = await deps.setContextWindowOverride(id, window)
+      if (!ok) {
+        json(res, 403, { error: 'context-window-not-writable' })
+        return
+      }
+      // 回整份 selection（和 enabled-models 一样）：卡片一次替换，不用自己拼状态。
+      const all = choicesOf(deps)
+      json(res, 200, { selection: selectionOf(all, deps.enabledModels?.(), true) })
+    } catch (error: unknown) {
+      json(res, 500, { error: safeMessage(error) })
+    }
+  }
+}
+
 /** POST /api/codearts/token { token, label? } — store a pasted token. */
 function tokenPostHandler(deps: CodeArtsStatusRouteOptions) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -1412,6 +1500,11 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_MODELS_SELECTION_PATH,
       handler: modelsSelectionHandler(deps),
     })
+    const disposeContextWindow = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_CONTEXT_WINDOW_PATH,
+      handler: contextWindowHandler(deps),
+    })
     // 宿主 WebServer 对同一个 (kind, path) 只留一个席位，重复注册会抛
     // duplicate exact route —— 抛在同一次 effect 里会把它后面的注册全跳过，
     // 所以 /token 的 POST 与 DELETE 必须共用一个 handler。
@@ -1479,6 +1572,7 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeStatus()
       disposeModels()
       disposeModelsSelection()
+      disposeContextWindow()
       disposeToken()
       disposeLoginStart()
       disposeLoginStatus()

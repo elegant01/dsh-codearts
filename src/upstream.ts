@@ -163,8 +163,13 @@ export function isParamInvalidFrame(text: string): boolean {
  * 免得该模型后面每一轮都先白撞一次。
  */
 const learnedMaxTokens = new Map<string, number>()
-/** 降档下限：再低就没有可用的生成长度了，此时宁可把具体错误报给用户。 */
-const MAX_TOKENS_FLOOR = 8_192
+/**
+ * 降档下限：再低就没有可用的生成长度了，此时宁可把具体错误报给用户。
+ *
+ * 导出是因为 shim 要拿它写报错文案（「max_tokens 已降到 8192 仍被拒」），文案里
+ * 的数字必须和真正的降档逻辑同源，不能在两处各写一个。
+ */
+export const MAX_TOKENS_FLOOR = 8_192
 
 function ceilingKey(id: string): string {
   return id.trim().toLowerCase()
@@ -188,6 +193,63 @@ export function degradeTokenCeiling(id: string): number {
 /** 清空降档记忆。进程内状态，测试之间必须能重置。 */
 export function resetTokenCeilings(): void {
   learnedMaxTokens.clear()
+}
+
+/**
+ * 本次进程内学到的「真实上下文窗口」上界（小写 id → tokens）。
+ *
+ * 目录值来自上游动态发现，但免费档真实窗口可能远小于标称、还会漂（issue #9：
+ * `deepseek-v4.1-flash-1017` 标称 1M、实测 ≈49 万，换一天又变）。上游对「装不下」
+ * 只回一句 InferHub.001001005.400，不说是哪个参数 —— 所以只能自己判：
+ * max_tokens 已经降到地板仍然被拒 ⇒ 不是 max_tokens 的问题，是 prompt 侧装不下
+ * ⇒ 把这次的 prompt 估算值记成该模型的上界。下一轮守卫就会在本地拦下来，并给出
+ * 指向上下文的报错，而不是让用户去猜「参数非法」。
+ *
+ * 与 learnedMaxTokens 一样是进程内状态：重启后第一次仍会白撞一次，之后立刻学会。
+ * 上游窗口只会收紧、不会放宽，所以取历史最小值，不被后面更大的估算抬高。
+ */
+const learnedContextWindow = new Map<string, number>()
+
+/** 该模型学到的真实窗口上界；没学过返回 undefined。 */
+export function learnedContextWindowFor(id: string): number | undefined {
+  return learnedContextWindow.get(ceilingKey(id))
+}
+
+/**
+ * 记录一次「prompt 装不下」：把本次 prompt 估算值作为该模型的上界。
+ * @returns 学习后的上界（取历史最小值）
+ */
+export function learnContextWindow(id: string, promptTokens: number): number {
+  const key = ceilingKey(id)
+  const measured = Math.max(1, Math.floor(promptTokens))
+  const previous = learnedContextWindow.get(key)
+  const learned = previous === undefined ? measured : Math.min(previous, measured)
+  learnedContextWindow.set(key, learned)
+  return learned
+}
+
+/** 清空学到的窗口上界（测试专用）。 */
+export function resetLearnedContextWindows(): void {
+  learnedContextWindow.clear()
+}
+
+/**
+ * 从用户配置里取某模型的 contextWindow 覆盖值（id 大小写不敏感）。
+ *
+ * 非正数、NaN、Infinity 一律视为「没配」：这些值只会让守卫把每一次请求都判成
+ * 放不下，比目录值更糟。用户真要表达「不知道窗口」，删掉这个键即可。
+ */
+export function contextWindowOverrideFor(
+  overrides: Readonly<Record<string, number>> | undefined,
+  id: string,
+): number | undefined {
+  if (overrides === undefined) return undefined
+  const key = ceilingKey(id)
+  for (const [rawKey, value] of Object.entries(overrides)) {
+    if (ceilingKey(rawKey) !== key) continue
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
+  }
+  return undefined
 }
 
 /**
@@ -410,6 +472,14 @@ export interface PreparedChatBody {
    * 那句话里没有模型、没有 token 数，用户无从下手。
    */
   error?: string
+  /**
+   * 本次请求的 prompt 估算（messages + tools，含工具定义）。
+   *
+   * 两个用途：守卫算 room；shim 在「max_tokens 已到地板仍被判参数非法」时把它
+   * 记成该模型的真实窗口上界（issue #9 的诉求 2）。守卫和报错用的是同一份数值，
+   * 不会出现「守卫说 40 万、报错说 39 万」的漂移。
+   */
+  promptTokens: number
 }
 
 /**
@@ -438,7 +508,7 @@ export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedCha
     parsed = JSON.parse(rawJson) as Record<string, unknown>
   } catch {
     // 解析失败仍拼一个最小请求，让上游自己报错
-    return { url: `${SNAP_HOST}${EP_CHAT}`, body: rawJson, model: '', chatId: '' }
+    return { url: `${SNAP_HOST}${EP_CHAT}`, body: rawJson, model: '', chatId: '', promptTokens: 0 }
   }
   const model = typeof parsed.model === 'string' ? canonicalModel(parsed.model) : ''
   const chatId = conversationChatId(parsed)
@@ -473,11 +543,13 @@ export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedCha
   //  1. 超过该模型上限 → 钳住（上限由服务端控制、会漂，真撞了还有 degradeTokenCeiling 兜底）
   //  2. prompt + max_tokens 超过 contextWindow → 把 max_tokens 压到装得下；
   //     连最短回答都放不下时，回一条**具体**错误，而不是让上游给一句黑话。
+  /** 本次 prompt 的估算值：不管窗口知不知道都算，shim 要靠它学真实上界。 */
+  let promptTokens = 0
   const ceiling = maxTokensCeilingFor(model)
   if (typeof body.max_tokens === 'number') {
     let maxTokens = Math.min(body.max_tokens, ceiling)
+    promptTokens = estimatePromptTokens(body.messages, body.tools)
     if (contextWindow > 0) {
-      const promptTokens = estimatePromptTokens(body.messages, body.tools)
       const room = contextWindow - promptTokens - PROMPT_ESTIMATE_MARGIN
       if (room < MIN_USEFUL_OUTPUT_TOKENS) {
         body.max_tokens = maxTokens
@@ -486,7 +558,8 @@ export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedCha
           body: JSON.stringify(body),
           model,
           chatId,
-          error: `上下文放不下：${model} 的窗口是 ${contextWindow} tokens，本次请求（含 ${Array.isArray(body.messages) ? body.messages.length : 0} 条消息与工具定义）估算约 ${promptTokens} tokens，剩余不足 ${MIN_USEFUL_OUTPUT_TOKENS} tokens 的生成余量。请新建会话或改用上下文更大的模型。`,
+          promptTokens,
+          error: `上下文放不下：${model} 的窗口是 ${contextWindow} tokens，本次请求（含 ${Array.isArray(body.messages) ? body.messages.length : 0} 条消息与工具定义）估算约 ${promptTokens} tokens，剩余不足 ${MIN_USEFUL_OUTPUT_TOKENS} tokens 的生成余量。请新建会话或改用上下文更大的模型；如果目录里的窗口值不准，可在设置里覆盖该模型的 contextWindow。`,
         }
       }
       maxTokens = Math.min(maxTokens, room)
@@ -509,7 +582,7 @@ export function prepareChatBody(rawJson: string, contextWindow = 0): PreparedCha
   body.chat_id = chatId
   body.prompt_cache_key = chatId
   body.tool_stream = true
-  return { url: `${SNAP_HOST}${EP_CHAT}`, body: JSON.stringify(body), model, chatId }
+  return { url: `${SNAP_HOST}${EP_CHAT}`, body: JSON.stringify(body), model, chatId, promptTokens }
 }
 
 /**
@@ -1393,13 +1466,16 @@ export async function clearQueueStatus(
  *    `gateway/config` 给福利模型标的是 393216 / 384000，而聊天端点实测超过 65536
  *    就流内报 InferHub.001001005.400；DSH 会把 catalog 的 maxTokens 原样当
  *    max_tokens 发出去，照抄标称值等于让每个请求都失败。
- *  - contextWindow 用发现值（只影响 DSH 的上下文计量与截断余量，不影响路由）。
+ *  - contextWindow 用发现值（只影响 DSH 的上下文计量与截断余量，不影响路由）；
+ *    用户配置的按模型覆盖值与进程内学到的真实上界在这里压过发现值（issue #9）。
  *
+ * @param contextWindowOverrides 按模型 id 覆盖 contextWindow（大小写不敏感）
  * @throws 三路全失败，或合并结果为空。
  */
 export async function fetchModels(
   credential: CodeArtsResolved,
   signal?: AbortSignal,
+  contextWindowOverrides: Readonly<Record<string, number>> = {},
 ): Promise<ModelDiscoveryResult> {
   const settled = await Promise.all([
     fetchBuiltinModels(credential, signal).then(
@@ -1446,11 +1522,20 @@ export async function fetchModels(
 
   const models = merged.map(model => {
     const thinking = variants.get(model.id.toLowerCase())
+    const override = contextWindowOverrideFor(contextWindowOverrides, model.id)
+    const learned = learnedContextWindowFor(model.id)
+    // 用户显式覆盖优先于目录值；学习值是实测上界，只往下压。两者都没有时保持原样。
+    const discovered = model.contextWindow > 0 ? model.contextWindow : UNKNOWN_CONTEXT_WINDOW
+    const base = override ?? discovered
+    const contextWindow = learned === undefined ? base : Math.min(base, learned)
     return {
       ...model,
       ...(thinking === undefined ? {} : { thinking }),
-      contextWindowKnown: model.contextWindow > 0,
-      contextWindow: model.contextWindow > 0 ? model.contextWindow : UNKNOWN_CONTEXT_WINDOW,
+      // 覆盖值与学习值都是我们自己确认过的上界，可以当真实值展示。
+      contextWindowKnown: override !== undefined || learned !== undefined || model.contextWindow > 0,
+      contextWindow,
+      // 生效值和上游标称值不同时留一份原值：卡片把窗口「改回跟随默认」要靠它。
+      ...(contextWindow === discovered ? {} : { contextWindowDiscovered: discovered }),
       maxTokens: Math.min(
         model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS,
         maxTokensCeilingFor(model.id),

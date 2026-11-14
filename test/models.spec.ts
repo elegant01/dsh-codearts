@@ -20,7 +20,15 @@ import {
 } from '../src/catalog.ts'
 import { refreshCatalog } from '../src/discovery.ts'
 import { thinkingFields } from '../src/adapter.ts'
-import { fetchModels, maxTokensCeilingFor, MAX_TOKENS_CEILING } from '../src/upstream.ts'
+import {
+  contextWindowOverrideFor,
+  fetchModels,
+  learnContextWindow,
+  learnedContextWindowFor,
+  maxTokensCeilingFor,
+  MAX_TOKENS_CEILING,
+  resetLearnedContextWindows,
+} from '../src/upstream.ts'
 
 const model = (id: string, patch: Partial<CodeArtsModelInfo> = {}): CodeArtsModelInfo => ({
   id,
@@ -394,10 +402,14 @@ function stubFetch(handlers: Record<string, () => Response>): void {
 const json = (body: string): Response => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } })
 
 describe('fetchModels', () => {
-  beforeEach(() => setDiscoveredBenefitModels([]))
+  beforeEach(() => {
+    setDiscoveredBenefitModels([])
+    resetLearnedContextWindows()
+  })
   afterEach(() => {
     vi.unstubAllGlobals()
     setDiscoveredBenefitModels([])
+    resetLearnedContextWindows()
   })
 
   it('merges the three sources and clamps max_tokens to the measured ceiling', async () => {
@@ -438,6 +450,51 @@ describe('fetchModels', () => {
     expect(byId.get('GLM-5.2')?.thinking).toEqual({ strengths: ['high', 'max'], default: 'high' })
     expect(byId.get('glm-5.2-sft-harmony')?.thinking?.strengths).toEqual(['high'])
     expect(byId.get('Qwen3-VL-235B')?.thinking).toBeUndefined()
+  })
+
+  // issue #9：目录给的 1M 是标称值，免费档实际窗口小得多。用户配置必须能压过发现值，
+  // 且 id 大小写不敏感 —— 上游注册名是大小写混排的，用户不会照着抄。
+  it('applies per-model contextWindow overrides over the discovered value', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/model/thinking-variants': () => json(THINKING_BODY),
+    })
+
+    const result = await fetchModels(credential, undefined, { 'glm-5.2': 100_000 })
+    const glm = result.models.find(m => m.id === 'GLM-5.2')
+    expect(glm?.contextWindow).toBe(100_000)
+    expect(glm?.contextWindowKnown).toBe(true)
+  })
+
+  // 学到的上界来自实测（max_tokens 到地板仍被拒），它必须继续压在覆盖值/发现值之下，
+  // 而且只能收紧不能放宽。
+  it('clamps the discovered value by the learned upper bound', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/model/thinking-variants': () => json(THINKING_BODY),
+    })
+
+    learnContextWindow('GLM-5.2', 90_000)
+    // 更大的估算不能把上界抬高。
+    learnContextWindow('GLM-5.2', 120_000)
+    expect(learnedContextWindowFor('GLM-5.2')).toBe(90_000)
+
+    const result = await fetchModels(credential, undefined, { 'GLM-5.2': 100_000 })
+    expect(result.models.find(m => m.id === 'GLM-5.2')?.contextWindow).toBe(90_000)
+  })
+
+  it('ignores non-positive / non-finite overrides instead of freezing every request', () => {
+    expect(contextWindowOverrideFor({ 'GLM-5.2': 0 }, 'glm-5.2')).toBeUndefined()
+    expect(contextWindowOverrideFor({ 'GLM-5.2': Number.NaN }, 'GLM-5.2')).toBeUndefined()
+    expect(contextWindowOverrideFor({ 'GLM-5.2': Number.POSITIVE_INFINITY }, 'GLM-5.2')).toBeUndefined()
+    expect(contextWindowOverrideFor({ 'GLM-5.2': 49_152.9 }, 'GLM-5.2')).toBe(49_152)
+    expect(contextWindowOverrideFor(undefined, 'GLM-5.2')).toBeUndefined()
   })
 
   it('keeps working when a source fails (benefit gateway down)', async () => {

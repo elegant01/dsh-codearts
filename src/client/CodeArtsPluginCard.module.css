@@ -872,6 +872,149 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* 模型行里的窗口调节（issue #9）：滑块给档位，输入框给精确 token 数。 */
+/* 行内只留一枚按钮，滑块和输入框收进点击弹出的浮层里，不占行的横向空间。 */
+.windowAnchor {
+  position: relative;
+  margin-left: auto;
+  flex: none;
+}
+
+.windowButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 4px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  background: transparent;
+  border: 0.5px solid transparent;
+  border-radius: var(--dsw-radius-sm);
+  cursor: pointer;
+}
+
+.windowButton:hover,
+.windowButtonOpen {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+  border-color: var(--dsw-alias-border-l3);
+}
+
+/* 用户自己设过的值：亮一点、粗一点，和「跟随上游」一眼能分开。 */
+.windowButtonSet {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+  border-color: var(--dsw-alias-state-business-primary);
+}
+
+.windowCaret {
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.windowPopover {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 208px;
+  padding: 10px;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 18%);
+}
+
+.windowPopoverHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.windowPopoverValue {
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-primary);
+}
+
+.windowRange {
+  width: 100%;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--dsw-alias-brand-primary);
+}
+
+.windowRange:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.windowPopoverRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.windowUnit {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.windowInput {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--dsw-alias-label-primary);
+  background: transparent;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-sm);
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.windowInput::-webkit-outer-spin-button,
+.windowInput::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.windowInput:focus {
+  outline: none;
+  color: var(--dsw-alias-label-primary);
+  border-color: var(--dsw-alias-brand-primary);
+}
+
+/* 用户自己设过的值：亮一点、粗一点，和「跟随上游」一眼能分开。 */
+.windowInputSet {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+  border-color: var(--dsw-alias-state-business-primary);
+}
+
+.windowHint {
+  margin: 0;
+  font-size: 10px;
+  line-height: 15px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
 /* 体检列表：一行一条，状态点 + 名称 + 说明。 */
 .doctorList {
   display: flex;

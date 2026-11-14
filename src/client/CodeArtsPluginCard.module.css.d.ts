@@ -92,5 +92,19 @@ declare const styles: {
   readonly "usageTipName": string
   readonly "usageTipRow": string
   readonly "usageTipSep": string
+  readonly "windowAnchor": string
+  readonly "windowButton": string
+  readonly "windowButtonOpen": string
+  readonly "windowButtonSet": string
+  readonly "windowCaret": string
+  readonly "windowHint": string
+  readonly "windowInput": string
+  readonly "windowInputSet": string
+  readonly "windowPopover": string
+  readonly "windowPopoverHead": string
+  readonly "windowPopoverRow": string
+  readonly "windowPopoverValue": string
+  readonly "windowRange": string
+  readonly "windowUnit": string
 }
 export default styles

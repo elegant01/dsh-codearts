@@ -45,10 +45,12 @@ export interface DiscoveryOutcome {
  *
  * @param store 账号文档；逐个 `resolve()` 以拿到已续期的签名材料
  * @param signal 取消信号（宿主关停时用）
+ * @param contextWindowOverrides 用户按模型 id 配置的窗口覆盖值（issue #9）
  */
 export async function discoverModels(
   store: CodeArtsAccountStore,
   signal?: AbortSignal,
+  contextWindowOverrides?: Readonly<Record<string, number>>,
 ): Promise<DiscoveryOutcome> {
   const ids = await store.ids()
   const accounts: AccountDiscovery[] = []
@@ -69,7 +71,7 @@ export async function discoverModels(
       continue
     }
     try {
-      const result = await fetchModels(resolved, signal)
+      const result = await fetchModels(resolved, signal, contextWindowOverrides)
       accounts.push({
         accountId: id,
         ...(label === undefined ? {} : { label }),
@@ -105,8 +107,9 @@ export async function refreshCatalog(
   store: CodeArtsAccountStore,
   catalog: CodeArtsCatalog,
   signal?: AbortSignal,
+  contextWindowOverrides?: Readonly<Record<string, number>>,
 ): Promise<DiscoveryOutcome | undefined> {
-  const outcome = await discoverModels(store, signal)
+  const outcome = await discoverModels(store, signal, contextWindowOverrides)
   if (!outcome.anySucceeded || outcome.models.length === 0) return outcome
   // 福利名单取所有成功账号的并集：漏标一次就是一次 InferHub.002002009.404。
   setDiscoveredBenefitModels(outcome.models.filter(model => model.benefit === true).map(model => model.id))

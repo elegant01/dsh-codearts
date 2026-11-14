@@ -24,6 +24,7 @@ import { markModelUnavailable } from './catalog.ts'
 import {
   canonicalModel,
   chatStream,
+  contextWindowOverrideFor,
   degradeTokenCeiling,
   firstFrameError,
   isConcurrencyCap,
@@ -33,6 +34,9 @@ import {
   isParamInvalidFrame,
   isQueueableRate,
   isTpmLimit,
+  learnContextWindow,
+  learnedContextWindowFor,
+  MAX_TOKENS_FLOOR,
   maxTokensCeilingFor,
   modelUnavailableReasonText,
   prepareChatBody,
@@ -82,6 +86,13 @@ export interface CodeArtsShimOptions {
   debug?: (message: string) => void
   /** 本地槽位满时最多等多久（缺省 30 秒）。测试用它把等待压到毫秒级。 */
   localSlotWaitMs?: number
+  /**
+   * 按模型 id 覆盖 contextWindow（用户配置，每次请求实时读取）。
+   *
+   * 目录值来自上游标称，免费档真实窗口可能小得多（issue #9）。回调而不是快照：
+   * 用户在设置里改完，下一句话就该用新值，不必等下一轮模型发现。
+   */
+  contextWindowOverrides?: () => Readonly<Record<string, number>> | undefined
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -189,7 +200,12 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   })
 }
 
-/** 一次请求最多把 max_tokens 降几档（65536 → 32768 → 16384 → 8192）。 */
+/**
+ * 一次请求最多把 max_tokens 降几档（65536 → 32768 → 16384 → 8192）。
+ *
+ * 到地板后还会再进循环一次 —— 那一次不再重发，而是把「其实是上下文装不下」
+ * 报出来并学习窗口上界（见 `openWithCeilingHeal`）。
+ */
 const MAX_CEILING_HEALS = 3
 /**
  * 一次请求最多试几个账号：clamp(可用账号数, ROTATE_MIN_ATTEMPTS, ROTATE_MAX_ATTEMPTS)。
@@ -398,13 +414,27 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     }
   }
 
-  /** 该模型的上下文窗口（catalog 里查，大小写不敏感）；查不到返回 0 = 不做超长预判。 */
+  /**
+   * 该模型当前应使用的上下文窗口：用户覆盖优先于目录值，再被进程内学到的上界往下钳。
+   *
+   * 学到的上界来自「max_tokens 已到地板仍被判参数非法」的实测（issue #9）。必须在这里
+   * 生效 —— 只改目录不够，目录要等下一轮发现，而用户下一句话马上就来。
+   * 返回 0 表示查不到该模型，不做超长预判。
+   */
   function contextWindowFor(id: string): number {
     const lower = id.trim().toLowerCase()
+    let discovered = 0
     for (const model of catalog.current()) {
-      if (model.id.toLowerCase() === lower) return model.contextWindow
+      if (model.id.toLowerCase() === lower) {
+        discovered = model.contextWindow
+        break
+      }
     }
-    return 0
+    const override = contextWindowOverrideFor(options.contextWindowOverrides?.(), lower)
+    const base = override ?? discovered
+    const learned = learnedContextWindowFor(lower)
+    const window = learned === undefined ? base : Math.min(base, learned)
+    return window > 0 ? window : 0
   }
 
   /**
@@ -462,12 +492,37 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
           return { prepared, result: { ok: false, kind, status: KIND_STATUS[kind], message: detail } }
         }
       }
-      const shouldHeal = heal < MAX_CEILING_HEALS && headText !== undefined && isParamInvalidFrame(headText)
+      // 只有「带 max_tokens、还有降档空间」的请求才值得重发：没有 max_tokens（或连
+      // prompt 都估不出来）的请求，降 max_tokens 解决不了任何问题，只会白撞上游。
+      // 已经在地板时多放一次机会进来 —— 那一次不是重发，而是把「其实装不下」说出来。
+      const atFloor = maxTokensCeilingFor(prepared.model) <= MAX_TOKENS_FLOOR
+      const shouldHeal = prepared.promptTokens > 0
+        && headText !== undefined
+        && isParamInvalidFrame(headText)
+        && (heal < MAX_CEILING_HEALS || atFloor)
       reader.releaseLock()
       if (!shouldHeal) return { prepared, result, head }
       await result.stream.cancel().catch(() => {})
       if (degradeTokenCeiling(prepared.model) === 0) {
-        return { prepared, result: { ok: false, kind: 'client', status: 400, message: `${prepared.model}: max_tokens 已降到下限仍被判参数非法` } }
+        // max_tokens 已经到地板还被判参数非法 ⇒ 不是 max_tokens 的问题，是 prompt 装不下。
+        // 把本次估算记成该模型的真实窗口上界（下一轮守卫会直接拦下来），并把报错指向
+        // 上下文 —— 继续让用户看到「max_tokens」只会把他引到重发/换号上（issue #9）。
+        if (prepared.promptTokens > 0) {
+          const learned = learnContextWindow(prepared.model, prepared.promptTokens)
+          logger?.warn(
+            `dsh-codearts: ${prepared.model} 在 max_tokens 地板仍被判参数非法，按本次 prompt 估算 ${prepared.promptTokens} tokens 学习窗口上界 ${learned}`,
+          )
+        }
+        const estimate = prepared.promptTokens > 0 ? `本次 prompt 估算约 ${prepared.promptTokens} tokens，` : ''
+        return {
+          prepared,
+          result: {
+            ok: false,
+            kind: 'client',
+            status: 400,
+            message: `${prepared.model}: 上下文放不下 —— ${estimate}max_tokens 已降到 ${MAX_TOKENS_FLOOR} 仍被上游判参数非法。请压缩上下文（/compact）或新建会话；如果目录里的窗口值不准，可在设置里覆盖该模型的 contextWindow。`,
+          },
+        }
       }
       logger?.warn(`dsh-codearts: ${prepared.model} 被判参数非法，max_tokens 降档到 ${maxTokensCeilingFor(prepared.model)} 后重发`)
     }

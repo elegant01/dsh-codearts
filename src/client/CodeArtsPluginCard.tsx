@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { Button, Checkbox, Input, SegmentedTabs, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SegmentedTab, StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
@@ -38,6 +38,10 @@ interface ModelChoice {
   error?: string
   /** 上游返回的上下文窗口；undefined 表示没返回（后端那个 32768 是兜底值，不能当真）。 */
   contextWindow?: number
+  /** 上游标称窗口（被覆盖/学习压低之前的原值）：输入框清空后要回到这里。 */
+  contextWindowDiscovered?: number
+  /** 用户给这个模型设的窗口覆盖值；undefined = 跟随上游。 */
+  contextWindowOverride?: number
   /** 上游返回的最大输出 token。 */
   maxTokens?: number
 }
@@ -178,6 +182,29 @@ function formatWindow(tokens: number | undefined): string {
   if (tokens >= 1_048_576) return `${Math.round(tokens / 1_048_576)}M`
   if (tokens >= 1_024) return `${Math.round(tokens / 1_024)}K`
   return String(tokens)
+}
+
+/**
+ * 窗口滑块的刻度。
+ *
+ * 不按 token 线性拖动：8K 到 2M 线性铺开的话，前 90% 的行程都在 100K 以下，最该调
+ * 的那一段（目录标称 1M、实际只有 49 万）反而只有几像素。刻度按「人眼能分辨的档」摆，
+ * 输入框仍然可以填任意值。
+ */
+const WINDOW_STOPS = [
+  8_192, 16_384, 32_768, 65_536, 131_072, 196_608, 262_144, 393_216,
+  491_520, 524_288, 774_000, 1_048_576, 1_572_864, 2_097_152,
+] as const
+
+/** 当前值落在哪个刻度上（不在刻度里就取最近的）。 */
+function windowStopIndex(tokens: number | undefined): number {
+  const fallback = WINDOW_STOPS.indexOf(1_048_576)
+  if (tokens === undefined || !Number.isFinite(tokens) || tokens <= 0) return fallback
+  let best = 0
+  for (let i = 1; i < WINDOW_STOPS.length; i += 1) {
+    if (Math.abs(WINDOW_STOPS[i] - tokens) < Math.abs(WINDOW_STOPS[best] - tokens)) best = i
+  }
+  return best
 }
 
 /** 体检里一条检查的标题。账号级检查按 id 找回备注名，别让用户对着哈希猜。 */
@@ -947,6 +974,15 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [savingModels, setSavingModels] = useState(false)
   const [savedModels, setSavedModels] = useState(false)
   const [modelError, setModelError] = useState<string | null>(null)
+  /** 正在编辑的窗口值（拖动/输入过程中不提交，松手或失焦才写后端）。 */
+  const [windowDrafts, setWindowDrafts] = useState<Record<string, string>>({})
+  /** 正在保存窗口的模型 id。 */
+  const [windowSaving, setWindowSaving] = useState<string | null>(null)
+  const [windowError, setWindowError] = useState<string | null>(null)
+  /** 弹层展开的模型 id（同一时间只开一个，行内只留一个按钮）。 */
+  const [windowOpenFor, setWindowOpenFor] = useState<string | null>(null)
+  /** 正在提交窗口值的模型 id（state 更新有延迟，去重用 ref）。 */
+  const windowCommitInFlight = useRef<Set<string>>(new Set())
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
   /** 正在实测的模型 id；同一时间只测一个，避免把上游并发槽位占满。 */
@@ -1192,6 +1228,29 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     if (status?.status === 'signed-in') void refreshSelection()
   }, [status?.status])
 
+  // 窗口弹层：点别处、按 Esc 收起。用 closest 查锚点，避免给每一行挂 ref。
+  // 用 click 而不是 mousedown —— 先让浏览器把焦点挪走再收起，输入框里的草稿不会丢。
+  useEffect(() => {
+    if (windowOpenFor === null) return
+    function onPointerDown(event: MouseEvent): void {
+      const target = event.target
+      if (target instanceof Element && target.closest('[data-window-anchor]') !== null) return
+      closeWindow()
+    }
+    function onKeyDown(event: KeyboardEvent): void {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        closeWindow()
+      }
+    }
+    document.addEventListener('click', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('click', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [windowOpenFor, windowDrafts, selection])
+
   async function saveToken(e: React.FormEvent): Promise<void> {
     e.preventDefault()
     setBusy(true)
@@ -1314,6 +1373,94 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     } finally {
       setSavingModels(false)
     }
+  }
+
+  /** 输入框里该显示的窗口值：编辑中优先显示草稿，否则显示服务端生效值。 */
+  function windowValueText(choice: ModelChoice): string {
+    const draft = windowDrafts[choice.id]
+    if (draft !== undefined) return draft
+    const value = choice.contextWindowOverride ?? choice.contextWindow
+    return value === undefined ? '' : String(value)
+  }
+
+  function windowNumberValue(choice: ModelChoice): number | undefined {
+    const parsed = Number(windowValueText(choice))
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+  }
+
+  function setWindowDraft(id: string, value: string): void {
+    setWindowDrafts(current => ({ ...current, [id]: value }))
+  }
+
+  function clearWindowDraft(id: string): void {
+    setWindowDrafts(current => {
+      if (!(id in current)) return current
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+  }
+
+  /**
+   * 提交一个模型的窗口值（滑块松手、回车、收起弹层都走这里）。
+   *
+   * 空值 / 非法值 / 填回上游标称值 = 删除覆盖。这样不需要额外的「重置」按钮 ——
+   * 清空就是重置，和 Qoder 那种「跟随默认」是一个意思，只是少一次点击。
+   */
+  async function commitWindow(choice: ModelChoice, raw: string): Promise<void> {
+    // 同一次改动可能被「滑块松手」和「收起弹层」两条路径先后触发，别重复打后端。
+    if (windowCommitInFlight.current.has(choice.id)) return
+    const base = choice.contextWindowDiscovered ?? choice.contextWindow
+    const text = raw.trim()
+    let target: number | null = null
+    if (text !== '') {
+      const parsed = Math.floor(Number(text))
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        clearWindowDraft(choice.id)
+        return
+      }
+      target = base !== undefined && parsed === base ? null : parsed
+    }
+    const before = choice.contextWindowOverride ?? null
+    if (target === before) {
+      clearWindowDraft(choice.id)
+      return
+    }
+    windowCommitInFlight.current.add(choice.id)
+    setWindowSaving(choice.id)
+    setWindowError(null)
+    try {
+      const res = await fetch('/api/codearts/context-window', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ id: choice.id, window: target }),
+      })
+      const data = (await res.json().catch(() => null)) as (ModelSelectionDoc & { error?: string }) | null
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+      if (data !== null && data.selection !== undefined) setSelection(data.selection)
+    } catch (err) {
+      setWindowError(err instanceof Error ? err.message : String(err))
+    } finally {
+      // 无论成败都丢草稿：失败要退回服务端值，成功则服务端值已经是新的。
+      clearWindowDraft(choice.id)
+      windowCommitInFlight.current.delete(choice.id)
+      setWindowSaving(null)
+    }
+  }
+
+  /**
+   * 收起弹层；输入框里还有没提交的草稿就先提交。
+   *
+   * 不靠输入框 onBlur 提交：点外面收起时输入框会被卸载，blur 未必来得及触发，
+   * 用户刚敲的数字就白丢了。收起是唯一的「提交时机」，逻辑放一处就不会漏。
+   */
+  function closeWindow(): void {
+    const id = windowOpenFor
+    setWindowOpenFor(null)
+    if (id === null) return
+    const draft = windowDrafts[id]
+    const choice = (selection?.choices ?? []).find(entry => entry.id === id)
+    if (draft !== undefined && choice !== undefined) void commitWindow(choice, draft)
   }
 
   /**
@@ -1783,17 +1930,82 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                             确实返回值；builtin 来源没有，后端会兜底成 32768 并置
                             contextWindow=undefined，这里就显示「—」而不是假的 32K。
                           */}
-                          <span
-                            className={styles.modelSpec}
-                            title={t('modelSpecTitle', {
-                              context: choice.contextWindow === undefined ? '?' : formatCount(choice.contextWindow),
-                              output: choice.maxTokens === undefined ? '?' : formatCount(choice.maxTokens),
-                            })}
-                          >
-                            {t('modelSpec', {
-                              context: formatWindow(choice.contextWindow),
-                              output: formatWindow(choice.maxTokens),
-                            })}
+                          {/*
+                            行内只放一枚按钮（issue #9）：点开才弹出滑块 + 输入框，不占行宽。
+                            清空或填回上游标称值 = 回到跟随上游。
+                          */}
+                          <span className={styles.windowAnchor} data-window-anchor>
+                            <button
+                              type="button"
+                              className={[
+                                styles.windowButton,
+                                windowOpenFor === choice.id ? styles.windowButtonOpen : '',
+                                choice.contextWindowOverride === undefined ? '' : styles.windowButtonSet,
+                              ].filter(Boolean).join(' ')}
+                              aria-expanded={windowOpenFor === choice.id}
+                              aria-label={t('modelWindowLabel', { model: modelName(choice) })}
+                              title={t('modelWindowTitle', {
+                                model: modelName(choice),
+                                value: formatWindow(choice.contextWindowDiscovered ?? choice.contextWindow),
+                              })}
+                              onClick={() => setWindowOpenFor(current => (current === choice.id ? null : choice.id))}
+                            >
+                              {t('modelSpec', {
+                                context: formatWindow(windowNumberValue(choice)),
+                                output: formatWindow(choice.maxTokens),
+                              })}
+                              <span className={styles.windowCaret} aria-hidden="true">▾</span>
+                            </button>
+                            {windowOpenFor === choice.id && (
+                              <div className={styles.windowPopover} role="dialog" aria-label={t('modelWindowLabel', { model: modelName(choice) })}>
+                                <div className={styles.windowPopoverHead}>
+                                  <span>{t('modelWindowHeading')}</span>
+                                  <span className={styles.windowPopoverValue}>{windowValueText(choice) || '—'}</span>
+                                </div>
+                                <input
+                                  type="range"
+                                  className={styles.windowRange}
+                                  min={0}
+                                  max={WINDOW_STOPS.length - 1}
+                                  step={1}
+                                  value={windowStopIndex(windowNumberValue(choice))}
+                                  aria-label={t('modelWindowLabel', { model: modelName(choice) })}
+                                  disabled={!selection.writable || windowSaving === choice.id}
+                                  onChange={e => setWindowDraft(choice.id, String(WINDOW_STOPS[Number(e.target.value)] ?? ''))}
+                                  onPointerUp={e => void commitWindow(choice, String(WINDOW_STOPS[Number(e.currentTarget.value)] ?? ''))}
+                                  onKeyUp={e => void commitWindow(choice, String(WINDOW_STOPS[Number(e.currentTarget.value)] ?? ''))}
+                                />
+                                <div className={styles.windowPopoverRow}>
+                                  <input
+                                    type="number"
+                                    className={
+                                      choice.contextWindowOverride === undefined
+                                        ? styles.windowInput
+                                        : `${styles.windowInput} ${styles.windowInputSet}`
+                                    }
+                                    value={windowValueText(choice)}
+                                    min={1}
+                                    step={1024}
+                                    inputMode="numeric"
+                                    autoFocus
+                                    placeholder={t('modelWindowFollow')}
+                                    aria-label={t('modelWindowLabel', { model: modelName(choice) })}
+                                    disabled={!selection.writable || windowSaving === choice.id}
+                                    onChange={e => setWindowDraft(choice.id, e.target.value)}
+                                    onKeyDown={e => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault()
+                                        closeWindow()
+                                      }
+                                    }}
+                                  />
+                                  <span className={styles.windowUnit}>tokens</span>
+                                </div>
+                                <p className={styles.windowHint}>
+                                  {t('modelWindowHint', { value: formatWindow(choice.contextWindowDiscovered ?? choice.contextWindow) })}
+                                </p>
+                              </div>
+                            )}
                           </span>
                           {choice.benefit === true && (
                             <Tag tone={choice.blocked === true ? 'warning' : 'success'}>
@@ -1846,6 +2058,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     </div>
                   )}
                   {modelError !== null && <p className={styles.error}>{modelError}</p>}
+                  {windowError !== null && <p className={styles.error}>{windowError}</p>}
                 </div>
               ) : (
                 <p className={styles.hint}>{t('modelsLoading')}</p>

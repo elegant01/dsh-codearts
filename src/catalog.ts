@@ -35,6 +35,13 @@ export interface CodeArtsModelInfo {
    * 卡片只在上游给值时印「1M 上下文」这类规格；兜底值印出来就是假数据。
    */
   contextWindowKnown?: boolean
+  /**
+   * 上游标称的窗口（用户覆盖、实测学习之前的原值）。
+   *
+   * `contextWindow` 是**生效值**：用户按模型覆盖（issue #9）或进程内学到的上界都会
+   * 把它压低。卡片要把窗口改回「跟随上游」时需要这个原值，所以只在两者不等时才带出来。
+   */
+  contextWindowDiscovered?: number
   maxTokens: number
   supportsImages: boolean
   /**

@@ -116,6 +116,14 @@ export const CODEARTS_SETTINGS_NS = 'codearts' as SettingsNamespace
 export interface Config {
   /** Allowlist of CodeArts model ids offered in the model pickers. */
   enabledModels?: string[]
+  /**
+   * 按模型 id 强制覆盖 `contextWindow`（id 大小写不敏感，值 = tokens）。
+   *
+   * 动态发现给的是上游/网关的标称值，免费档的真实窗口可能远小于它、还会漂
+   * （issue #9：deepseek-v4.1-flash-1017 标称 1M、实测 ≈49 万）。覆盖值压过发现值；
+   * 进程内按实测学到的上界仍会在此基础上继续往下钳。
+   */
+  contextWindowOverrides?: Record<string, number>
   /** 对话输入框下方那行「积分 N」是否显示。缺省 = 显示（老配置不改行为）。 */
   showCreditDock?: boolean
   /** 等上游开流时那行「排队第 N 位」是否显示。缺省 = 显示。 */
@@ -180,6 +188,7 @@ function unwrapConfig(value: unknown): Config {
 
 export const Config: z<Config> = z.object({
   enabledModels: z.array(z.string()).description('Model ids offered in the model pickers (empty means every model)').volatile(),
+  contextWindowOverrides: z.dict(z.natural()).description('Per-model contextWindow overrides (model id → tokens). Discovery reports the nominal server window, which the free tier may not actually serve (issue #9); an override wins over it, and the in-process learned upper bound still clamps it.').volatile(),
   showCreditDock: z.boolean().default(true).description('Show the remaining-credits line under the chat input box').volatile(),
   showQueueDock: z.boolean().default(true).description('Show the upstream queue position under the chat input box').volatile(),
   showSidebarPanel: z.boolean().default(false).description('Show a CodeArts icon in the DSH sidebar icon column, opening this page in the middle column').volatile(),
@@ -277,6 +286,35 @@ export function apply(ctx: Context, rawConfig: Config): void {
     const settings = ctx.get('settings')
     if (settings === undefined) return false
     await settings.update(settingsCompatNamespace(ctx), { enabledModels: [...ids] })
+    return true
+  }
+
+  /**
+   * 写/清某个模型的窗口覆盖（issue #9）。
+   *
+   * 除了落 settings，还**当场**把目录里那条改成新值：卡片保存后会立刻重拉 selection，
+   * 目录不跟着变的话输入框会弹回旧数字，用户会以为没存上。
+   * `window: null` = 删除覆盖，生效值退回上游标称值（`contextWindowDiscovered`）。
+   */
+  const setContextWindowOverride = async (id: string, window: number | null): Promise<boolean> => {
+    const settings = ctx.get('settings')
+    if (settings === undefined) return false
+    const lower = id.trim().toLowerCase()
+    const next: Record<string, number> = {}
+    for (const [key, value] of Object.entries(current().contextWindowOverrides ?? {})) {
+      // id 大小写不敏感：上游注册名是大小写混排的，用户不会照着抄。
+      if (key.trim().toLowerCase() !== lower) next[key] = value
+    }
+    if (window !== null) next[id.trim()] = window
+    await settings.update(settingsCompatNamespace(ctx), { contextWindowOverrides: next })
+    catalog.set(catalog.current().map(model => {
+      if (model.id.toLowerCase() !== lower) return model
+      const target = window ?? model.contextWindowDiscovered ?? model.contextWindow
+      const { contextWindowDiscovered, ...rest } = model
+      return contextWindowDiscovered === undefined || contextWindowDiscovered === target
+        ? { ...rest, contextWindow: target }
+        : { ...rest, contextWindow: target, contextWindowDiscovered }
+    }))
     return true
   }
 
@@ -514,6 +552,9 @@ export function apply(ctx: Context, rawConfig: Config): void {
     models: () => catalog.current(),
     enabledModels,
     setEnabledModels,
+    // 卡片模型列表里那个窗口输入框/滑块（issue #9）：读当前覆盖值 + 写入。
+    contextWindowOverrides: () => current().contextWindowOverrides,
+    setContextWindowOverride,
     pool: () => pool.list(),
     // 重新登录/贴新 token 成功后，把这个号从禁用里捞出来（disabled 不清的话登录也救不回来）。
     reviveAccount: id => pool.revive(id),
@@ -550,7 +591,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
       return outcome
     },
     refreshModels: async () => {
-      const outcome = await refreshCatalog(store, catalog, AbortSignal.timeout(MANUAL_REFRESH_MS))
+      const outcome = await refreshCatalog(store, catalog, AbortSignal.timeout(MANUAL_REFRESH_MS), current().contextWindowOverrides)
       const models = catalog.current()
       return {
         models: models.length,
@@ -600,7 +641,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
   const discover = async (): Promise<void> => {
     if (stopped) return
     try {
-      const outcome = await refreshCatalog(store, catalog, abort.signal)
+      const outcome = await refreshCatalog(store, catalog, abort.signal, current().contextWindowOverrides)
       if (outcome === undefined || stopped) return
       if (outcome.anySucceeded) {
         const free = outcome.models.filter(model => model.benefit === true).length
@@ -780,7 +821,17 @@ export function apply(ctx: Context, rawConfig: Config): void {
       }
     }
     : undefined
-  const shim = createCodeArtsShim({ store, catalog, pool, usage, queue, logger: ctx.logger, debug: writeDebugLog })
+  const shim = createCodeArtsShim({
+    store,
+    catalog,
+    pool,
+    usage,
+    queue,
+    logger: ctx.logger,
+    debug: writeDebugLog,
+    // 每次请求实时读：用户在设置里改了覆盖值，不必等下一轮模型发现就生效。
+    contextWindowOverrides: () => current().contextWindowOverrides,
+  })
 
   // 账本懒加载：读盘失败/文件不存在都不影响插件启动。
   void usage.load().catch(() => {})

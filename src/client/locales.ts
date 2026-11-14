@@ -97,6 +97,12 @@ export interface CodeArtsSettingsKey {
   /** 行内的上下文窗口 / 最大输出（`1M · 64K`）。 */
   modelSpec: string
   modelSpecTitle: string
+  /** 模型行里的窗口按钮与弹层（issue #9）。 */
+  modelWindowLabel: string
+  modelWindowTitle: string
+  modelWindowHeading: string
+  modelWindowFollow: string
+  modelWindowHint: string
   /** 账号暂停/置顶。 */
   accountPaused: string
   accountPinned: string
@@ -320,6 +326,11 @@ export const zh: CodeArtsSettingsKey = {
   usageStatLatencyEmpty: '还没有成功请求',
   modelSpec: '{context} 上下文 · {output} 输出',
   modelSpecTitle: '上游返回的上下文窗口 {context} token，最大输出 {output} token',
+  modelWindowLabel: '设置 {model} 的上下文窗口',
+  modelWindowTitle: '上下文窗口：上游标称 {value} token。点击可拖动滑块或直接输入',
+  modelWindowHeading: '上下文窗口',
+  modelWindowFollow: '跟随上游',
+  modelWindowHint: '上游标称 {value}。拖动或输入后立即生效；清空或填回标称值 = 跟随上游',
   accountPaused: '已暂停',
   accountPinned: '已置顶',
   accountEnabled: '启用',
@@ -528,6 +539,11 @@ export const en: CodeArtsSettingsKey = {
   usageStatLatencyEmpty: 'No successful request yet',
   modelSpec: '{context} ctx · {output} out',
   modelSpecTitle: 'Context window {context} tokens, max output {output} tokens reported upstream',
+  modelWindowLabel: 'Set the context window for {model}',
+  modelWindowTitle: 'Context window: upstream reports {value} tokens. Click to drag the slider or type a value',
+  modelWindowHeading: 'Context window',
+  modelWindowFollow: 'Follow upstream',
+  modelWindowHint: 'Upstream reports {value}. Changes apply immediately; clear the field or type the upstream value to follow it',
   accountPaused: 'Paused',
   accountPinned: 'Pinned',
   accountEnabled: 'Enabled',

@@ -2,7 +2,7 @@ import { request as httpRequest } from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createCodeArtsShim, type CodeArtsShim } from '../src/shim.ts'
 import { clearBenefitBlocked, isBenefitBlocked } from '../src/catalog.ts'
-import { resetTokenCeilings } from '../src/upstream.ts'
+import { learnContextWindow, learnedContextWindowFor, resetLearnedContextWindows, resetTokenCeilings } from '../src/upstream.ts'
 
 /**
  * End-to-end over the real HTTP surface: a stubbed upstream emits CodeArts SSE,
@@ -104,6 +104,7 @@ type Responder = readonly string[] | ((body: string) => readonly string[])
 async function startShim(
   chunks: Responder,
   catalogModels: readonly { id: string; contextWindow: number; maxTokens: number }[] = [],
+  contextWindowOverrides?: Record<string, number>,
 ): Promise<void> {
   vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { body?: unknown }) => {
     // 出网只传「字符串 URL + 普通 init」（见 upstream.ts 的 dispatch），请求体在 init.body。
@@ -119,6 +120,7 @@ async function startShim(
       resolve: async () => ({ token: 'sts', accessKeyId: 'AK', secretAccessKey: 'SK', securityToken: 'sts' }),
     } as never,
     catalog: { current: () => catalogModels } as never,
+    contextWindowOverrides: () => contextWindowOverrides,
   })
   await shim.ready
   port = Number(new URL(shim.baseUrl()).port)
@@ -129,8 +131,9 @@ const ASK = { model: 'GLM-5.2', messages: [{ role: 'user', content: 'hi' }], str
 
 beforeEach(() => {
   vi.restoreAllMocks()
-  // 降档记忆是进程内的，不重置的话上一个用例学到的低上限会串到下一个用例里。
+  // 降档/窗口记忆都是进程内的，不重置的话上一个用例学到的低上限会串到下一个用例里。
   resetTokenCeilings()
+  resetLearnedContextWindows()
 })
 
 afterEach(async () => {
@@ -341,5 +344,66 @@ describe('max_tokens 上限降档自愈', () => {
     expect(res.status).toBe(400)
     expect(res.text).toContain('上下文放不下')
     expect(res.text).toContain('4000')
+  })
+})
+
+// issue #9：目录标称 1M、免费档实际装不下。
+//  1) max_tokens 一档档降到地板仍被拒 ⇒ 必须说「上下文放不下」，而不是继续提 max_tokens；
+//  2) 同一模型下一次请求要在本地就拦下，不再白打上游；
+//  3) 用户在设置里的覆盖值要即时生效，不用等下一轮模型发现。
+describe('装不下时学到真实窗口并指向上下文', () => {
+  const PARAM_INVALID = 'data: {"error_code":"InferHub.001001005.400","error_msg":"The request param is invalid, Please check it"}\n\n'
+  const BIG = 'x'.repeat(400_000) // 非 CJK，估算 ≈ 10 万 tokens
+  const ASK_BIG = { model: 'GLM-5.2', messages: [{ role: 'user', content: BIG }], stream: true, max_tokens: 65_536 }
+
+  it('max_tokens 到地板仍被拒：报错指向上下文，并学到上界', async () => {
+    const sent: number[] = []
+    await startShim(
+      body => {
+        sent.push((JSON.parse(body) as { max_tokens?: number }).max_tokens ?? 0)
+        return [PARAM_INVALID]
+      },
+      [{ id: 'GLM-5.2', contextWindow: 1_048_576, maxTokens: 65_536 }],
+    )
+    const res = await postSse(port, bearer, ASK_BIG)
+    expect(sent).toEqual([65_536, 32_768, 16_384, 8_192])
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('上下文放不下')
+    expect(res.text).not.toContain('max_tokens 已降到下限')
+    const learned = learnedContextWindowFor('GLM-5.2')
+    expect(learned).toBeGreaterThan(90_000)
+    expect(learned).toBeLessThan(120_000)
+  })
+
+  it('学过之后再发同样大小的请求，本地直接拦下、不打上游', async () => {
+    let upstreamCalls = 0
+    await startShim(
+      () => {
+        upstreamCalls += 1
+        return [PARAM_INVALID]
+      },
+      [{ id: 'GLM-5.2', contextWindow: 1_048_576, maxTokens: 65_536 }],
+    )
+    learnContextWindow('GLM-5.2', 100_000)
+    const res = await postSse(port, bearer, ASK_BIG)
+    expect(upstreamCalls).toBe(0)
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('上下文放不下')
+  })
+
+  it('用户覆盖值在下一句话立刻生效，一次上游都不打', async () => {
+    let upstreamCalls = 0
+    await startShim(
+      () => {
+        upstreamCalls += 1
+        return [PARAM_INVALID]
+      },
+      [{ id: 'GLM-5.2', contextWindow: 1_048_576, maxTokens: 65_536 }],
+      { 'glm-5.2': 20_000 },
+    )
+    const res = await postSse(port, bearer, ASK_BIG)
+    expect(upstreamCalls).toBe(0)
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('20000')
   })
 })

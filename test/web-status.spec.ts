@@ -45,9 +45,11 @@ import {
 import {
   CODEARTS_ACCOUNTS_PATH,
   CODEARTS_CLAIM_PATH,
+  CODEARTS_CONTEXT_WINDOW_PATH,
   CODEARTS_DOCTOR_PATH,
   CODEARTS_LOGIN_PATH,
   CODEARTS_LOGIN_STATUS_PATH,
+  CODEARTS_MODELS_SELECTION_PATH,
   CODEARTS_QUEUE_PATH,
   CODEARTS_REFRESH_MODELS_PATH,
   CODEARTS_STATUS_PATH,
@@ -1102,5 +1104,111 @@ describe('POST /api/codearts/test-model', () => {
   it('rejects a model that is not in the current catalog', async () => {
     const res = await call(testHandler(), POST, CODEARTS_TEST_MODEL_PATH, { 'content-type': 'application/json' }, JSON.stringify({ id: 'not-a-model' }))
     expect(res.status).toBe(404)
+  })
+})
+
+/**
+ * 窗口覆盖（issue #9）：目录标称 1M、免费档实际装不下时，用户要在模型行里自己调。
+ *
+ * 这里只测路由契约：卡片拿到什么、写进去什么、非法输入怎么拒。真正把值用起来的是
+ * shim 的守卫（见 e2e-stream.spec.ts）。
+ */
+describe('context window override route', () => {
+  const model = {
+    id: 'GLM-5.2',
+    name: 'GLM-5.2',
+    // 生效值：已经被用户覆盖过。
+    contextWindow: 491_520,
+    // 上游标称值：卡片据此判断「清空后应该回到哪」。
+    contextWindowDiscovered: 1_048_576,
+    contextWindowKnown: true,
+    maxTokens: 65_536,
+    supportsImages: true,
+  }
+
+  function mount(sub: {
+    overrides?: Record<string, number>
+    set?: (id: string, window: number | null) => Promise<boolean>
+  } = {}) {
+    const set = vi.fn(sub.set ?? (async () => true))
+    return {
+      local: mountRoutes({
+        store,
+        models: () => [model] as never,
+        enabledModels: () => undefined,
+        contextWindowOverrides: () => sub.overrides,
+        ...(sub.set === undefined ? {} : { setContextWindowOverride: set }),
+      }),
+      set,
+    }
+  }
+
+  type Choice = { id: string; contextWindow?: number; contextWindowDiscovered?: number; contextWindowOverride?: number }
+  const choicesOf = (body: Record<string, unknown> | undefined): Choice[] =>
+    (body?.selection as { choices: Choice[] } | undefined)?.choices ?? []
+
+  it('tells the card both the effective window and the upstream value', async () => {
+    const { local } = mount({ overrides: { 'glm-5.2': 491_520 } })
+    const res = await call(local.get(CODEARTS_MODELS_SELECTION_PATH)!, GET, CODEARTS_MODELS_SELECTION_PATH)
+    const choice = choicesOf(res.body)[0]
+    expect(choice?.contextWindow).toBe(491_520)
+    expect(choice?.contextWindowDiscovered).toBe(1_048_576)
+    // 大小写不敏感：上游注册名是混排的，用户不会照着抄。
+    expect(choice?.contextWindowOverride).toBe(491_520)
+  })
+
+  it('writes a window and answers with the refreshed selection', async () => {
+    const { local, set } = mount({ set: async () => true })
+    const res = await call(
+      local.get(CODEARTS_CONTEXT_WINDOW_PATH)!,
+      POST,
+      CODEARTS_CONTEXT_WINDOW_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'GLM-5.2', window: 774_000 }),
+    )
+    expect(res.status).toBe(200)
+    expect(set).toHaveBeenCalledWith('GLM-5.2', 774_000)
+    expect(choicesOf(res.body)[0]?.id).toBe('GLM-5.2')
+  })
+
+  it('clears the override when window is null', async () => {
+    const { local, set } = mount({ set: async () => true })
+    const res = await call(
+      local.get(CODEARTS_CONTEXT_WINDOW_PATH)!,
+      POST,
+      CODEARTS_CONTEXT_WINDOW_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'GLM-5.2', window: null }),
+    )
+    expect(res.status).toBe(200)
+    expect(set).toHaveBeenCalledWith('GLM-5.2', null)
+  })
+
+  it('rejects a non-positive or non-finite window instead of writing junk', async () => {
+    const { local, set } = mount({ set: async () => true })
+    for (const window of [0, -1, 'abc', null]) {
+      if (window === null) continue
+      const res = await call(
+        local.get(CODEARTS_CONTEXT_WINDOW_PATH)!,
+        POST,
+        CODEARTS_CONTEXT_WINDOW_PATH,
+        { 'content-type': 'application/json' },
+        JSON.stringify({ id: 'GLM-5.2', window }),
+      )
+      expect(res.status).toBe(400)
+    }
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('is read-only when the host has no settings provider', async () => {
+    const local = mountRoutes({ store, models: () => [model] as never })
+    const res = await call(
+      local.get(CODEARTS_CONTEXT_WINDOW_PATH)!,
+      POST,
+      CODEARTS_CONTEXT_WINDOW_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'GLM-5.2', window: 1000 }),
+    )
+    expect(res.status).toBe(403)
   })
 })

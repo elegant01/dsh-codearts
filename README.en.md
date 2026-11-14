@@ -134,8 +134,14 @@ other local processes cannot impersonate it.
   393216, while the chat endpoint rejects anything above 65536 with
   `InferHub.001001005.400`. Requests are clamped to the **measured** ceiling per model
   (65536 for the free DeepSeek family, 131072 for GLM-5.2, which was measured); models
-  without a measurement fall back to the conservative 65536. Context length uses the
-  discovered value, which only affects DSH’s context meter and truncation margin.
+  without a measurement fall back to the conservative 65536.
+- **Context window** starts from the discovered value, but the free tier’s real window can be
+  far smaller than advertised and it drifts (issue #9). When long sessions always fail, correct
+  it per model with `contextWindowOverrides`, e.g.
+  `{ "deepseek-v4.1-flash-1017": 491520, "glm-5.3-flash": 774000 }`. Separately, when
+  `max_tokens` is already at the 8192 floor and upstream still rejects the request, the plugin
+  records this request’s prompt estimate as that model’s upper bound (in-process, tighten-only),
+  so the next round is blocked locally with a `/compact` or new-session hint.
 - The usage ledger counts only requests **this machine sent through the plugin**, so its
   numbers are not an account total; the card links to the official page. The ledger keeps
   60 days and is lost when you move machines or clear `$DSH_HOME`.
