@@ -1751,14 +1751,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 <div className={styles.accountToolbar}>
                   <Button
                     variant="outline"
-                    size="sm"
+                    size="md"
                     aria-expanded={manualOpen}
                     disabled={busy}
                     onClick={() => setManualOpen(open => !open)}
                   >
                     {t('pasteTokenAdd')}
                   </Button>
-                  <Button variant="primary" size="sm" disabled={busy || loginPending} onClick={() => void startOAuthLogin()}>
+                  <Button variant="primary" size="md" disabled={busy || loginPending} onClick={() => void startOAuthLogin()}>
                     {loginPending ? t('signingIn') : t('addAccount')}
                   </Button>
                 </div>

@@ -1157,6 +1157,23 @@ describe('context window override route', () => {
     expect(choice?.contextWindowOverride).toBe(491_520)
   })
 
+  // issue #9 的遗留项：兜底值可以参与守卫，但绝不能下发给卡片当「上游规格」。
+  it('omits a window the catalog could not vouch for', async () => {
+    const local = mountRoutes({
+      store,
+      models: () => [{
+        id: 'Qwen3-VL-235B',
+        name: 'Qwen3-VL-235B',
+        // 参数表补出来的 128K：守卫用它，卡片不该印。
+        contextWindow: 128_000,
+        maxTokens: 8_000,
+        supportsImages: true,
+      }] as never,
+    })
+    const res = await call(local.get(CODEARTS_MODELS_SELECTION_PATH)!, GET, CODEARTS_MODELS_SELECTION_PATH)
+    expect(choicesOf(res.body)[0]?.contextWindow).toBeUndefined()
+  })
+
   it('writes a window and answers with the refreshed selection', async () => {
     const { local, set } = mount({ set: async () => true })
     const res = await call(

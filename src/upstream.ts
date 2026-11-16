@@ -1180,10 +1180,14 @@ async function fetchBuiltinModels(
     const id = firstString(model.model_id, model.model_name)
     if (id === '') continue
     const ratio = creditRatioOf(model)
+    // 「上游真给了这个窗口」要在这里记下：后面 backfillParams 会把 0 补成参数表里的值，
+    // 那时就分不出是上游给的还是我们兜的（issue #9 的遗留项）。
+    const contextWindow = positive(model.context_window)
     out.push({
       id,
       name: firstString(model.model_name, id),
-      contextWindow: positive(model.context_window),
+      contextWindow,
+      ...(contextWindow > 0 ? { contextWindowKnown: true } : {}),
       maxTokens: positive(model.max_tokens),
       supportsImages: model.supports_images === true,
       ...(ratio === undefined ? {} : { ratio }),
@@ -1215,10 +1219,12 @@ async function fetchBenefitModels(
     if (id === '') continue
     // 福利模型的上游 credit 照样记下（展示层强制 x0.00），别把原始事实丢掉。
     const ratio = creditRatioOf(model)
+    const contextWindow = positive(model.context_window)
     out.push({
       id,
       name: firstString(model.model_name, id),
-      contextWindow: positive(model.context_window),
+      contextWindow,
+      ...(contextWindow > 0 ? { contextWindowKnown: true } : {}),
       maxTokens: positive(model.max_tokens),
       supportsImages: model.supports_images === true,
       ...(ratio === undefined ? {} : { ratio }),
@@ -1288,10 +1294,12 @@ async function fetchAgentModels(
     if (id === '') continue
     // 实测 credit 挂在条目顶层；params 里也试一把，免得上游换位置就整列消失。
     const ratio = creditRatioOf(model) ?? creditRatioOf(params)
+    const contextWindow = positive(params.context_window)
     out.push({
       id,
       name: firstString(model.model_name, model.model_alias, id),
-      contextWindow: positive(params.context_window),
+      contextWindow,
+      ...(contextWindow > 0 ? { contextWindowKnown: true } : {}),
       maxTokens: positive(params.max_tokens),
       supportsImages: model.supports_images === true,
       ...(ratio === undefined ? {} : { ratio }),
@@ -1524,18 +1532,22 @@ export async function fetchModels(
     const thinking = variants.get(model.id.toLowerCase())
     const override = contextWindowOverrideFor(contextWindowOverrides, model.id)
     const learned = learnedContextWindowFor(model.id)
-    // 用户显式覆盖优先于目录值；学习值是实测上界，只往下压。两者都没有时保持原样。
-    const discovered = model.contextWindow > 0 ? model.contextWindow : UNKNOWN_CONTEXT_WINDOW
+    // 上游真的给了窗口吗 —— 这个标记在解析阶段定下，`backfillParams` 补出来的值没有它。
+    const upstreamKnown = model.contextWindowKnown === true
+    // 守卫输入的基数：覆盖值 > 上游值 / 参数表值 > 实测上界 > 32768（宁可保守）。
+    const discovered = model.contextWindow > 0 ? model.contextWindow : learned ?? UNKNOWN_CONTEXT_WINDOW
     const base = override ?? discovered
     const contextWindow = learned === undefined ? base : Math.min(base, learned)
     return {
       ...model,
       ...(thinking === undefined ? {} : { thinking }),
-      // 覆盖值与学习值都是我们自己确认过的上界，可以当真实值展示。
-      contextWindowKnown: override !== undefined || learned !== undefined || model.contextWindow > 0,
+      // 展示信任：上游给过、用户覆盖过、或实测学到过，才算真值。参数表兜底值不算 ——
+      // 它可以参与守卫（保守拦截），但不能印成上游规格。
+      ...(override !== undefined || learned !== undefined || upstreamKnown ? { contextWindowKnown: true } : {}),
       contextWindow,
-      // 生效值和上游标称值不同时留一份原值：卡片把窗口「改回跟随默认」要靠它。
-      ...(contextWindow === discovered ? {} : { contextWindowDiscovered: discovered }),
+      // 生效值和「上游标称」不同时留一份原值：卡片把窗口「改回跟随上游」要靠它。
+      // 只在上游真的给过时才带，兜底值不是标称值。
+      ...(upstreamKnown && contextWindow !== model.contextWindow ? { contextWindowDiscovered: model.contextWindow } : {}),
       maxTokens: Math.min(
         model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS,
         maxTokensCeilingFor(model.id),

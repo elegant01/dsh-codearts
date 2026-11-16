@@ -132,6 +132,20 @@ describe('backfillParams', () => {
     // 表里有、上游没给：目录里就不该出现它（列表只反映上游现状，不做兜底）。
     expect(filled.map(m => m.id)).toEqual(['OpenPangu-2.0-Pro'])
   })
+
+  // issue #9 的遗留项：backfill 补出来的值不能冒充「上游真给的」。
+  it('keeps the upstream flag only on windows discovery actually provided', () => {
+    const kept = backfillParams(
+      [model('GLM-5.2', { contextWindow: 202_752, contextWindowKnown: true, maxTokens: 0 })],
+      params,
+    )
+    expect(kept[0]?.contextWindow).toBe(202_752)
+    expect(kept[0]?.contextWindowKnown).toBe(true)
+
+    const filled = backfillParams([model('OpenPangu-2.0-Pro', { contextWindow: 0, maxTokens: 0 })], params)
+    expect(filled[0]?.contextWindow).toBe(32_000)
+    expect(filled[0]?.contextWindowKnown).toBeUndefined()
+  })
 })
 
 describe('isBenefitModel', () => {
@@ -431,6 +445,12 @@ describe('fetchModels', () => {
     // GLM-5.2 的实测上限同样要钳住：上游 2026-10-10 起拒 131072。
     expect(byId.get('GLM-5.2')?.maxTokens).toBe(65_536)
     expect(byId.get('GLM-5.2')?.contextWindow).toBe(202_752)
+    // 上游真给过的窗口才可以当规格展示。
+    expect(byId.get('GLM-5.2')?.contextWindowKnown).toBe(true)
+    // issue #9 的遗留项：Qwen3-VL 只有内置来源、没带 context_window。守卫仍拿参数表的
+    // 128K 兜底（宁可保守），但这一列不能印成上游规格。
+    expect(byId.get('Qwen3-VL-235B')?.contextWindow).toBe(128_000)
+    expect(byId.get('Qwen3-VL-235B')?.contextWindowKnown).toBeUndefined()
     // 倍率取默认时段；内置 / agent 两路都给的模型合并后不能丢。
     expect(byId.get('GLM-5.2')?.ratio).toBe('0.7x')
     expect(byId.get('glm-5.2-sft-harmony')?.ratio).toBe('0.7x')
@@ -467,6 +487,25 @@ describe('fetchModels', () => {
     const glm = result.models.find(m => m.id === 'GLM-5.2')
     expect(glm?.contextWindow).toBe(100_000)
     expect(glm?.contextWindowKnown).toBe(true)
+    expect(glm?.contextWindowDiscovered).toBe(202_752)
+  })
+
+  // 覆盖值可以展示（是我们自己确认的），但「上游标称值」不能拿参数表的兜底数来顶。
+  it('does not present the fallback table value as the upstream nominal window', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/model/thinking-variants': () => json(THINKING_BODY),
+    })
+
+    const result = await fetchModels(credential, undefined, { 'qwen3-vl-235b': 100_000 })
+    const qwen = result.models.find(m => m.id === 'Qwen3-VL-235B')
+    expect(qwen?.contextWindow).toBe(100_000)
+    expect(qwen?.contextWindowKnown).toBe(true)
+    // 上游没给过窗口 -> 没有「标称值」可还原，卡片不该显示「跟随上游 128K」。
+    expect(qwen?.contextWindowDiscovered).toBeUndefined()
   })
 
   // 学到的上界来自实测（max_tokens 到地板仍被拒），它必须继续压在覆盖值/发现值之下，

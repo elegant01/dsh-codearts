@@ -30,9 +30,14 @@ export interface CodeArtsModelInfo {
   name: string
   contextWindow: number
   /**
-   * `contextWindow` 是上游真的给的，还是兜底值（32768）。
+   * 这个 `contextWindow` 能不能当「上游真实规格」展示。
    *
-   * 卡片只在上游给值时印「1M 上下文」这类规格；兜底值印出来就是假数据。
+   * 由各发现源在解析时置位（上游真给了字段、且 > 0），再一路带过合并与 `backfillParams`；
+   * 用户按模型覆盖、或进程内实测学到上界时，`fetchModels` 也会把它置位（那些值是我们
+   * 确认过的，可以展示）。
+   *
+   * 参数表补出来的值**永远不带**这个标记：`contextWindow` 同时是守卫输入，补一个保守值
+   * 让它保守拦截是对的；但把兜底值印成上游规格就是假数据（issue #9 的遗留项）。
    */
   contextWindowKnown?: boolean
   /**
@@ -378,10 +383,13 @@ export function backfillParams(
   for (const fallback of params) {
     const current = byId.get(fallback.id.toLowerCase())
     if (current === undefined) continue
+    // 上游给了窗口才保留它和它的信任标记；补参数表值时两者都不带。
+    const keptWindow = current.contextWindow > 0
     byId.set(fallback.id.toLowerCase(), {
       id: current.id,
       name: current.name || fallback.name,
-      contextWindow: current.contextWindow > 0 ? current.contextWindow : fallback.contextWindow,
+      contextWindow: keptWindow ? current.contextWindow : fallback.contextWindow,
+      ...(keptWindow && current.contextWindowKnown === true ? { contextWindowKnown: true } : {}),
       maxTokens: current.maxTokens > 0 ? current.maxTokens : fallback.maxTokens,
       supportsImages: current.supportsImages || fallback.supportsImages,
       // 倍率只来自发现：参数表里的占位条目没有 ratio，绝不能拿它当兜底。

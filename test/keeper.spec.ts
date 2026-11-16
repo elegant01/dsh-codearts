@@ -4,14 +4,21 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   KEEPER_STALE_MS,
+  bundledNodeExecutable,
+  clearKeeperHandoff,
+  isDshInstallerTempDir,
+  keeperHandoffPath,
+  keeperHandoffRecent,
   keeperLogPath,
   keeperStatePath,
+  nodeLauncher,
   pidAlive,
   keeperScriptPath,
   keeperStats,
   readKeeperState,
   spawnKeeper,
   stopKeeper,
+  writeKeeperHandoff,
   writeKeeperState,
   type CodeArtsKeeperState,
 } from '../src/keeper.ts'
@@ -125,5 +132,56 @@ describe('stopKeeper', () => {
     writeKeeperState(state({ pid: 0 }), home)
     await stopKeeper(home)
     expect(readKeeperState(home)).toBeUndefined()
+  })
+})
+
+describe('update installer handoff', () => {
+  // keeper 必须在更新安装器启动后让路，但也不能被"用户装别的软件"误伤 —— 两条判据
+  // 缺一不可：目录名像 NSIS 插件目录，且里面真有我们安装器的 window-frame.dll。
+  it('recognises only the DSH installer temp dir', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codearts-inst-'))
+    try {
+      const ours = join(root, 'nsA123.tmp')
+      await mkdir(ours)
+      await writeFile(join(ours, 'window-frame.dll'), '')
+      expect(isDshInstallerTempDir(ours)).toBe(true)
+
+      const noDll = join(root, 'nsB456.tmp')
+      await mkdir(noDll)
+      expect(isDshInstallerTempDir(noDll)).toBe(false)
+
+      const otherName = join(root, 'tempA123')
+      await mkdir(otherName)
+      await writeFile(join(otherName, 'window-frame.dll'), '')
+      expect(isDshInstallerTempDir(otherName)).toBe(false)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the switch from being turned off only while the marker is fresh', async () => {
+    expect(keeperHandoffRecent(home)).toBe(false)
+    expect(keeperHandoffPath(home)).toBe(join(home, '.codearts-keeper.handoff'))
+
+    writeKeeperHandoff('update installer detected', home)
+    expect(keeperHandoffRecent(home)).toBe(true)
+
+    await writeFile(keeperHandoffPath(home), JSON.stringify({ at: Date.now() - 16 * 60 * 1000, reason: 'x' }), 'utf8')
+    expect(keeperHandoffRecent(home)).toBe(false)
+  })
+
+  it('drops the marker so it cannot mask a later real death', () => {
+    writeKeeperHandoff('update installer detected', home)
+    clearKeeperHandoff(home)
+    expect(keeperHandoffRecent(home)).toBe(false)
+  })
+
+  // 主路：keeper 用宿主自带的 node.exe 跑，进程名不是 DeepSeek Harness.exe，
+  // 安装器就不会把它当成"应用还在跑"。拿不到 bundled node 时才退回宿主 exe。
+  it('prefers the bundled node over the host executable', () => {
+    const launcher = nodeLauncher()
+    expect(launcher.command.length).toBeGreaterThan(0)
+    const bundled = bundledNodeExecutable()
+    if (bundled !== undefined) expect(launcher.command).toBe(bundled)
   })
 })

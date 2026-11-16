@@ -12,9 +12,11 @@
  * ## 进程形态
  *
  * DSH Desktop 是 Electron，宿主 exe 可以直接当 Node 用：设置
- * `ELECTRON_RUN_AS_NODE=1` 后启动它就是 node 24.21.0（已实测）。所以不依赖用户
- * 装没装 node，也不引入任何原生依赖。启动后 `detached` + `unref` + `stdio:'ignore'`，
- * DSH 退出它不跟着退出（同样已实测）。
+ * `ELECTRON_RUN_AS_NODE=1` 后启动它就是 node 24.21.0（已实测）。但**优先用宿主自带的
+ * 真 node.exe**（`resources/runtime/<runtime>/dependencies/node/bin/node.exe`）—— 宿主 exe 的
+ * 进程名是 `DeepSeek Harness.exe`，会被更新安装器当成「应用还在跑」而挡住更新
+ * （见 `bundledNodeExecutable`）。两者都不依赖用户装没装 node，也不引入任何原生依赖。
+ * 启动后 `detached` + `unref` + `stdio:'ignore'`，DSH 退出它不跟着退出（同样已实测）。
  *
  * ## 谁有权续期（重要）
  *
@@ -33,9 +35,9 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /** 心跳超过这么久没更新，就认为守护进程已经不在（它每 30 秒写一次）。 */
@@ -144,19 +146,99 @@ export function keeperScriptPath(): string {
 }
 
 /**
+ * 宿主自带的 node（`resources/runtime/<runtime>/dependencies/node/bin/node.exe`）。
+ *
+ * 为什么不直接用 `process.execPath`：那是宿主 exe，keeper 的进程名就成了
+ * `DeepSeek Harness.exe`。DSH 的更新安装器会枚举同名进程判断「应用是否已关闭」，
+ * 看到 keeper 就认为应用还在跑 —— 更新在十秒左右中止，而且安装器不会把应用拉回来
+ * （2026-11-16 实测：装 0.2.2-rc.3 时两次都是被这个挡住的）。
+ *
+ * 运行时目录名会随版本变（`primary-runtime` / `dsh-primary-runtime`），所以按目录枚举，
+ * 不把某一版的名字写死。拿不到就返回 undefined，由调用方退回宿主 exe。
+ */
+export function bundledNodeExecutable(): string | undefined {
+  const name = process.platform === 'win32' ? 'node.exe' : 'node'
+  const roots: string[] = []
+  const resources = (process as { resourcesPath?: string }).resourcesPath
+  if (typeof resources === 'string' && resources !== '') roots.push(resources)
+  // Electron 里 process.execPath 是 <安装目录>/DeepSeek Harness.exe。
+  roots.push(join(dirname(process.execPath), 'resources'))
+  for (const root of roots) {
+    const runtime = join(root, 'runtime')
+    let runtimes: string[]
+    try {
+      runtimes = readdirSync(runtime)
+    } catch {
+      continue
+    }
+    for (const runtimeName of runtimes) {
+      const candidate = join(runtime, runtimeName, 'dependencies', 'node', 'bin', name)
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return undefined
+}
+
+/**
  * 拿 `ELECTRON_RUN_AS_NODE` 这条路启动 node 所需的 exe。
  *
  * 优先级：宿主自己给的 `DSH_DESKTOP_NODE_EXECUTABLE`（Desktop 注入，最准）→
- * `process.execPath`（Electron 自己或普通 node 都适用）→ PATH 里的 `node`。
+ * 宿主自带的 node.exe（见 `bundledNodeExecutable`，进程名不会撞 DSH）→
+ * `process.execPath`（Electron 自己或普通 node 都适用）。
  */
 export function nodeLauncher(): { command: string; env: NodeJS.ProcessEnv } {
   const desktop = process.env.DSH_DESKTOP_NODE_EXECUTABLE
   if (desktop !== undefined && desktop !== '' && existsSync(desktop)) {
     return { command: desktop, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } }
   }
+  const bundled = bundledNodeExecutable()
+  // 真 node 不需要 ELECTRON_RUN_AS_NODE；留着也无害，但不加更干净。
+  if (bundled !== undefined) return { command: bundled, env: { ...process.env } }
   // process.execPath 在 Electron 里是宿主 exe，配 ELECTRON_RUN_AS_NODE 就是 node；
   // 在普通 node 里本来就是 node，多这个环境变量也无害。
   return { command: process.execPath, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } }
+}
+
+/**
+ * 这是 DSH 更新安装器在 `%TEMP%` 里建的插件目录吗。
+ *
+ * 安装器（NSIS）一启动就把自己签名的 `window-frame.dll` 解到 `%TEMP%\ns*.tmp\`。
+ * 用「目录名 + 那个 dll」两条一起判，用户装别的软件留下同名目录也不会误伤。
+ */
+export function isDshInstallerTempDir(path: string): boolean {
+  if (!/^ns[\w.-]{2,}\.tmp$/i.test(basename(path))) return false
+  return existsSync(join(path, 'window-frame.dll'))
+}
+
+/** 「让路」标记：keeper 为更新安装器主动退出时写，插件据此不把开关关掉。 */
+export function keeperHandoffPath(home?: string): string {
+  return join(home ?? dshHome(), '.codearts-keeper.handoff')
+}
+
+export function writeKeeperHandoff(reason: string, home?: string): void {
+  try {
+    writeFileSync(keeperHandoffPath(home), JSON.stringify({ at: Date.now(), reason }), { mode: 0o600 })
+  } catch {
+    // 写不进去只会让开关在下一次巡检时被关掉，不影响让路本身。
+  }
+}
+
+/** 最近发生过一次「为更新让路」的退出吗（默认 15 分钟内）。 */
+export function keeperHandoffRecent(home?: string, maxAgeMs = 15 * 60 * 1000): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(keeperHandoffPath(home), 'utf8')) as { at?: unknown }
+    return typeof parsed.at === 'number' && Date.now() - parsed.at <= maxAgeMs
+  } catch {
+    return false
+  }
+}
+
+export function clearKeeperHandoff(home?: string): void {
+  try {
+    if (existsSync(keeperHandoffPath(home))) unlinkSync(keeperHandoffPath(home))
+  } catch {
+    // 删不掉也不阻断。
+  }
 }
 
 export interface KeeperSpawnResult {

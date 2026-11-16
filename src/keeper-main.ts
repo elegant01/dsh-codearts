@@ -17,15 +17,19 @@
  * @module dsh-codearts/keeper-main
  */
 
-import { appendFileSync, existsSync, unlinkSync } from 'node:fs'
+import { appendFileSync, existsSync, unlinkSync, watch } from 'node:fs'
+import { join } from 'node:path'
 import {
   KEEPER_HEARTBEAT_MS,
   KEEPER_TICK_MS,
+  clearKeeperHandoff,
   clearKeeperState,
+  isDshInstallerTempDir,
   keeperLogPath,
+  keeperStats,
   keeperStatePath,
-  readKeeperState,
   stopRequested,
+  writeKeeperHandoff,
   writeKeeperState,
   type CodeArtsKeeperState,
 } from './keeper.ts'
@@ -61,17 +65,16 @@ function log(message: string): void {
  *
  * 从卡片连点两次、或同时开两个 DSH 窗口时，第二次 spawn 必须让路 —— 两个进程同时
  * 刷 refresh_token 就是上面说的那个翻车场景。
+ *
+ * 判据用 `keeperStats`（心跳 + pid 都算），不能只看 pid：上一份 keeper 被强杀后
+ * 状态文件会留在盘上，而 Windows 很快就把那个 pid 发给别的进程 —— 只探 pid 会
+ * 把一个正常的新进程当成「已有 keeper」，于是每次启动都立刻退出（2026-11-16 实测）。
  */
 function alreadyRunning(): number | undefined {
-  const state = readKeeperState(home)
-  if (state === undefined) return undefined
-  if (state.pid === process.pid) return undefined
-  try {
-    process.kill(state.pid, 0)
-    return state.pid
-  } catch (error: unknown) {
-    return (error as NodeJS.ErrnoException | undefined)?.code === 'EPERM' ? state.pid : undefined
-  }
+  const stats = keeperStats(home)
+  if (!stats.alive || stats.state === undefined) return undefined
+  if (stats.state.pid === process.pid) return undefined
+  return stats.state.pid
 }
 
 /**
@@ -174,6 +177,42 @@ async function tick(state: CodeArtsKeeperState): Promise<void> {
   }
 }
 
+/**
+ * 更新安装器一出现就通知调用方让路。
+ *
+ * 为什么需要：安装器启动后会枚举进程判断「应用是否已关闭」，keeper 只要还在跑就
+ * 可能被当成应用本身，更新在十秒左右中止、也不把应用拉回来（`keeper.ts` 的
+ * `bundledNodeExecutable` 注释里有完整现场）。换 node.exe 是主路，这里是双保险 —
+ * 安装器就算按安装路径匹配也挡不住。
+ *
+ * 实现上用 `fs.watch` 盯 `%TEMP%`（事件驱动，不轮询）：只有新出现的 `ns*.tmp`
+ * 目录里真有安装器的 `window-frame.dll` 才算数，用户装别的软件不会误伤。
+ */
+function watchForUpdateInstaller(onSeen: () => void): void {
+  if (process.platform !== 'win32') return
+  const root = process.env.TEMP ?? process.env.TMP
+  if (root === undefined || root === '') return
+  const confirm = (name: string, attempt: number): void => {
+    if (!name.toLowerCase().startsWith('ns')) return
+    const dir = join(root, name)
+    if (isDshInstallerTempDir(dir)) {
+      onSeen()
+      return
+    }
+    // 插件目录先出现、dll 晚一拍落盘：隔一会儿再看两次。
+    if (attempt < 2) setTimeout(() => confirm(name, attempt + 1), 500)
+  }
+  try {
+    watch(root, (_event, filename) => {
+      if (filename === null) return
+      confirm(String(filename), 0)
+    })
+  } catch (error: unknown) {
+    // 盯不上不影响续期主业，只是少了这层保险。
+    log(`installer watch unavailable: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 async function main(): Promise<void> {
   // 单实例：已经有一份在跑就立刻退出，别让两个进程抢同一个 refresh_token。
   const other = alreadyRunning()
@@ -203,6 +242,26 @@ async function main(): Promise<void> {
     clearKeeperState(home)
     process.exit(0)
   }
+
+  // 新的一份 keeper 起来了：上一次「为更新让路」的标记已经过时。
+  clearKeeperHandoff(home)
+
+  /**
+   * 为更新安装让路。
+   *
+   * 和 `shutdown` 的区别只有一条：留一个「让路」标记。插件看到它会知道这是预期内
+   * 的退出，不把「常驻保活」开关关掉 —— 新版应用起来后开关还开着，keeper 会照常被
+   * 拉起，用户不会发现自己"被关了保活"。
+   */
+  const stepAside = (reason: string): void => {
+    if (stopped) return
+    log(`keeper stepping aside: ${reason}`)
+    writeKeeperHandoff(reason, home)
+    clearKeeperState(home)
+    stopped = true
+    process.exit(0)
+  }
+  watchForUpdateInstaller(() => stepAside('update installer detected'))
 
   // 被 kill（正是用户会按的那个按钮）时也尽量把状态文件清掉。SIGKILL 抓不住，
   // 所以插件那边判活用「心跳 + pid 存活」，不只靠文件在不在。

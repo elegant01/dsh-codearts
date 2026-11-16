@@ -28,7 +28,7 @@ import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { CodeArtsAccountStore, codeartsAccountsPath, codeartsDebugLogPath, codeartsRefreshLogPath } from './auth.ts'
 import { CodeArtsAccountPool } from './account-pool.ts'
-import { CodeArtsCatalog, filterEnabledModels, isBenefitModel } from './catalog.ts'
+import { CodeArtsCatalog, filterEnabledModels, isBenefitModel, type CodeArtsModelInfo } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
 import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CodeArtsQueueGate } from './queue.ts'
@@ -47,6 +47,8 @@ import type {
 import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
 import {
   KEEPER_STALE_MS,
+  clearKeeperHandoff,
+  keeperHandoffRecent,
   keeperLogPath,
   keeperScriptPath,
   keeperStats,
@@ -311,9 +313,17 @@ export function apply(ctx: Context, rawConfig: Config): void {
       if (model.id.toLowerCase() !== lower) return model
       const target = window ?? model.contextWindowDiscovered ?? model.contextWindow
       const { contextWindowDiscovered, ...rest } = model
+      // 用户显式设的覆盖值是可以展示的真值（就算上游没给过窗口）；清空（window=null）
+      // 只是回到原值，标记维持原样，别顺手把一个兜底值洗成「上游规格」。
+      const known = window === null ? model.contextWindowKnown : true
+      const patched: CodeArtsModelInfo = {
+        ...rest,
+        contextWindow: target,
+        ...(known === true ? { contextWindowKnown: true } : {}),
+      }
       return contextWindowDiscovered === undefined || contextWindowDiscovered === target
-        ? { ...rest, contextWindow: target }
-        : { ...rest, contextWindow: target, contextWindowDiscovered }
+        ? patched
+        : { ...patched, contextWindowDiscovered }
     }))
     return true
   }
@@ -396,6 +406,10 @@ export function apply(ctx: Context, rawConfig: Config): void {
     if (Date.now() - keeperSpawnedAt < KEEPER_START_GRACE_MS) {
       return { alive: false, starting: true, ...keeperLastError === undefined ? {} : { error: keeperLastError }, logPath }
     }
+    // 为更新安装让路是**预期内**的退出：开关保持原样，新版应用起来后会照常拉起。
+    if (keeperHandoffRecent()) {
+      return { alive: false, error: '守护进程为更新安装让路，重启后会自动恢复', logPath }
+    }
     // 被 kill 了（或者是启动失败）。用户点过「结束」的情况由 keeper/stop 路由负责，
     // 这里是「进程在别处消失」—— 开关必须跟着关，否则界面会永远顶着一个空 pid。
     try {
@@ -440,6 +454,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
     keeperSpawnedAt = Date.now()
     if (outcome.ok) {
       keeperLastError = undefined
+      // 新进程已经起来：上一次「为更新让路」的标记到此失效。
+      clearKeeperHandoff()
       ctx.logger.debug(`dsh-codearts: credential keeper running (pid ${outcome.pid ?? '?'})`)
     } else {
       keeperLastError = outcome.reason ?? 'spawn failed'
@@ -463,6 +479,8 @@ export function apply(ctx: Context, rawConfig: Config): void {
     if (!keeperRunning() && Date.now() - keeperSpawnedAt >= KEEPER_START_GRACE_MS) {
       keeperTimer = undefined
       keeperSpawnedAt = 0
+      // 为更新安装让路的预期退出：不关开关，重启后 `armKeepAliveDaemon` 会再拉起。
+      if (keeperHandoffRecent()) return
       await setDock({ keepAliveDaemon: false }).catch(() => false)
       return
     }
