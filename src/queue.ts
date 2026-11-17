@@ -7,16 +7,16 @@
  * 官方客户端的做法是：只对 `enable_queue` 的模型，先轮询排队接口，等状态变成
  * `working` 才发聊天请求（见 vscode-codebot 的 `startQueuePolling`）。
  *
- * 这里**不照搬官方那种「一直等到轮到」**：宿主的流空闲超时只有 90 秒（等待期间
- * 一个字节都发不出去，SSE 注释帧也不算事件，实测每 90 秒就被掐一次重来），而
- * flash 高峰期队尾有 500+ 号、要等二十几分钟 —— 没有人会挂着对话等它。所以
- * `wait()` 只等 `maxWaitMs`（默认 20 秒）：
- *  - 等到 working → 放行；
- *  - 还在队里 → 返回 `queued` 带上位置和队长度，由 shim 直接回一句「排队中，
- *    稍后再试」，让用户自己决定要不要再发一次；
- *  - 队列已满 → `queue_full`；连续失败 → `error`。
+ * 这张票的定位是**提示，不是门禁**（issue #10）：真正的 chat 请求并不校验它，
+ * 所以 `wait()` 只做一次短探（`maxWaitMs`，默认 5 秒），结果交给 shim ——
+ * 没轮到也照发请求，底部积分条在这几秒里显示「排队第 N 位」。以前等满 20 秒
+ * 就直接回 400，用户看到的失败其实是插件自己造出来的。
  *
- * 三种收尾都会 DELETE 清号，别把幽灵排队留在上游把队列越撑越长。
+ * 宿主也等不起：流空闲超时只有 90 秒（等待期间一个字节都发不出去，SSE 注释帧
+ * 也不算事件），而 flash 高峰期队尾有 500+ 号、要等二十几分钟。真正值得等的位置
+ * 在 POST 被上游明确拒绝之后（还没写任何字节，重发安全），由 shim 退避重试。
+ *
+ * 收尾（轮到/超时/取消/失败）都会 DELETE 清号，别把幽灵排队留在上游撑大队列。
  *
  * @module dsh-codearts/queue
  */
@@ -42,11 +42,11 @@ export interface CodeArtsQueueEntry {
 export type CodeArtsQueueOutcome =
   /** 轮到了（或模型本来就不排队），可以发请求。 */
   | { kind: 'working' }
-  /** 等了 `maxWaitMs` 还在队里：把位置报给用户，让他稍后再发。 */
+  /** 短探没轮到：只是提示，shim 照常发请求。 */
   | { kind: 'queued'; position: number; length: number; message: string }
-  /** 队列本身已满，上游让用户换模型/升级套餐。 */
+  /** 队列本身已满；同样只是提示，不拦请求。 */
   | { kind: 'queue_full'; message: string }
-  /** 排队接口连续失败，放弃排队并报出原因。 */
+  /** 排队接口连续失败：拿不到位置就安静地照发，不影响请求。 */
   | { kind: 'error'; message: string }
   /** 用户取消或插件退出。 */
   | { kind: 'aborted' }
@@ -54,7 +54,7 @@ export type CodeArtsQueueOutcome =
 export interface CodeArtsQueueGateOptions {
   /** 两次查询之间的间隔（官方客户端是 5 秒）。 */
   intervalMs?: number
-  /** 最多替用户等多久。超过就回 `queued`，别把请求挂着。 */
+  /** 短探多久（只影响底部提示的可见时长，不拦请求）。 */
   maxWaitMs?: number
   /** 连续失败几次就放弃。 */
   maxErrors?: number
@@ -84,7 +84,7 @@ export class CodeArtsQueueGate {
 
   constructor(options: CodeArtsQueueGateOptions = {}) {
     this.intervalMs = options.intervalMs ?? 5_000
-    this.maxWaitMs = options.maxWaitMs ?? 20_000
+    this.maxWaitMs = options.maxWaitMs ?? 5_000
     this.maxErrors = options.maxErrors ?? 3
     this.query = options.fetchStatus ?? fetchQueueStatus
     this.clear =
@@ -94,14 +94,16 @@ export class CodeArtsQueueGate {
   }
 
   /**
-   * 占号并**最多等 `maxWaitMs`** 轮到。调用方拿到 `working` 后才发 chat 请求；
-   * 其余结果（含 `queued`）都不要再发 —— `queued` 是要把位置原样告诉用户。
+   * 占号并**最多探 `maxWaitMs`**。调用方只拿结果做提示：`working` 表示正好轮到，
+   * 其余结果照发 chat 请求（这张票不拦请求，见模块注释）。
    */
   async wait(
     credential: CodeArtsResolved,
     chatId: string,
     model: string,
     signal?: AbortSignal,
+    /** 覆盖这次探测的时长（「一直等到轮到」开关会传几分钟）。 */
+    budgetMs: number = this.maxWaitMs,
   ): Promise<CodeArtsQueueOutcome> {
     if (chatId === '') return { kind: 'working' }
     if (signal?.aborted === true) return { kind: 'aborted' }
@@ -122,7 +124,7 @@ export class CodeArtsQueueGate {
     this.entries.set(chatId, entry)
 
     let errors = 0
-    const deadlineAt = this.now() + this.maxWaitMs
+    const deadlineAt = this.now() + budgetMs
     try {
       for (;;) {
         if (controller.signal.aborted) return { kind: 'aborted' }
@@ -146,7 +148,7 @@ export class CodeArtsQueueGate {
         entry.updatedAt = this.now()
         const verdict = verdictOf(status)
         if (verdict !== undefined) return verdict
-        // 等够了就把位置交出去：请求是宿主发出来的，没人会挂着对话等二十几分钟。
+        // 探够了就把结果交出去：请求照发，位置只用来提示。
         if (this.now() >= deadlineAt) {
           return { kind: 'queued', position: status.queuePosition, length: status.queueLength, message: status.message }
         }

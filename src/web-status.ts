@@ -285,6 +285,13 @@ export interface CodeArtsDockFlags {
    * `keeper` 字段会带上 pid 与最近一轮结果；进程被 kill 掉时这里会自动翻回 false。
    */
   keepAliveDaemon: boolean
+  /**
+   * 「排队时一直等到轮到」（issue #10）。
+   *
+   * 缺省关：打开后上游回排队拒绝时会提前开流保活并等最长 15 分钟，界面在等待期间
+   * 就已经进入「回复中」—— 这是知情后主动选择的行为，不能默认替用户打开。
+   */
+  queueWait: boolean
 }
 
 /**
@@ -329,6 +336,7 @@ export const DEFAULT_DOCK_FLAGS: CodeArtsDockFlags = {
   modelDetail: true,
   autoClaim: false,
   keepAliveDaemon: false,
+  queueWait: false,
 }
 
 /**
@@ -952,12 +960,13 @@ function dockHandler(deps: CodeArtsStatusRouteOptions) {
           modelDetail?: unknown
           autoClaim?: unknown
           keepAliveDaemon?: unknown
+          queueWait?: unknown
         }
-        const keys = ['credits', 'queue', 'sidebar', 'settingsEntry', 'modelDetail', 'autoClaim', 'keepAliveDaemon'] as const
+        const keys = ['credits', 'queue', 'sidebar', 'settingsEntry', 'modelDetail', 'autoClaim', 'keepAliveDaemon', 'queueWait'] as const
         const touched = keys.filter(key => body[key] !== undefined)
         if (touched.length === 0 || touched.some(key => typeof body[key] !== 'boolean')) {
           json(res, 400, {
-            error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean, "settingsEntry"?: boolean, "modelDetail"?: boolean, "autoClaim"?: boolean, "keepAliveDaemon"?: boolean}',
+            error: 'expected {"credits"?: boolean, "queue"?: boolean, "sidebar"?: boolean, "settingsEntry"?: boolean, "modelDetail"?: boolean, "autoClaim"?: boolean, "keepAliveDaemon"?: boolean, "queueWait"?: boolean}',
           })
           return
         }

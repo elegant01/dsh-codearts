@@ -276,65 +276,123 @@ describe('usage accounting', () => {
 })
 
 /**
- * 排队闸门的出口：没轮到就不发聊天请求，并把上游那句排队文案回给宿主。
+ * 排队闸门只负责提示，不拦请求（issue #10）。
  *
- * 状态码必须是 400 而不是 429 —— 宿主的 classifyPiAiError 按文本里的状态码归类，
- * 429 会被判成 RATE_LIMIT 并自动重试 5 次（实测），用户看到的是「一直转圈」。
+ * 实测 chat 请求并不校验挂号票 —— 拿第 535 位的票去 POST，942ms 就开流。
+ * 以前等满 20 秒直接回 400，用户看到的那个失败其实是插件自己造出来的。
+ * 真被上游拒排队时才在本地退避重发；最终放弃仍回 400 + 上游原话。
  */
-describe('queue gate replies', () => {
-  async function withGate(outcome: unknown): Promise<{ port: number; bearer: string; close: () => Promise<void> }> {
-    const upstream = vi.fn(async () => {
-      throw new Error('排队没等到时不该发聊天请求')
-    })
-    vi.stubGlobal('fetch', upstream)
+describe('queue gate is advisory', () => {
+  const OK_STREAM = 'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\ndata: [DONE]\n\n'
+  const QUEUE_BODY = JSON.stringify({
+    message: '当前请求量较大，您排在第16位。建议切换其他模型，或升级套餐优享更高优先级。',
+    type: 'queued',
+    code: 'queued',
+  })
+
+  async function gatedChat(
+    options: { verdict?: unknown; queueRetryGapMs?: number; waitInQueue?: boolean },
+  ): Promise<RawResponse> {
     const gated = createCodeArtsShim({
       store: { ids: async () => ['acct'], pausedIds: async () => [], pinnedIds: async () => [], resolve: async () => ({ token: 't', securityToken: 't' }) } as never,
       catalog: { current: () => CATALOG } as never,
-      queue: { wait: async () => outcome } as never,
+      ...(options.verdict === undefined ? {} : { queue: { wait: async () => options.verdict } as never }),
+      ...(options.queueRetryGapMs === undefined ? {} : { queueRetryGapMs: options.queueRetryGapMs }),
+      ...(options.waitInQueue === undefined ? {} : { waitInQueue: () => options.waitInQueue === true }),
     })
     await gated.ready
-    return {
-      port: Number(new URL(gated.baseUrl()).port),
-      bearer: gated.token(),
-      close: async () => {
-        await gated.close()
-        vi.unstubAllGlobals()
-      },
+    const gatedPort = Number(new URL(gated.baseUrl()).port)
+    try {
+      return await raw(gatedPort, {
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: { host: `127.0.0.1:${gatedPort}`, authorization: `Bearer ${gated.token()}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+      })
+    } finally {
+      await gated.close()
     }
   }
 
-  const chat = async (shimPort: number, token: string) =>
-    raw(shimPort, {
-      method: 'POST',
-      path: '/v1/chat/completions',
-      headers: { host: `127.0.0.1:${shimPort}`, authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }], stream: true }),
-    })
-
-  it('answers a queued verdict with 400 and the upstream wording', async () => {
-    const gated = await withGate({ kind: 'queued', position: 595, length: 600, message: '当前请求量较大，您排在第595位。' })
-    try {
-      const res = await chat(gated.port, gated.bearer)
-      expect(res.status).toBe(400)
-      const error = (res.body as { error: { code: string; message: string } }).error
-      expect(error.code).toBe('queued')
-      expect(error.message).toContain('您排在第595位')
-      expect(error.message).toContain('请稍后重试')
-      // 429/timeout 这类词会踩到宿主的重试分类，正文里不能出现。
-      expect(error.message).not.toMatch(/\b429\b|rate.?limit|timeout/i)
-    } finally {
-      await gated.close()
-    }
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
-  it('answers queue_full with 429 and never opens the chat request', async () => {
-    const gated = await withGate({ kind: 'queue_full', message: '队列已满，请稍后再试' })
-    try {
-      const res = await chat(gated.port, gated.bearer)
-      expect(res.status).toBe(429)
-      expect((res.body as { error: { message: string } }).error.message).toBe('队列已满，请稍后再试')
-    } finally {
-      await gated.close()
-    }
+  it('sends the chat request even when the gate says queued', async () => {
+    const upstream = vi.fn(async () => new Response(OK_STREAM, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', upstream)
+    const res = await gatedChat({ verdict: { kind: 'queued', position: 595, length: 600, message: '当前请求量较大，您排在第595位。' } })
+    expect(res.status).toBe(200)
+    expect(upstream).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores a queue_full verdict and still sends the chat request', async () => {
+    const upstream = vi.fn(async () => new Response(OK_STREAM, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', upstream)
+    const res = await gatedChat({ verdict: { kind: 'queue_full', message: '队列已满，请稍后再试' } })
+    expect(res.status).toBe(200)
+    expect(upstream).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries locally when upstream rejects with a queued body', async () => {
+    // 第 1 次撞在轮换主路上，第 2 次是兜底通道的第一次尝试 —— 两跳都必须能续上，
+    // 第 3 次才放行。
+    let calls = 0
+    const upstream = vi.fn(async () => {
+      calls += 1
+      return calls <= 2
+        ? new Response(QUEUE_BODY, { status: 400, headers: { 'content-type': 'application/json' } })
+        : new Response(OK_STREAM, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    vi.stubGlobal('fetch', upstream)
+    const res = await gatedChat({ queueRetryGapMs: 10 })
+    expect(res.status).toBe(200)
+    expect(calls).toBe(3)
+  })
+
+  it('keeps the stream alive and delivers the retry in wait mode', async () => {
+    // 「一直等到轮到」：先开流发心跳（status 200 + 空帧），轮到后把上游内容接着写进来。
+    let calls = 0
+    const upstream = vi.fn(async () => {
+      calls += 1
+      return calls === 1
+        ? new Response(QUEUE_BODY, { status: 400, headers: { 'content-type': 'application/json' } })
+        : new Response(OK_STREAM, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    })
+    vi.stubGlobal('fetch', upstream)
+    const res = await gatedChat({ waitInQueue: true, verdict: { kind: 'working' } })
+    expect(res.status).toBe(200)
+    expect(calls).toBe(2)
+    const body = res.body as string
+    expect(body).toContain('codearts-queue')
+    expect(body).toContain('"content":"hi"')
+  })
+
+  it('reports a queue-wait timeout as an in-stream error frame', async () => {
+    vi.stubGlobal('fetch', async () => new Response(QUEUE_BODY, { status: 400, headers: { 'content-type': 'application/json' } }))
+    const res = await gatedChat({
+      waitInQueue: true,
+      verdict: { kind: 'queued', position: 16, length: 20, message: '当前请求量较大，您排在第16位。' },
+    })
+    // 心跳已经把 200 发出去了，失败只能落在流内。
+    expect(res.status).toBe(200)
+    const body = res.body as string
+    expect(body).toContain('仍未轮到')
+    expect(body).toContain('第 16 位')
+    expect(body).toContain('[DONE]')
+  })
+
+  it('answers 400 with the upstream wording once queued retries run out', async () => {
+    const upstream = vi.fn(async () => new Response(QUEUE_BODY, { status: 400, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', upstream)
+    // 退避间隔比总预算（75 秒）还大：试完一次就收，不用真的干等。
+    const res = await gatedChat({ queueRetryGapMs: 80_000 })
+    expect(res.status).toBe(400)
+    const error = (res.body as { error: { code: string; message: string } }).error
+    expect(error.code).toBe('queued')
+    expect(error.message).toContain('您排在第16位')
+    expect(error.message).toContain('本地排队重试')
+    // 429/timeout 这类词会踩到宿主的重试分类，正文里不能出现。
+    expect(error.message).not.toMatch(/\b429\b|rate.?limit|timeout/i)
   })
 })

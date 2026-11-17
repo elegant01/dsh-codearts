@@ -168,6 +168,15 @@ export interface Config {
    * 打开后卡片上会显示它的 pid，并给一个「结束」按钮。
    */
   keepAliveDaemon?: boolean
+  /**
+   * 「排队时一直等到轮到」（issue #10）。缺省 = **关**。
+   *
+   * 打开后，上游明确回排队拒绝时插件不再直接报错，而是提前打开 SSE、每 20 秒发
+   * 一个空帧保住连接（宿主的 90 秒空闲超时只认可解析事件），轮询排队位置直到
+   * 轮到，最长等 15 分钟。代价：等待期间界面上已经开始「回复」，属于用户知情后
+   * 主动选择的行为，所以不默认开。
+   */
+  queueWaitUntilReady?: boolean
 }
 
 interface VolatileValue<T> {
@@ -198,6 +207,7 @@ export const Config: z<Config> = z.object({
   showModelDetailDock: z.boolean().default(true).description('Show "Model … · x ratio" on the line under the chat input box (Provider CodeArts always shows)').volatile(),
   autoClaim: z.boolean().default(false).description('Automatically claim the daily sign-in credits for every signed-in account').volatile(),
   keepAliveDaemon: z.boolean().default(false).description('Keep a detached background process that refreshes the OAuth credential while DSH is closed').volatile(),
+  queueWaitUntilReady: z.boolean().default(false).description('When upstream rejects with "queued", keep the stream alive and wait up to 15 minutes for a turn instead of failing (issue #10)').volatile(),
 }) as unknown as z<Config>
 
 function settingsCompatNamespace(ctx: Context): SettingsNamespace {
@@ -339,6 +349,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     modelDetail: current().showModelDetailDock !== false,
     autoClaim: current().autoClaim === true,
     keepAliveDaemon: current().keepAliveDaemon === true,
+    queueWait: current().queueWaitUntilReady === true,
   })
 
   const setDock = async (patch: Partial<CodeArtsDockFlags>): Promise<boolean> => {
@@ -352,6 +363,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
       ...patch.modelDetail === undefined ? {} : { showModelDetailDock: patch.modelDetail },
       ...patch.autoClaim === undefined ? {} : { autoClaim: patch.autoClaim },
       ...patch.keepAliveDaemon === undefined ? {} : { keepAliveDaemon: patch.keepAliveDaemon },
+      ...patch.queueWait === undefined ? {} : { queueWaitUntilReady: patch.queueWait },
     })
     return true
   }
@@ -849,6 +861,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
     debug: writeDebugLog,
     // 每次请求实时读：用户在设置里改了覆盖值，不必等下一轮模型发现就生效。
     contextWindowOverrides: () => current().contextWindowOverrides,
+    waitInQueue: () => current().queueWaitUntilReady === true,
   })
 
   // 账本懒加载：读盘失败/文件不存在都不影响插件启动。

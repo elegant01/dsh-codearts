@@ -33,6 +33,8 @@ import {
   isNotMultimodal,
   isParamInvalidFrame,
   isQueueableRate,
+  isQueueReject,
+  isQueueRejectText,
   isTpmLimit,
   learnContextWindow,
   learnedContextWindowFor,
@@ -40,6 +42,7 @@ import {
   maxTokensCeilingFor,
   modelUnavailableReasonText,
   prepareChatBody,
+  queueFrame,
   rateLimitFrame,
   upstreamErrorMessage,
   type ChatResult,
@@ -71,8 +74,8 @@ export interface CodeArtsShimOptions {
   /** 用量账本。给了就在转发流的同时把 usage 帧记下来（卡片上的「今日用量」）。 */
   usage?: CodeArtsUsageTracker
   /**
-   * 上游排队闸门。给了就在发请求前占号、轮询到轮到再开流
-   * （底部积分条旁边展示「排队第 N 位」）。
+   * 上游排队闸门。给了就在发请求前短探一次排队位置（底部展示「排队第 N 位」），
+   * **没轮到也照发** —— 实测 chat 请求不校验这张票（issue #10）。
    */
   queue?: CodeArtsQueueGate
   logger?: ShimLogger
@@ -86,6 +89,15 @@ export interface CodeArtsShimOptions {
   debug?: (message: string) => void
   /** 本地槽位满时最多等多久（缺省 30 秒）。测试用它把等待压到毫秒级。 */
   localSlotWaitMs?: number
+  /** 上游回排队拒绝后的首次退避（缺省 5 秒，之后翻倍）。测试用它把等待压到毫秒级。 */
+  queueRetryGapMs?: number
+  /**
+   * 「排队时一直等到轮到」（每次请求实时读，缺省关）。
+   *
+   * 打开后，上游明确回排队拒绝时不再换号/短退避，而是提前开流 + 每 20 秒一个空帧
+   * 保住宿主连接，轮询这张票直到 working（最长 15 分钟），再用同一个号发请求。
+   */
+  waitInQueue?: () => boolean
   /**
    * 按模型 id 覆盖 contextWindow（用户配置，每次请求实时读取）。
    *
@@ -120,19 +132,6 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 
 function writeOpenAIError(res: ServerResponse, status: number, kind: string, message: string): void {
   writeJson(res, status, { error: { message, type: kind, code: kind } })
-}
-
-/**
- * 排队没等到时回给用户的那句：优先用上游自己的文案（它就是写给人看的，带位置和
- * 「建议切换模型/升级套餐」），上游没给才自己拼。
- */
-function queuedMessage(
-  model: string,
-  gate: { position: number; length: number; message: string },
-): string {
-  const upstream = gate.message.trim()
-  const detail = upstream === '' ? `上游排队中：${model} 第 ${gate.position} 位（共 ${gate.length} 条）` : upstream
-  return `${detail} 插件没有一直等下去，请稍后重试。`
 }
 
 /**
@@ -219,7 +218,7 @@ const MAX_CEILING_HEALS = 3
  */
 const ROTATE_MIN_ATTEMPTS = 3
 const ROTATE_MAX_ATTEMPTS = 6
-/** 开始下一次尝试前必须留下的预算：一次挂号最多等这么久。 */
+/** 开始下一次尝试前必须留下的预算：一次挂号短探（默认 5 秒）再加一次开流。 */
 const ATTEMPT_RESERVE_MS = 20_000
 /**
  * 一次请求在「换号轮换 + 回落到同一账号原地重发」上总共能花的墙上时间，从进入
@@ -236,6 +235,17 @@ const ATTEMPT_RESERVE_MS = 20_000
  */
 const CAP_WAIT_LIMIT = 75_000
 const CAP_RETRY_GAP = 3_000
+/** 上游回「排队」拒绝后的首次退避，之后翻倍（5s → 10s → 20s → 30s）。 */
+const QUEUE_RETRY_GAP = 5_000
+/**
+ * 「排队时一直等到轮到」开关打开后替用户挂多久。
+ *
+ * 默认关（卡片「显示」页）：这一段会提前打开 SSE 并每 20 秒发一个空帧保活，
+ * 等待期间界面上已经开始「回复」了 —— 属于用户应当主动选择的行为。
+ */
+const QUEUE_WAIT_LIMIT_MS = 15 * 60_000
+/** 空帧间隔：宿主按「可解析的流事件」算 90 秒空闲，20 秒留足余量。 */
+const QUEUE_HEARTBEAT_MS = 20_000
 /** 上游 5xx 后短时冷却该账号。 */
 const SERVER_COOLDOWN_MS = 30_000
 /** 零散错误累计到阈值后冷却该账号。 */
@@ -335,6 +345,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
    */
   const LOCAL_SLOT_WAIT_MS = 30_000
   const localSlotWaitBudgetMs = options.localSlotWaitMs ?? LOCAL_SLOT_WAIT_MS
+  const queueRetryGapMs = options.queueRetryGapMs ?? QUEUE_RETRY_GAP
   // 账号池。空池起步，每次请求前用 store.ids() 对齐（新增/删除账号自动跟上）。
   const pool = options.pool ?? new CodeArtsAccountPool([])
 
@@ -472,6 +483,15 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         logger?.warn(`dsh-codearts: ${prepared.model} 首帧被判限流（${rate.code}），进入本地排队`)
         return { prepared, result: { ok: false, kind: 'soft_rate', status: 429, message: `${rate.code}: ${rate.message}` } }
       }
+      // 排队拒绝同样要赶在转发之前认出来：一个字都没吐出去，退避重发是安全的。
+      // 归 'client' 而不是 'soft_rate' —— 账号本身完全健康，别让它被冷却（issue #10）。
+      const queued = headText === undefined ? undefined : queueFrame(headText)
+      if (queued !== undefined) {
+        reader.releaseLock()
+        await result.stream.cancel().catch(() => {})
+        logger?.warn(`dsh-codearts: ${prepared.model} 首帧被判排队，本地退避重发`)
+        return { prepared, result: { ok: false, kind: 'client', status: 400, message: `queued: ${queued.message}` } }
+      }
       // 凭据失效 / 模型无权限 / 不吃图也都是流内首帧，与限流同样绕过了 classify()。
       // 必须在转发之前认出来：凭据失效要能强制续期后重发，另外两种要翻成人话。
       const upstreamError = headText === undefined ? undefined : firstFrameError(headText)
@@ -539,6 +559,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
    * 间隔逐次翻倍（3s → 6s → 12s → 24s，封顶 30s），避免在配额已经满的时候
    * 把重试本身也打成一波流量。
    *
+   * 「排队」拒绝（issue #10）同理：上游让等一会儿再来，从 5 秒起翻倍重发；
+   * 这段等待发生在 POST 被拒之后 —— 还没写给宿主任何字节，重发安全。
+   *
    * 命中限流不甩给 pi-ai：429 会被重试 5 次，每次再撞一次限流，越试越满。
    */
   async function openStream(
@@ -550,12 +573,17 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   ): Promise<{ prepared: PreparedChatBody; result: ChatResult; head?: Uint8Array; waitedMs: number }> {
     const started = Date.now()
     let gap = CAP_RETRY_GAP
+    let queueGap = queueRetryGapMs
     for (;;) {
       const opened = await openWithCeilingHeal(credential, raw, contextWindow, signal)
       const waitedMs = Date.now() - started
       if (opened.result.ok || signal.aborted) return { ...opened, waitedMs }
       if (!isQueueableRate(opened.result)) return { ...opened, waitedMs }
       if (isTpmLimit(opened.result)) gap = Math.min(gap * 2, 30_000)
+      if (isQueueReject(opened.result)) {
+        gap = queueGap
+        queueGap = Math.min(queueGap * 2, 30_000)
+      }
       if (Date.now() + gap > untilAt) return { ...opened, waitedMs }
       await sleep(gap)
     }
@@ -637,6 +665,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     const refreshed = new Set<string>()
     let cappedAccount: string | undefined
     let tpmAccount: string | undefined
+    let queuedAccount: string | undefined
     let queueWaitedMs = 0
     let localSlotWaitedMs = 0
     let lastKind: UpstreamErrorKind | undefined
@@ -658,8 +687,8 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     for (let round = 0; round < 2; round += 1) {
       tried.clear()
       for (let attempt = 0; attempt < attempts; attempt += 1) {
-        // 剩下的预算还得够过一次挂号（queue.ts 的 maxWaitMs 默认 20 秒），否则这一试
-        // 自己就会把截止点拖过去，比直接报错更糟。
+        // 剩下的预算还得够过一次挂号短探（queue.ts 的 maxWaitMs 默认 5 秒）和一次开流，
+        // 否则这一试自己就会把截止点拖过去，比直接报错更糟。
         if (Date.now() + ATTEMPT_RESERVE_MS > rotateDeadline) break
         const id = pool.pick(tried)
         if (id === undefined) break
@@ -675,25 +704,13 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             pool.disable(id, 'no credential')
             continue
           }
-          // 上游排队要客户端自己挂号：先占号、轮询到 working 再发聊天请求。
-          // 只等一小会儿（闸门里的 maxWaitMs），还在队里就把位置回给用户 ——
-          // 挂着他二十几分钟不是产品，而且宿主的 90 秒流空闲超时也会先掐掉。
+          // 挂号只用来提示（底部积分条显示「排队第 N 位」）：实测 chat 请求并不校验
+          // 这张票 —— 拿第 535 位的票去 POST，942ms 就开流了。没轮到也照发；
+          // 以前在这里白等 20 秒再回 400，就是 issue #10 里那个失败。
           if (queue !== undefined) {
             const gate = await queue.wait(credential, checked.chatId, checked.model, controller.signal)
             if (controller.signal.aborted) return
-            if (gate.kind === 'queued') {
-              // 400 而不是 429：宿主的 classifyPiAiError 按状态码归类，429 会被判成
-              // RATE_LIMIT 并自动重试 5 次（实测），用户看到的是「一直转圈」而不是一句
-              // 「在排队，稍后再试」。INVALID_REQUEST 不在重试名单里，一次就把话说到。
-              usage?.noteFailure('queued', id)
-              writeOpenAIError(res, 400, 'queued', queuedMessage(checked.model, gate))
-              return
-            }
-            if (gate.kind === 'queue_full' || gate.kind === 'error') {
-              usage?.noteFailure(gate.kind, id)
-              writeOpenAIError(res, gate.kind === 'queue_full' ? 429 : 502, gate.kind, gate.message)
-              return
-            }
+            if (gate.kind !== 'working') debug?.(`queue ${gate.kind} req=${requestTag} ${id}`)
           }
           const opened = await openWithCeilingHeal(credential, raw, contextWindow, controller.signal)
           const { prepared, result } = opened
@@ -725,6 +742,11 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             // TPM 是模型级配额，换号也只是换个账号去撞同一堵墙；原地排队等窗口。
             // 账号本身完全健康，不要标记 capped/冷却。
             tpmAccount = id
+            break
+          }
+          if (isQueueReject(result)) {
+            // 上游让「等一会儿再来」：账号和模型都没坏，交给下面的兜底原地退避重发。
+            queuedAccount = id
             break
           }
           if (result.kind === 'iam_stale') {
@@ -777,11 +799,18 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
 
     if (controller.signal.aborted) return
 
+    // 「排队时一直等到轮到」（卡片开关，默认关）：上游明确回排队拒绝时，短退避
+    // 换个号也救不了，唯一能做的就是等这张票。见 waitForQueueTurn。
+    if (queuedAccount !== undefined && options.waitInQueue?.() === true) {
+      await waitForQueueTurn(queuedAccount)
+      return
+    }
+
     // 所有账号都撞在上限上：挑一个号原地排队等限流解除。单号时这是唯一的兜底；
     // 号超过尝试次数（>6）时剩下的号这一轮没被碰过，也是走这里排队 —— 那部分靠
     // LRU 在请求之间轮转覆盖（acquire 会推 lastUsed）。
     // 截止点跟轮换共用，所以前面耗掉的时间会从这里的等待里扣掉。
-    const queueAccount = cappedAccount ?? tpmAccount
+    const queueAccount = cappedAccount ?? tpmAccount ?? queuedAccount
     if (queueAccount !== undefined) {
       if (pool.acquire(queueAccount)) {
         // 上限降档在主循环里已经跑过（learned 表是进程内共享的），这里不再重跑，
@@ -829,8 +858,108 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     if (queueWaitedMs >= 1_000) waits.push(`排队重试 ${Math.round(queueWaitedMs / 1000)} 秒`)
     if (localSlotWaitedMs >= 1_000) waits.push(`等本地槽位 ${Math.round(localSlotWaitedMs / 1000)} 秒`)
     const waited = waits.length > 0 ? `（本地已${waits.join('、')}）` : ''
-    usage?.noteFailure(lastKind, lastAccountId)
-    writeOpenAIError(res, KIND_STATUS[lastKind], lastKind, `${explanation}${waited}`)
+    const failedKind = isQueueRejectText(lastMessage) ? 'queued' : lastKind
+    usage?.noteFailure(failedKind, lastAccountId)
+    writeOpenAIError(res, KIND_STATUS[lastKind], failedKind, `${explanation}${waited}`)
+
+    /**
+     * 「一直等到轮到」：提前开流保住宿主连接，轮询这张票直到 working，再发请求。
+     *
+     * 和上面的兜底通道有一个本质区别：响应头已经发出去了，后面任何失败都**不能再
+     * 换号、也不能回 HTTP 状态码**，只能以流内错误帧交代。所以只有上游明确回排队
+     * 拒绝时才会走到这里 —— 那时换别的号去撞同一张票也没有意义。
+     */
+    async function waitForQueueTurn(id: string): Promise<void> {
+      const gate = queue
+      if (gate === undefined) return
+      const credential = await store.resolve(id)
+      if (credential === undefined) return
+      const waitStartedAt = Date.now()
+      const heartbeat = startHeartbeat(checked.model)
+      try {
+        const verdict = await gate.wait(credential, checked.chatId, checked.model, controller.signal, QUEUE_WAIT_LIMIT_MS)
+        if (controller.signal.aborted || verdict.kind === 'aborted') return
+        if (verdict.kind !== 'working') {
+          usage?.noteFailure(verdict.kind === 'error' ? 'queued' : verdict.kind, id)
+          failStream(
+            res,
+            verdict.kind === 'queued'
+              ? `等了 ${Math.round(QUEUE_WAIT_LIMIT_MS / 60_000)} 分钟仍未轮到（第 ${verdict.position} 位，共 ${verdict.length} 条）。请稍后重试，或临时切换模型。`
+              : verdict.message,
+          )
+          return
+        }
+        let acquired = pool.acquire(id)
+        if (!acquired) {
+          const freed = await pool.waitForFreeSlot(10_000, controller.signal)
+          acquired = freed && pool.acquire(id)
+        }
+        if (!acquired) {
+          failStream(res, '轮到排队后本地账号槽位仍被占用，请稍后重试。')
+          return
+        }
+        try {
+          const opened = await openStream(credential, raw, contextWindow, controller.signal, Date.now() + 60_000)
+          queueWaitedMs = opened.waitedMs
+          if (controller.signal.aborted) {
+            if (opened.result.ok) await opened.result.stream.cancel().catch(() => {})
+            return
+          }
+          if (opened.result.ok) {
+            pool.noteSuccess(id)
+            await pipeToResponse(res, opened.result.stream, controller.signal, { accountId: id, model: opened.prepared.model, startedAt: requestStartedAt }, opened.head)
+            return
+          }
+          usage?.noteFailure(isQueueReject(opened.result) ? 'queued' : opened.result.kind, id)
+          const waitedSec = Math.round((Date.now() - waitStartedAt) / 1000)
+          const suffix = waitedSec >= 1 ? `（本地已排队 ${waitedSec} 秒）` : ''
+          failStream(res, `${upstreamErrorMessage(opened.result.message, opened.result.status)}${suffix}`)
+        } finally {
+          pool.release(id)
+        }
+      } finally {
+        heartbeat.stop()
+      }
+    }
+
+    /**
+     * 等待期间的空帧：宿主只看「可解析的流事件」续空闲计时（SSE 注释不算），
+     * 空 delta 不产生任何可见文字，但足以让连接活着。
+     */
+    function startHeartbeat(model: string): { stop: () => void } {
+      if (!res.headersSent) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        })
+      }
+      const beat = (): void => {
+        if (!res.writable || res.writableEnded) return
+        res.write(`data: ${JSON.stringify({
+          id: 'codearts-queue',
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: null }],
+        })}\n\n`)
+      }
+      beat()
+      const timer = setInterval(beat, QUEUE_HEARTBEAT_MS)
+      timer.unref?.()
+      return { stop: () => clearInterval(timer) }
+    }
+
+    /** 响应头已经发出之后的失败：只能作为流内错误帧交代，不能再改状态码。 */
+    function failStream(response: ServerResponse, message: string): void {
+      if (!response.writable || response.writableEnded) return
+      response.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content: '' }, finish_reason: 'stop' }],
+        error: { code: 'queued', message },
+      })}\n\n`)
+      response.end('data: [DONE]\n\n')
+    }
   }
 
   /**
@@ -858,12 +987,15 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     attribution?: { accountId: string; model: string; startedAt?: number },
     head?: Uint8Array,
   ): Promise<void> {
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    })
+    // 「一直等到轮到」会在等票期间先发头 + 空帧保活；那时这里不能再写一次头。
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      })
+    }
     const reader = stream.getReader()
     const decoder = new TextDecoder()
     let buf = ''

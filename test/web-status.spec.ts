@@ -602,7 +602,7 @@ describe('GET /api/codearts/status', () => {
   // 底部积分条靠这一份开关决定画不画，所以它必须搭 /status 的车 —— 为两个布尔
   // 多开一条轮询链路没道理。没接 settings 的宿主上 deps.dock 缺席，字段就该整个没有。
   it('carries the dock visibility flags so the composer bar does not need its own poll', async () => {
-    const flags = { credits: false, queue: true, sidebar: false, settingsEntry: true, modelDetail: true, autoClaim: false, keepAliveDaemon: false }
+    const flags = { credits: false, queue: true, sidebar: false, settingsEntry: true, modelDetail: true, autoClaim: false, keepAliveDaemon: false, queueWait: false }
     const scoped = mountRoutes({ store, models: () => [], dock: () => flags })
     const res = await call(scoped.get(CODEARTS_STATUS_PATH)!, GET, CODEARTS_STATUS_PATH)
     expect(res.body?.dock).toEqual(flags)
@@ -640,7 +640,7 @@ describe('GET /api/codearts/status', () => {
 
 describe('/api/codearts/dock', () => {
   it('answers the current flags and reports writability', async () => {
-    const flags = { credits: true, queue: false, sidebar: true, settingsEntry: false, modelDetail: false, autoClaim: true, keepAliveDaemon: true }
+    const flags = { credits: true, queue: false, sidebar: true, settingsEntry: false, modelDetail: false, autoClaim: true, keepAliveDaemon: true, queueWait: true }
     const scoped = mountRoutes({ store, models: () => [], dock: () => flags })
     const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, GET, CODEARTS_DOCK_PATH)
     expect(res.body?.dock).toEqual(flags)
@@ -657,6 +657,7 @@ describe('/api/codearts/dock', () => {
       modelDetail: true,
       autoClaim: false,
       keepAliveDaemon: false,
+      queueWait: false,
     })
   })
 
@@ -758,6 +759,24 @@ describe('/api/codearts/dock', () => {
     }, JSON.stringify({ autoClaim: true }))
     expect(res.status).toBe(200)
     expect(res.body?.dock).toEqual({ ...DEFAULT_DOCK_FLAGS, autoClaim: true })
+  })
+
+  it('writes the queueWait flag on its own', async () => {
+    let flags: CodeArtsDockFlags = { ...DEFAULT_DOCK_FLAGS }
+    const scoped = mountRoutes({
+      store,
+      models: () => [],
+      dock: () => flags,
+      setDock: async patch => {
+        flags = { ...flags, ...patch }
+        return true
+      },
+    })
+    const res = await call(scoped.get(CODEARTS_DOCK_PATH)!, POST, CODEARTS_DOCK_PATH, {
+      'content-type': 'application/json',
+    }, JSON.stringify({ queueWait: true }))
+    expect(res.status).toBe(200)
+    expect(res.body?.dock).toEqual({ ...DEFAULT_DOCK_FLAGS, queueWait: true })
   })
 
   it('rejects a non-boolean or unknown-only body', async () => {

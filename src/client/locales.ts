@@ -199,6 +199,9 @@ export interface CodeArtsSettingsKey {
   displayAutoClaimTitle: string
   displayAutoClaimHint: string
   displayAutoClaimToggle: string
+  displayQueueWaitTitle: string
+  displayQueueWaitHint: string
+  displayQueueWaitToggle: string
   displayKeeperTitle: string
   displayKeeperHint: string
   displayKeeperToggle: string
@@ -414,6 +417,9 @@ export const zh: CodeArtsSettingsKey = {
   displayAutoClaimTitle: '每日签到积分',
   displayAutoClaimHint: '打开后，DSH 启动约 30 秒会自动把每个已登录账号的每日签到积分领一遍；没领到会隔 30 分钟再试，最多 3 次。上游按天去重，重复领取不会出错。领取结果可以点开积分条查看。注意：这个功能只在 DSH 运行时生效，关掉 DSH 后不会替你领。',
   displayAutoClaimToggle: '自动领取每日签到积分（默认关闭）',
+  displayQueueWaitTitle: '排队等待',
+  displayQueueWaitHint: '上游在高峰期会回「当前请求量较大，您排在第 N 位」。打开这一项后，插件不再直接报错，而是提前打开回复流、每 20 秒发一个空帧保住连接，一直轮询到轮到再继续（最长 15 分钟）。代价：等待期间界面上已经开始「回复」，而且这一条请求会一直占着；想立刻做别的事可以点「停止生成」。默认关闭，因为这是让你自己决定要不要等。',
+  displayQueueWaitToggle: '排队时一直等到轮到（最长 15 分钟，默认关闭）',
   displayKeeperTitle: '常驻保活（DSH 关掉后仍续登录）',
   displayKeeperHint: '上游给的登录凭证只活 2 小时，但要靠它换新的登录凭证（refresh token），那个能活 30 天。打开这一项后，DSH 会在系统里另起一个独立的后台进程，每 20 分钟替你续一次——所以哪怕 DSH 关着、好几天不开，回来也不用重新登录。这个进程不随 DSH 退出，要用下面的「结束」按钮手动停。默认关闭：不经你同意就在系统里留一个常驻进程不合适。',
   displayKeeperToggle: '开启常驻保活进程（默认关闭）',
@@ -627,6 +633,9 @@ export const en: CodeArtsSettingsKey = {
   displayAutoClaimTitle: 'Daily sign-in credits',
   displayAutoClaimHint: 'When on, about 30 seconds after DSH starts the plugin claims the daily sign-in credits for every signed-in account; if nothing was claimed it retries after 30 minutes, up to 3 times. Upstream deduplicates by day, so claiming twice is harmless. Open the credits bar to see the result. Note: this only runs while DSH is running — it cannot claim for you once DSH is closed.',
   displayAutoClaimToggle: 'Claim daily sign-in credits automatically (off by default)',
+  displayQueueWaitTitle: 'Queue waiting',
+  displayQueueWaitHint: 'At peak times upstream answers "the request volume is high, you are #N in the queue". With this on, the plugin stops failing immediately: it opens the reply stream early and sends an empty frame every 20 seconds to keep the connection alive, polling until your turn (up to 15 minutes). The trade-off: the UI already looks like an answer in progress, and the request stays occupied — press "Stop generating" if you need to do something else. Off by default, because whether to wait is your call.',
+  displayQueueWaitToggle: 'Wait for your turn when queued (up to 15 minutes, off by default)',
   displayKeeperTitle: 'Keep-alive process (stays signed in while DSH is closed)',
   displayKeeperHint: 'The login token upstream hands out only lives 2 hours, but the refresh token behind it lives 30 days. With this on, DSH starts a separate background process that refreshes the credential every 20 minutes — so even after DSH has been closed for days, you come back without signing in again. That process outlives DSH; stop it with the button below. Off by default: leaving a resident process on your machine without asking is not something a plugin should do.',
   displayKeeperToggle: 'Run the keep-alive background process (off by default)',

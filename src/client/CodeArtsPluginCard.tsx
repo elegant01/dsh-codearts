@@ -142,7 +142,7 @@ type Translate = CodeArtsPluginCardInjected['t']
 type CardTab = 'accounts' | 'models' | 'usage' | 'display'
 
 /** 「显示」页的开关键（与 CodeArtsDockFlags 一一对应）。 */
-type DockKey = 'credits' | 'queue' | 'sidebar' | 'settingsEntry' | 'modelDetail' | 'autoClaim' | 'keepAliveDaemon'
+type DockKey = 'credits' | 'queue' | 'sidebar' | 'settingsEntry' | 'modelDetail' | 'autoClaim' | 'keepAliveDaemon' | 'queueWait'
 
 /** GET/POST /api/codearts/dock 的文档（后端契约见 web-status.ts 的 CodeArtsDockFlags）。 */
 interface DockDoc {
@@ -154,6 +154,7 @@ interface DockDoc {
     modelDetail?: boolean
     autoClaim?: boolean
     keepAliveDaemon?: boolean
+    queueWait?: boolean
   }
   writable?: boolean
 }
@@ -2140,6 +2141,28 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                       disabled={!dockWritable || dockSavingKeys.has('autoClaim')}
                       onChange={on => void toggleDock('autoClaim', on)}
                       label={t('displayAutoClaimToggle')}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/*
+                排队等待：上游明确回「排队」时，是直接报错还是挂着等（issue #10）。
+                它会影响请求本身的形态（提前开流），所以单独一段、默认关。
+              */}
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displayQueueWaitTitle')}</span>
+                </div>
+                <p className={styles.hint}>{t('displayQueueWaitHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.queueWait === true}
+                      disabled={!dockWritable || dockSavingKeys.has('queueWait')}
+                      onChange={on => void toggleDock('queueWait', on)}
+                      label={t('displayQueueWaitToggle')}
                     />
                   </div>
                 </div>

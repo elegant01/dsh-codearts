@@ -27,7 +27,8 @@ describe('CodeArtsQueueGate', () => {
       .mockResolvedValueOnce(waiting(1, 4))
       .mockResolvedValueOnce(working())
     const clear = vi.fn(async () => {})
-    const gate = new CodeArtsQueueGate({ fetchStatus: query, clearStatus: clear })
+    // 默认只短探 5 秒；这条用例要跨两次 5 秒轮询，显式放宽。
+    const gate = new CodeArtsQueueGate({ fetchStatus: query, clearStatus: clear, maxWaitMs: 20_000 })
 
     const outcome = gate.wait(credential, 'chat-1', 'deepseek-v4.1-flash')
     await vi.advanceTimersByTimeAsync(0)
@@ -70,7 +71,16 @@ describe('CodeArtsQueueGate', () => {
     await expect(empty.wait(credential, 'chat-2', 'GLM-5.2')).resolves.toEqual({ kind: 'working' })
   })
 
-  it('等满 maxWaitMs 还在队里就返回 queued 并清号（不把请求挂着）', async () => {
+  it('默认只短探 5 秒，没轮到就把结果交出去（issue #10）', async () => {
+    const query = vi.fn(async () => waiting(16, 20))
+    const gate = new CodeArtsQueueGate({ fetchStatus: query, clearStatus: vi.fn(async () => {}) })
+    const outcome = gate.wait(credential, 'chat-1', 'deepseek-v4.1-flash')
+    await vi.advanceTimersByTimeAsync(5_000)
+    await expect(outcome).resolves.toMatchObject({ kind: 'queued', position: 16 })
+    expect(query).toHaveBeenCalledTimes(2)
+  })
+
+  it('探满 maxWaitMs 还在队里就返回 queued 并清号（结果只用来提示）', async () => {
     const query = vi.fn(async () => waiting(571, 599))
     const clear = vi.fn(async () => {})
     const gate = new CodeArtsQueueGate({ fetchStatus: query, clearStatus: clear, maxWaitMs: 20_000 })
@@ -101,6 +111,19 @@ describe('CodeArtsQueueGate', () => {
       kind: 'queue_full',
       message: '队列已满，请稍后再试',
     })
+    expect(clear).toHaveBeenCalledTimes(1)
+  })
+
+  it('按次覆盖等待预算（「一直等到轮到」会传几分钟）', async () => {
+    const query = vi.fn(async () => waiting(3, 10))
+    const clear = vi.fn(async () => {})
+    const gate = new CodeArtsQueueGate({ fetchStatus: query, clearStatus: clear, maxWaitMs: 5_000 })
+    const outcome = gate.wait(credential, 'chat-1', 'deepseek-v4.1-flash', undefined, 20_000)
+    await vi.advanceTimersByTimeAsync(10_000)
+    // 默认预算早就过了，但这次覆盖到 20 秒：还在队里就继续等。
+    expect(query).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(10_000)
+    await expect(outcome).resolves.toMatchObject({ kind: 'queued', position: 3 })
     expect(clear).toHaveBeenCalledTimes(1)
   })
 

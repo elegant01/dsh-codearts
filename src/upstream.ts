@@ -616,9 +616,69 @@ export function isTpmLimit(result: ChatResult): boolean {
   return MODEL_RATE_CODE.test(result.message) || MODEL_RATE_TEXT.test(result.message)
 }
 
-/** 撞到这两类限流都值得原地等，而不是直接甩给 pi-ai 重试。 */
+/** 撞到这几类限流/排队都值得原地等，而不是直接甩给 pi-ai 重试。 */
 export function isQueueableRate(result: ChatResult): boolean {
-  return isConcurrencyCap(result) || isTpmLimit(result)
+  return isConcurrencyCap(result) || isTpmLimit(result) || isQueueReject(result)
+}
+
+/**
+ * 上游明确回「排队」拒绝（issue #10）：HTTP 400 的 body 形如
+ * `{"message":"当前请求量较大，您排在第16位。…","type":"queued","code":"queued"}`。
+ *
+ * 它不是请求写错了，是让客户端等一会儿再来 —— 本地退避重发就有机会。流内首帧
+ * （HTTP 200 + error_code/推送帧）也会被 `queueFrame` 归一成 `queued: <文案>`。
+ */
+export function isQueueRejectText(text: string): boolean {
+  return /"code"\s*:\s*"queued"|"type"\s*:\s*"queued"|^\s*queued\s*:/i.test(text)
+}
+
+export function isQueueReject(result: ChatResult): boolean {
+  return !result.ok && isQueueRejectText(result.message)
+}
+
+/** 从排队拒绝里取出给人看的那句（JSON 的 message 字段或 `queued: …` 前缀）。 */
+export function queueRejectMessage(text: string): string {
+  const prefixed = /^\s*queued\s*:\s*/i.exec(text)
+  if (prefixed !== null) return text.slice(prefixed[0].length).trim()
+  try {
+    const parsed = JSON.parse(text) as { message?: unknown; error?: { message?: unknown } }
+    return String(parsed.message ?? parsed.error?.message ?? '').trim()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 从首帧里认出上游的「排队」拒绝（HTTP 200 + 流内帧的形态）。
+ *
+ * 与 `rateLimitFrame` 同理：只在**还没有任何内容产出**的首帧上使用，此时重发安全。
+ */
+export function queueFrame(text: string): { message: string } | undefined {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const payload = trimmed.slice(5).trim()
+    if (payload === '' || payload === '[DONE]') continue
+    let ev: {
+      error?: { code?: unknown; type?: unknown; message?: unknown }
+      error_code?: unknown
+      error_msg?: unknown
+      code?: unknown
+      type?: unknown
+      message?: unknown
+    }
+    try {
+      ev = JSON.parse(payload) as typeof ev
+    } catch {
+      continue
+    }
+    const code = String(ev.error?.code ?? ev.error_code ?? ev.code ?? '')
+    const type = String(ev.error?.type ?? ev.type ?? '')
+    if (!/^queued$/i.test(code) && !/^queued$/i.test(type)) continue
+    const message = String(ev.error?.message ?? ev.error_msg ?? ev.message ?? '')
+    return { message }
+  }
+  return undefined
 }
 
 /**
@@ -668,6 +728,11 @@ export function upstreamErrorMessage(message: string, status = 0): string {
   }
   if (isBenefitMissing('', message)) {
     return '这个模型属于限时福利，当前福利通道不可用（不是账号问题）。可以刷新模型列表，改用非福利模型。'
+  }
+  if (isQueueRejectText(message)) {
+    const inner = queueRejectMessage(message)
+    const detail = inner === '' ? '上游提示请求量较大、需要排队。' : inner
+    return `${detail} 插件已在本地排队重试，仍未轮到，请稍后重试或临时切换模型。`
   }
   if (isIamTokenError(message)) {
     return '上游判定本次登录凭据（IAM token）已失效。插件已尝试自动续期；若反复出现，请到设置卡片重新登录。'
