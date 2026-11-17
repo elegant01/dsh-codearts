@@ -1,15 +1,20 @@
 // 由 dsh-css 在构建时生成，别手改。
 declare const styles: {
   readonly "accountCard": string
+  readonly "accountClear": string
+  readonly "accountClearHint": string
   readonly "accountEntry": string
+  readonly "accountGrid": string
   readonly "accountHint": string
   readonly "accountInfo": string
+  readonly "accountMenu": string
+  readonly "accountMenuAnchor": string
+  readonly "accountMenuItem": string
   readonly "accountName": string
   readonly "accountNameRow": string
   readonly "accountRow": string
   readonly "accountRowActions": string
   readonly "accountToggle": string
-  readonly "accountToggleLabel": string
   readonly "accountToolbar": string
   readonly "actions": string
   readonly "area": string
@@ -24,6 +29,7 @@ declare const styles: {
   readonly "card": string
   readonly "check": string
   readonly "choiceRow": string
+  readonly "choiceTail": string
   readonly "choices": string
   readonly "claimAllRow": string
   readonly "count": string
@@ -43,6 +49,9 @@ declare const styles: {
   readonly "expiryRow": string
   readonly "field": string
   readonly "fieldLabel": string
+  readonly "groupHead": string
+  readonly "groupHeadFirst": string
+  readonly "groupLabel": string
   readonly "headText": string
   readonly "header": string
   readonly "heatAxis": string
@@ -61,7 +70,9 @@ declare const styles: {
   readonly "manualSummary": string
   readonly "meta": string
   readonly "modelChart": string
+  readonly "modelCheck": string
   readonly "modelFill": string
+  readonly "modelMeta": string
   readonly "modelName": string
   readonly "modelRequests": string
   readonly "modelRow": string

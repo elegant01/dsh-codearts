@@ -22,6 +22,10 @@ export interface CodeArtsSettingsKey {
   storedMetaNoLabel: string
   refresh: string
   clearToken: string
+  /** 「清除全部凭据」左侧的影响说明。 */
+  clearTokenHint: string
+  /** 账号行尾「⋯」菜单的按钮名（无障碍标签）。 */
+  accountMore: string
   tokenLabel: string
   tokenPlaceholder: string
   labelLabel: string
@@ -196,6 +200,8 @@ export interface CodeArtsSettingsKey {
   displayCreditsToggle: string
   displayQueueToggle: string
   displayModelDetailToggle: string
+  displayGroupUi: string
+  displayGroupBehavior: string
   displayAutoClaimTitle: string
   displayAutoClaimHint: string
   displayAutoClaimToggle: string
@@ -260,6 +266,8 @@ export const zh: CodeArtsSettingsKey = {
   storedMetaNoLabel: '存于 {time}',
   refresh: '刷新',
   clearToken: '清除全部凭据',
+  clearTokenHint: '会把本机保存的所有账号凭据删掉，之后需要重新登录。',
+  accountMore: '更多操作',
   tokenLabel: 'cloud_dragon_token',
   tokenPlaceholder: '粘贴从 CodeArts 网页/桌面端拿到的 token……',
   labelLabel: '备注（可选）',
@@ -414,6 +422,8 @@ export const zh: CodeArtsSettingsKey = {
   displayCreditsToggle: '在输入框工具行显示剩余积分（点开可看各账号明细）',
   displayQueueToggle: '显示上游排队位置',
   displayModelDetailToggle: '显示模型与倍率（Provider CodeArts 不受影响，始终显示）',
+  displayGroupUi: '界面显示',
+  displayGroupBehavior: '后台行为',
   displayAutoClaimTitle: '每日签到积分',
   displayAutoClaimHint: '打开后，DSH 启动约 30 秒会自动把每个已登录账号的每日签到积分领一遍；没领到会隔 30 分钟再试，最多 3 次。上游按天去重，重复领取不会出错。领取结果可以点开积分条查看。注意：这个功能只在 DSH 运行时生效，关掉 DSH 后不会替你领。',
   displayAutoClaimToggle: '自动领取每日签到积分（默认关闭）',
@@ -476,6 +486,8 @@ export const en: CodeArtsSettingsKey = {
   storedMetaNoLabel: 'stored {time}',
   refresh: 'Refresh',
   clearToken: 'Clear all credentials',
+  clearTokenHint: 'Deletes every credential stored on this machine; you will need to sign in again.',
+  accountMore: 'More actions',
   tokenLabel: 'cloud_dragon_token',
   tokenPlaceholder: 'Paste the token taken from the CodeArts web/desktop client……',
   labelLabel: 'Label (optional)',
@@ -630,6 +642,8 @@ export const en: CodeArtsSettingsKey = {
   displayCreditsToggle: 'Show remaining credits in the composer tool row (click for per-account details)',
   displayQueueToggle: 'Show the upstream queue position',
   displayModelDetailToggle: 'Show the model and rate (Provider CodeArts is not affected and always shows)',
+  displayGroupUi: 'Interface',
+  displayGroupBehavior: 'Background tasks',
   displayAutoClaimTitle: 'Daily sign-in credits',
   displayAutoClaimHint: 'When on, about 30 seconds after DSH starts the plugin claims the daily sign-in credits for every signed-in account; if nothing was claimed it retries after 30 minutes, up to 3 times. Upstream deduplicates by day, so claiming twice is harmless. Open the credits bar to see the result. Note: this only runs while DSH is running — it cannot claim for you once DSH is closed.',
   displayAutoClaimToggle: 'Claim daily sign-in credits automatically (off by default)',

@@ -992,6 +992,8 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   const [testResults, setTestResults] = useState<Record<string, ModelTestResult>>(() => ({ ...lastTestResults }))
   /** 正在提交 paused/pinned 的账号 id。 */
   const [flagBusy, setFlagBusy] = useState<string | null>(null)
+  /** 展开了行尾「⋯」菜单的账号 id（同一时间只开一个）。 */
+  const [accountMenuFor, setAccountMenuFor] = useState<string | null>(null)
   const [doctor, setDoctor] = useState<CodeArtsDoctorReport | null>(null)
   const [doctorBusy, setDoctorBusy] = useState(false)
   const [doctorError, setDoctorError] = useState<string | null>(null)
@@ -1251,6 +1253,28 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       document.removeEventListener('keydown', onKeyDown)
     }
   }, [windowOpenFor, windowDrafts, selection])
+
+  // 账号行尾「⋯」菜单：点别处、按 Esc 收起（与窗口弹层同一套做法）。
+  useEffect(() => {
+    if (accountMenuFor === null) return
+    function onPointerDown(event: MouseEvent): void {
+      const target = event.target
+      if (target instanceof Element && target.closest('[data-account-menu]') !== null) return
+      setAccountMenuFor(null)
+    }
+    function onKeyDown(event: KeyboardEvent): void {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        setAccountMenuFor(null)
+      }
+    }
+    document.addEventListener('click', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('click', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [accountMenuFor])
 
   async function saveToken(e: React.FormEvent): Promise<void> {
     e.preventDefault()
@@ -1786,6 +1810,11 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 )}
 
                 <div className={styles.accountCard}>
+                  {/*
+                    账号卡按 auto-fit 排：面板够宽时一行两个，窄了自动回落一行一个。
+                    320px 是放下「头像 + 名字 + 开关 + 重新登录 + ⋯」的最小宽度。
+                  */}
+                  <div className={styles.accountGrid}>
                   {accounts.map(account => {
                     const accountLine = accountMeta(account)
                     const credit = creditFor(account.id)
@@ -1817,8 +1846,11 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                               重新登录 —— 以前这里是一个「暂停/恢复」按钮，状态要靠
                               按钮文案反推；换成开关后，开着的就是能接活的号。
                             */}
-                            <span className={styles.accountToggle}>
-                              <span className={styles.accountToggleLabel}>{t('accountEnabled')}</span>
+                            {/*
+                              开关不再带可见文字（两列卡里省下的宽度留给「重新登录」）；
+                              含义靠悬浮提示和开关标签给出，暂停的号本身还有「已暂停」Tag。
+                            */}
+                            <span className={styles.accountToggle} title={t('accountEnabled')}>
                               <Switch
                                 checked={!account.paused}
                                 disabled={busy || loginPending || flagBusy === account.id}
@@ -1826,14 +1858,6 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                                 onChange={next => void setAccountFlag(account.id, { paused: !next })}
                               />
                             </span>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={busy || loginPending || flagBusy === account.id}
-                              onClick={() => void setAccountFlag(account.id, { pinned: !account.pinned })}
-                            >
-                              {account.pinned ? t('accountUnpin') : t('accountPin')}
-                            </Button>
                             {/*
                               「重新登录」把新凭证写回这一条：以前只有删除，凭证一过期
                               就只能删掉再加回来，顺序和备注全丢。
@@ -1848,15 +1872,48 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                                 ? t('reloginPending')
                                 : t('accountRelogin')}
                             </Button>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className={styles.danger}
-                              disabled={busy || loginPending}
-                              onClick={() => void removeAccount(account.id)}
-                            >
-                              {t('accountRemove')}
-                            </Button>
+                            {/*
+                              置顶/删除是低频动作，删除还不可逆 —— 收进行尾菜单，
+                              免得四个控件挤在名字右边、窄列时换行把信息挤扁。
+                            */}
+                            <span className={styles.accountMenuAnchor} data-account-menu>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                aria-expanded={accountMenuFor === account.id}
+                                aria-label={t('accountMore')}
+                                disabled={busy || loginPending || flagBusy === account.id}
+                                onClick={() => setAccountMenuFor(current => (current === account.id ? null : account.id))}
+                              >
+                                ⋯
+                              </Button>
+                              {accountMenuFor === account.id && (
+                                <div className={styles.accountMenu} role="menu">
+                                  <button
+                                    type="button"
+                                    role="menuitem"
+                                    className={styles.accountMenuItem}
+                                    onClick={() => {
+                                      setAccountMenuFor(null)
+                                      void setAccountFlag(account.id, { pinned: !account.pinned })
+                                    }}
+                                  >
+                                    {account.pinned ? t('accountUnpin') : t('accountPin')}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    role="menuitem"
+                                    className={`${styles.accountMenuItem} ${styles.danger}`}
+                                    onClick={() => {
+                                      setAccountMenuFor(null)
+                                      void removeAccount(account.id)
+                                    }}
+                                  >
+                                    {t('accountRemove')}
+                                  </button>
+                                </div>
+                              )}
+                            </span>
                           </div>
                         </div>
                         {credit !== undefined && (
@@ -1873,6 +1930,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                       </div>
                     )
                   })}
+                  </div>
                   {accounts.length > 1 && (
                     <div className={styles.claimAllRow}>
                       <Button
@@ -1888,7 +1946,9 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                   {accounts.length > 1 && <p className={styles.accountHint}>{t('accountsRotateHint')}</p>}
                 </div>
 
-                <div className={styles.actions}>
+                {/* 整页级破坏性动作：把影响范围写在按钮左边，别让按钮孤零零挂在底部。 */}
+                <div className={styles.accountClear}>
+                  <span className={styles.accountClearHint}>{t('clearTokenHint')}</span>
                   <Button variant="outline" size="sm" className={styles.danger} disabled={busy} onClick={() => void clearToken()}>
                     {t('clearToken')}
                   </Button>
@@ -1920,7 +1980,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                       return (
                         <div key={choice.id} className={styles.choiceRow}>
                           <Checkbox
-                            className={styles.check}
+                            className={`${styles.check} ${styles.modelCheck}`}
                             checked={draft.includes(choice.id)}
                             disabled={!selection.writable || savingModels}
                             onChange={(on) => setModel(choice.id, on)}
@@ -2008,33 +2068,44 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                               </div>
                             )}
                           </span>
-                          {choice.benefit === true && (
-                            <Tag tone={choice.blocked === true ? 'warning' : 'success'}>
-                              {choice.blocked === true ? t('benefitBlocked') : t('benefit')}
-                            </Tag>
-                          )}
-                          {choice.error !== undefined && (
-                            <span title={choice.error} style={{ cursor: 'help' }}>
-                              <Tag tone="warning">{t('modelError')}</Tag>
-                            </span>
-                          )}
-                          {choice.ratio !== undefined && <Tag tone="quiet">{choice.ratio}</Tag>}
-                          {choice.supportsImages === true && <Tag tone="quiet">{t('modelImages')}</Tag>}
-                          {draft.includes(choice.id) && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={testingId !== null}
-                              onClick={() => void testModel(choice.id)}
-                            >
-                              {testingId === choice.id ? t('testingModel') : t('testModel')}
-                            </Button>
-                          )}
-                          {result !== undefined && (
-                            <span title={result.ms === undefined ? result.message : `${result.message}（${result.ms} ms）`}>
-                              <Tag tone={result.ok ? 'success' : 'warning'}>{result.ok ? t('testOk') : t('testFailed')}</Tag>
-                            </span>
-                          )}
+                          {/*
+                            行尾信息簇：语义 Tag 在前；倍率/识图合成一段文字（少两个胶囊，
+                            不是每条都得扫一遍色块），窄列时整簇换到下一行。
+                          */}
+                          <span className={styles.choiceTail}>
+                            {choice.benefit === true && (
+                              <Tag tone={choice.blocked === true ? 'warning' : 'success'}>
+                                {choice.blocked === true ? t('benefitBlocked') : t('benefit')}
+                              </Tag>
+                            )}
+                            {choice.error !== undefined && (
+                              <span title={choice.error} style={{ cursor: 'help' }}>
+                                <Tag tone="warning">{t('modelError')}</Tag>
+                              </span>
+                            )}
+                            {(choice.ratio !== undefined || choice.supportsImages === true) && (
+                              <span className={styles.modelMeta}>
+                                {[choice.ratio, choice.supportsImages === true ? t('modelImages') : undefined]
+                                  .filter(Boolean)
+                                  .join(' · ')}
+                              </span>
+                            )}
+                            {draft.includes(choice.id) && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={testingId !== null}
+                                onClick={() => void testModel(choice.id)}
+                              >
+                                {testingId === choice.id ? t('testingModel') : t('testModel')}
+                              </Button>
+                            )}
+                            {result !== undefined && (
+                              <span title={result.ms === undefined ? result.message : `${result.message}（${result.ms} ms）`}>
+                                <Tag tone={result.ok ? 'success' : 'warning'}>{result.ok ? t('testOk') : t('testFailed')}</Tag>
+                              </span>
+                            )}
+                          </span>
                         </div>
                       )
                     })}
@@ -2081,6 +2152,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
               labelledBy={tabId('display')}
               active={activeTab === 'display'}
             >
+              {/*
+                这一页混着两类开关：只改界面的（底部两行、入口图标）和会动后台的
+                （自动签到、排队挂等、常驻进程）。分组标题把它们分开，免得「不影响
+                任何请求」这句话被下面几段行为开关打脸。
+              */}
+              <div className={`${styles.groupHead} ${styles.groupHeadFirst}`}>
+                <span className={styles.groupLabel}>{t('displayGroupUi')}</span>
+              </div>
               <div className={styles.section}>
                 <div className={styles.sectionHead}>
                   <span className={styles.sectionLabel}>{t('displayTitle')}</span>
@@ -2122,6 +2201,50 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 </div>
                 {!dockWritable && <p className={styles.hint}>{t('displayNotWritable')}</p>}
                 {dockError !== null && <p className={styles.error}>{t('displayFailed', { message: dockError })}</p>}
+              </div>
+
+              {/*
+                设置导航入口：默认显示。用户找插件的第一反应是「设置里从左列找」，
+                只挂在「内置插件 → 详情页」里等于默认找不到（issue #7）。
+              */}
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displaySettingsEntryTitle')}</span>
+                </div>
+                <p className={styles.hint}>{t('displaySettingsEntryHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.settingsEntry}
+                      disabled={!dockWritable || dockSavingKeys.has('settingsEntry')}
+                      onChange={on => void toggleDock('settingsEntry', on)}
+                      label={t('displaySettingsEntryToggle')}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className={styles.section}>
+                <div className={styles.sectionHead}>
+                  <span className={styles.sectionLabel}>{t('displaySidebarTitle')}</span>
+                </div>
+                <p className={styles.hint}>{t('displaySidebarHint')}</p>
+                <div className={styles.choices}>
+                  <div className={styles.choiceRow}>
+                    <Checkbox
+                      className={styles.check}
+                      checked={dock.sidebar}
+                      disabled={!dockWritable || dockSavingKeys.has('sidebar')}
+                      onChange={on => void toggleDock('sidebar', on)}
+                      label={t('displaySidebarToggle')}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className={styles.groupHead}>
+                <span className={styles.groupLabel}>{t('displayGroupBehavior')}</span>
               </div>
 
               {/*
@@ -2227,42 +2350,6 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                 设置导航入口：默认显示。用户找插件的第一反应是「设置里从左列找」，
                 只挂在「内置插件 → 详情页」里等于默认找不到（issue #7）。
               */}
-              <div className={styles.section}>
-                <div className={styles.sectionHead}>
-                  <span className={styles.sectionLabel}>{t('displaySettingsEntryTitle')}</span>
-                </div>
-                <p className={styles.hint}>{t('displaySettingsEntryHint')}</p>
-                <div className={styles.choices}>
-                  <div className={styles.choiceRow}>
-                    <Checkbox
-                      className={styles.check}
-                      checked={dock.settingsEntry}
-                      disabled={!dockWritable || dockSavingKeys.has('settingsEntry')}
-                      onChange={on => void toggleDock('settingsEntry', on)}
-                      label={t('displaySettingsEntryToggle')}
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div className={styles.section}>
-                <div className={styles.sectionHead}>
-                  <span className={styles.sectionLabel}>{t('displaySidebarTitle')}</span>
-                </div>
-                <p className={styles.hint}>{t('displaySidebarHint')}</p>
-                <div className={styles.choices}>
-                  <div className={styles.choiceRow}>
-                    <Checkbox
-                      className={styles.check}
-                      checked={dock.sidebar}
-                      disabled={!dockWritable || dockSavingKeys.has('sidebar')}
-                      onChange={on => void toggleDock('sidebar', on)}
-                      label={t('displaySidebarToggle')}
-                    />
-                  </div>
-                </div>
-              </div>
-
               {/* 体检：CLI doctor 的可视化版本，只查本机可判定的东西，不联网。 */}
               <div className={styles.section}>
                 <div className={styles.sectionHead}>

@@ -109,6 +109,18 @@
   margin-top: 12px;
 }
 
+/* 账号卡按宽度自动分栏：够宽一行两个，窄了回落一行一个。 */
+.accountGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.accountGrid > * {
+  min-width: 0;
+}
+
 .accountEntry {
   border: 0.5px solid var(--dsw-alias-border-l2);
   border-radius: var(--dsw-radius-md);
@@ -178,23 +190,73 @@
   gap: 6px;
 }
 
-/* 「启用」开关：和按钮同排，关闭即暂停（不参与轮转）。 */
+/* 「启用」开关：和按钮同排，关闭即暂停（不参与轮转）。文字已去掉，只留图形。 */
 .accountToggle {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-}
-
-.accountToggleLabel {
-  color: var(--dsw-alias-label-secondary);
-  font-size: 12px;
-  line-height: 20px;
-  white-space: nowrap;
 }
 
 .accountHint {
   margin: 0;
   padding: 0 12px 12px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+/* 行尾「⋯」菜单：置顶/删除收进来，窄列不再把四个控件挤成一堵墙。 */
+.accountMenuAnchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.accountMenu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-md);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 18%);
+}
+
+.accountMenuItem {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: var(--dsw-radius-sm);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+}
+
+.accountMenuItem:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* 清除全部凭据：破坏性动作单独一行，说明放左边、按钮在右边。 */
+.accountClear {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.accountClearHint {
+  flex: 1;
+  min-width: 200px;
+  margin: 0;
   color: var(--dsw-alias-label-tertiary);
   font-size: 12px;
   line-height: 18px;
@@ -325,6 +387,31 @@
   margin-top: 16px;
 }
 
+/*
+  「显示」页的分组标题：这一页既有只改界面的开关，也有会动后台的开关，
+  以前混排在一起，顶部那句「不影响任何请求」被下面的行为开关打脸。
+*/
+.groupHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 24px;
+  padding-top: 12px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+/* 第一组紧贴标签栏，再加一条分割线就成了双线。 */
+.groupHeadFirst {
+  border-top: none;
+  padding-top: 0;
+}
+
+.groupLabel {
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .sectionHead {
   display: flex;
   align-items: baseline;
@@ -396,8 +483,28 @@
   margin-top: 8px;
 }
 
+/* 模型行尾信息簇：靠右排，窄列时整体折到下一行。 */
+.choiceTail {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 倍率/识图合成一段文字，不再各占一个胶囊。 */
+.modelMeta {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .choiceRow {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin: 0 -6px;
@@ -874,10 +981,15 @@
 
 /* 模型行里的窗口调节（issue #9）：滑块给档位，输入框给精确 token 数。 */
 /* 行内只留一枚按钮，滑块和输入框收进点击弹出的浮层里，不占行的横向空间。 */
+/* 规格紧跟模型名（两者都是「这是什么模型」）；右对齐交给行尾信息簇。 */
 .windowAnchor {
   position: relative;
-  margin-left: auto;
   flex: none;
+}
+
+/* 模型行的复选框不伸展：名字贴着自己的规格，别把中间撑出一段空白。 */
+.modelCheck {
+  flex: 0 1 auto;
 }
 
 .windowButton {
