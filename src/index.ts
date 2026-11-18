@@ -50,6 +50,7 @@ import {
   clearKeeperHandoff,
   keeperHandoffRecent,
   keeperLogPath,
+  keeperNextPassAt,
   keeperScriptPath,
   keeperStats,
   spawnKeeper,
@@ -726,12 +727,31 @@ export function apply(ctx: Context, rawConfig: Config): void {
    */
   const KEEP_ALIVE_INTERVAL_MS = 20 * 60 * 1000
   let keepAliveTimer: ReturnType<typeof setTimeout> | undefined
+
+  /**
+   * 这一轮该不该把续期让给守护进程。
+   *
+   * 原来只看 `keeperRunning()`（心跳新鲜 + pid 活着）。问题是那个条件在 keeper 的
+   * **两轮 tick 之间（20 分钟空窗）同样成立**，于是插件整段时间完全不刷；万一 keeper
+   * 那一轮撞上锁忙跳过了，两边就一起不刷，凭证一路裸奔到过期（2026-11-18 凌晨
+   * 06:46–08:06 缺 4 轮 tick 时就是这样，见 `keeper-main.ts` 的睡眠补偿注释）。
+   *
+   * 现在改成「keeper 活着 **且** 它马上要来」才让路：只有当下一轮 tick 已到最后
+   * 一个心跳周期的窗口里（或者已经过点了），才把续期权交给它。其余时间插件自己刷，
+   * 反正跨进程锁会把两边串起来。
+   */
+  const shouldDeferToKeeper = (): boolean => {
+    const stats = keeperStats()
+    if (!stats.alive) return false
+    return Date.now() >= keeperNextPassAt(stats.state) - KEEPER_STALE_MS
+  }
+
   const keepAliveLoop = async (): Promise<void> => {
     if (stopped) return
-    // 让路：守护进程活着时续期的独占权在它手里。refresh_token 一次性，两边同时刷
-    // 会让后刷的那次拿着已作废的 token 失败，直接把号写成 stale —— 这正是「隔天就要
-    // 重新登录」的成因之一。所以我们只从磁盘重读它写回的结果，自己不发刷新请求。
-    if (keeperRunning()) {
+    // 让路：守护进程即将跑下一轮时，续期的独占权在它手里。refresh_token 一次性，
+    // 两边同时刷会让后刷的那次拿着已作废的 token 失败，直接就把号写成 stale ——
+    // 这正是「隔天就要重新登录」的成因之一。这时候我们只从磁盘重读它写回的结果。
+    if (shouldDeferToKeeper()) {
       await store.reloadFromDisk().catch(() => {})
     } else {
       try {

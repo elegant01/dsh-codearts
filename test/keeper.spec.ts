@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   KEEPER_STALE_MS,
+  KEEPER_TICK_MS,
   bundledNodeExecutable,
   clearKeeperHandoff,
   isDshInstallerTempDir,
@@ -15,6 +16,7 @@ import {
   nodeLauncher,
   pidAlive,
   keeperScriptPath,
+  keeperNextPassAt,
   keeperStats,
   readKeeperState,
   spawnKeeper,
@@ -119,6 +121,27 @@ describe('keeperStats', () => {
     } finally {
       child.kill()
     }
+  })
+})
+
+describe('keeperNextPassAt', () => {
+  // 插件靠这个时间点决定「这一轮该我刷还是让给守护进程」。判错了就是两边一起刷
+  // （令牌互相作废）或者两边都不刷（凭证裸奔到过期）。
+  it('lands one tick plus a grace period after the last pass', () => {
+    const at = 1_700_000_000_000
+    expect(keeperNextPassAt(state({ lastPass: { at, checked: 0, refreshed: 0, needsLogin: [] } })))
+      .toBe(at + KEEPER_TICK_MS + KEEPER_STALE_MS)
+  })
+
+  // 还没跑过任何一轮时（刚起来、账号文档读不出来），以启动时刻为准。
+  it('falls back to the start time when no pass has completed', () => {
+    const startedAt = 1_700_000_000_000
+    expect(keeperNextPassAt(state({ startedAt, lastPass: undefined })))
+      .toBe(startedAt + KEEPER_TICK_MS + KEEPER_STALE_MS)
+  })
+
+  it('treats a missing state file as never', () => {
+    expect(keeperNextPassAt(undefined)).toBe(0)
   })
 })
 

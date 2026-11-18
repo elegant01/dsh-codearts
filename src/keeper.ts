@@ -165,6 +165,22 @@ export function keeperStats(home?: string): { alive: boolean; state?: CodeArtsKe
   return { alive: fresh && pidAlive(state.pid), state }
 }
 
+/**
+ * 下一个 tick 最晚会在什么时候发生。
+ *
+ * 守护进程每 `KEEPER_TICK_MS` 跑一轮，但那一刻没在跑不代表它死了 —— 两轮之间就是
+ * 20 分钟的空窗。插件要判断「这一轮的续期该由谁来负责」，必须看这个时间点，而不是
+ * 只看 `alive`。
+ *
+ * 补了一点余量（`KEEPER_STALE_MS`）：tick 本身要读文档、逐号发请求，慢的时候能拖上
+ * 几十秒，卡在边界上会让插件抢在 keeper 落库前就把号刷了 —— 那正是要避免的双刷。
+ */
+export function keeperNextPassAt(state: CodeArtsKeeperState | undefined): number {
+  if (state === undefined) return 0
+  const base = state.lastPass?.at ?? state.startedAt
+  return base + KEEPER_TICK_MS + KEEPER_STALE_MS
+}
+
 /** 守护进程的脚本路径：和当前 bundle 同目录的 `keeper-main.mjs`（tsdown 入口名）。 */
 export function keeperScriptPath(): string {
   // 主 bundle 跑起来时 import.meta.url 指向 lib/index.mjs，keeper-main.mjs 就在旁边。
