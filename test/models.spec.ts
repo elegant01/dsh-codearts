@@ -472,6 +472,54 @@ describe('fetchModels', () => {
     expect(byId.get('Qwen3-VL-235B')?.thinking).toBeUndefined()
   })
 
+  // issue #11：企业专业版的自定义模型把输出上限放在 output_context_window，
+  // model_parameters.max_tokens 留 0。只读 max_tokens 会落到 8000 兜底。
+  it('falls back to output_context_window when max_tokens is 0', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () =>
+        json(
+          JSON.stringify({
+            agent_id: 'aaa',
+            gpts: {
+              models: [
+                {
+                  model_name: 'glm-5.3-1m-自定义模型',
+                  model_parameters: {
+                    model_id: '3ac4ab8e6f31425199088bbcf4c09a06',
+                    context_window: 1_016_000,
+                    input_context_window: 1_000_000,
+                    output_context_window: 16_000,
+                    max_tokens: 0,
+                  },
+                },
+                {
+                  model_name: 'glm-5.2-自定义模型',
+                  model_parameters: {
+                    model_id: 'ae0fa0ec00000000000000000000abcd',
+                    context_window: 1_100_000,
+                    input_context_window: 1_000_000,
+                    output_context_window: 100_000,
+                    max_tokens: 0,
+                  },
+                },
+              ],
+            },
+          }),
+        ),
+      '/v1/model/thinking-variants': () => json('{"variants":{}}'),
+    })
+
+    const result = await fetchModels(credential)
+    const byId = new Map(result.models.map(m => [m.id, m]))
+    expect(byId.get('3ac4ab8e6f31425199088bbcf4c09a06')?.maxTokens).toBe(16_000)
+    expect(byId.get('3ac4ab8e6f31425199088bbcf4c09a06')?.contextWindow).toBe(1_016_000)
+    // 声明 100000 超过实测上限，仍要钳住。
+    expect(byId.get('ae0fa0ec00000000000000000000abcd')?.maxTokens).toBe(65_536)
+  })
+
   // issue #9：目录给的 1M 是标称值，免费档实际窗口小得多。用户配置必须能压过发现值，
   // 且 id 大小写不敏感 —— 上游注册名是大小写混排的，用户不会照着抄。
   it('applies per-model contextWindow overrides over the discovered value', async () => {

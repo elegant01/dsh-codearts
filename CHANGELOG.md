@@ -3,6 +3,34 @@
 本文件记录本插件的重要改动。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复
+
+- **企业版自定义模型的输出上限不再被压到 8000**（#11）：企业内部专业版的模型由
+  管理侧注册为自定义模型，上游把输出上限放在 `model_parameters.output_context_window`、
+  而 `max_tokens` 留 0。插件以前只读 `max_tokens`，这类模型的 `maxTokens` 全部落到
+  8000 兜底，长回答在 8K token 处被截断。现在 `max_tokens` 为 0 时退回读
+  `output_context_window`，随后仍按该模型的实测上限钳制（声明 100000 会被钳到
+  65536）；内置模型与福利模型的取值不变。
+- **续期不再把两个账号同时刷死**：插件的保活循环和守护进程 keeper 会各自拿同一份
+  `refresh_token` 去换新令牌，而 CodeArts 的 refresh_token 是一次性的 —— 谁后到
+  谁收到 `HTTP 400 STS5.1806 invalid refresh token: 'the refresh token has been used'`，
+  两个令牌一起作废，所有账号掉到需要重新登录。现在跨进程用 `.codearts-refresh.lock`
+  （PID + 心跳，60ms 轮询抢锁、20s 重申、90s 判僵尸）串行化刷新，拿不到锁的一方
+  直接跳过本轮，等对端写完再读盘。
+- **「refresh token 已用过」不再当场判死**：这条错误以前被当成永久失败，直接把账号
+  标成 `stale` 停在登录页。现在按瞬态处理：先重读磁盘看对端是否已换上新令牌，没换
+  就连续 3 轮（插件侧 3 次独立刷新）才真正判死，期间保持可重试。
+- **PID 探活不再误杀进程**：Windows 上 `process.kill(pid, 0)` 会真的把目标进程
+  干掉（Node 不看信号值，直接 TerminateProcess）。锁文件的僵尸判定与 keeper 的
+  `keeperStats()` 探活都踩了这一条 —— 后者每探一次就可能杀掉守护进程，keeper 一死
+  插件就整段时间不再自己续期。现在 Windows 分支改用 `tasklist /FI "PID eq N"` 判定，
+  探活失败按「活着」处理，宁可等心跳超时也不误删。
+- **机器睡眠后 keeper 立即补一轮**：Windows 睡眠会让 20 分钟一次的 `setTimeout`
+  停摆（11-18 凌晨实测有 4 轮 tick 全空，而进程一直活着），期间没有续期。现在加了
+  30 秒看门狗，发现距上次 tick 超过 25 分钟就重排定时器并立刻补跑一轮。
+
 ## [1.4.4] - 2026-11-17
 
 ### 调整

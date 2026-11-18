@@ -1365,7 +1365,9 @@ async function fetchAgentModels(
       name: firstString(model.model_name, model.model_alias, id),
       contextWindow,
       ...(contextWindow > 0 ? { contextWindowKnown: true } : {}),
-      maxTokens: positive(params.max_tokens),
+      // 企业租户的自定义模型把输出上限放在 output_context_window，max_tokens 留 0
+      // （issue #11）。只读 max_tokens 会把这类模型压到兜底 8000。
+      maxTokens: positive(params.max_tokens) || positive(params.output_context_window),
       supportsImages: model.supports_images === true,
       ...(ratio === undefined ? {} : { ratio }),
     })
