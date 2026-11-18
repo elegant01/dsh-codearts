@@ -34,7 +34,7 @@
  * @module dsh-codearts/keeper
  */
 
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
@@ -42,6 +42,9 @@ import { fileURLToPath } from 'node:url'
 
 /** 心跳超过这么久没更新，就认为守护进程已经不在（它每 30 秒写一次）。 */
 export const KEEPER_STALE_MS = 90_000
+
+/** Windows 上探活要起一次 tasklist：给足超时，卡住就按「活着」处理。 */
+const PID_PROBE_TIMEOUT_MS = 5_000
 
 /** 心跳写入间隔。 */
 export const KEEPER_HEARTBEAT_MS = 30_000
@@ -117,14 +120,38 @@ export function writeKeeperState(state: CodeArtsKeeperState, home?: string): voi
 }
 
 /** 进程还在吗。信号 0 只探活，不真的发信号（Windows 上同样适用）。 */
+/**
+ * 某个 pid 是否还活着。
+ *
+ * **不能用 `process.kill(pid, 0)`**：那个「发信号 0 只是探活」的约定只在 POSIX 上
+ * 成立。Windows 上 Node 的实现不看信号值，直接 `TerminateProcess` —— 探活会把目标
+ * 进程**当场杀掉**。这里的调用方是 `keeperStats()`，探的正是守护进程本身，用错实现
+ * 就成了「插件每查一次状态就杀一次 keeper」，而 keeper 一死插件就再也不自己续期。
+ */
 export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false
+  if (pid === process.pid) return true
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error: unknown) {
+      // EPERM = 进程在，只是不归我们管；ESRCH 才是真的没了。
+      return (error as NodeJS.ErrnoException | undefined)?.code === 'EPERM'
+    }
+  }
   try {
-    process.kill(pid, 0)
+    // `/FI` 过滤命中时 tasklist 的退出码仍是 0，所以判据是「输出里有这个 pid」。
+    const out = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: PID_PROBE_TIMEOUT_MS,
+      windowsHide: true,
+    })
+    return new RegExp(`\\b${pid}\\b`).test(out)
+  } catch {
+    // 查不到就当活着：宁可多等一次心跳超时，也别把一个真在跑的 keeper 判死。
     return true
-  } catch (error: unknown) {
-    // EPERM = 进程在，只是不归我们管；ESRCH 才是真的没了。
-    return (error as NodeJS.ErrnoException | undefined)?.code === 'EPERM'
   }
 }
 

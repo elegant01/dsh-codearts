@@ -18,7 +18,7 @@
  */
 
 import { appendFileSync, existsSync, unlinkSync, watch } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   KEEPER_HEARTBEAT_MS,
   KEEPER_TICK_MS,
@@ -35,12 +35,28 @@ import {
 } from './keeper.ts'
 import { readAccountDocument, writeJsonAtomic, codeartsAccountsPath } from './auth.ts'
 import { refreshToken, defaultLoginConfig, OAuthTokenError } from './oauth.ts'
+import { refreshLockPath, withRefreshLock } from './refresh-lock.ts'
 
 /** 单次续期的预算：慢请求不能把整轮堵死。 */
 const REFRESH_TIMEOUT_MS = 30_000
 
 /** 距过期不足这么久就续（与服务端插件保持一致）。 */
 const REFRESH_SKEW_MS = 30 * 60 * 1000
+
+/**
+ * `STS5.1806` 连续撞上几次才判死（与 `auth.ts` 的 `REFRESH_USED_MAX_STREAK` 对齐）。
+ *
+ * 这个码只说明「这个 refresh_token 已经被用掉了」，最常见的原因是插件刚刚先刷了
+ * 一次。磁盘上若已经有新令牌，重读就行；磁盘还没更新（对方正在写）时也会撞上，
+ * 那更不能判死 —— 下一轮就恢复正常了。
+ */
+const USED_MAX_STREAK = 3
+
+/** 睡眠看门狗的检查间隔：机器醒过来最多 30 秒就会补跑一轮。 */
+const SLEEP_WATCHDOG_MS = 30_000
+
+/** 超过一个 tick 周期再多这么久还没跑，就认为是睡过去了（给慢机器留余量）。 */
+const SLEEP_GAP_GRACE_MS = 5 * 60 * 1000
 
 function parseHomeArg(argv: readonly string[]): string | undefined {
   const at = argv.indexOf('--home')
@@ -84,6 +100,10 @@ function alreadyRunning(): number | undefined {
  * 凭证，守护进程必须看见这些变化，否则会把一份过期的内存快照写回去，把刚登录的
  * 号覆盖掉。
  */
+
+/** 每个账号连续撞上「令牌已被用掉」的次数；成功续上一次就清零。 */
+const usedStreak = new Map<string, number>()
+
 async function tick(state: CodeArtsKeeperState): Promise<void> {
   const accountsPath = codeartsAccountsPath(home)
   const doc = await readAccountDocument(accountsPath)
@@ -112,8 +132,16 @@ async function tick(state: CodeArtsKeeperState): Promise<void> {
     if (exp - Date.now() >= REFRESH_SKEW_MS) continue
 
     checked += 1
-    try {
-      const next = await refreshToken(defaultLoginConfig(), {
+    // 上面已确认三样续期材料都在，收窄类型给闭包用。
+    const refreshTokenValue = cred.refreshToken
+    const clientIdValue = cred.clientId
+    const dpopPrivateKeyValue = cred.dpopPrivateKey
+    if (refreshTokenValue === undefined || clientIdValue === undefined || dpopPrivateKeyValue === undefined) continue
+    // 和插件抢同一把锁：refresh_token 一次性，两边同时刷必有一方拿到已作废的值。
+    // 拿不到锁说明插件正在刷，这一轮跳过就好 —— 它写回之后下一轮我们能读到新令牌。
+    const locked = await withRefreshLock(
+      refreshLockPath(dirname(accountsPath)),
+      () => refreshToken(defaultLoginConfig(), {
         userId: cred.userId ?? '',
         userName: cred.userName ?? '',
         domainId: '',
@@ -121,10 +149,16 @@ async function tick(state: CodeArtsKeeperState): Promise<void> {
         accessKeyId: cred.accessKeyId ?? '',
         secretAccessKey: cred.secretAccessKey ?? '',
         expiration: cred.expiration ?? '',
-        refreshToken: cred.refreshToken,
-        clientId: cred.clientId,
-        dpopPrivateKey: cred.dpopPrivateKey,
-      })
+        refreshToken: refreshTokenValue,
+        clientId: clientIdValue,
+        dpopPrivateKey: dpopPrivateKeyValue,
+      }),
+      { onBusy: () => log(`refresh SKIPPED ${id.slice(0, 12)} (plugin holds the refresh lock)`) },
+    )
+    if (locked === undefined) continue
+    try {
+      const next = locked
+      usedStreak.delete(id)
       doc.accounts[id] = {
         ...cred,
         token: next.securityToken,
@@ -144,17 +178,26 @@ async function tick(state: CodeArtsKeeperState): Promise<void> {
       // refresh token 一次性：插件那边先刷了，我们手里的就是「已用掉」。重读一次
       // 文档看有没有更新的令牌；有就留到下一轮，别把刚写好的新令牌判死。
       const used = error instanceof OAuthTokenError && error.refreshTokenUsed
+      let markStale = false
       if (used) {
         const fresh = await readAccountDocument(accountsPath)
         const advanced = fresh !== undefined && fresh.accounts[id]?.refreshToken !== undefined
           && fresh.accounts[id]?.refreshToken !== cred.refreshToken
-        log(`refresh SKIPPED ${id.slice(0, 12)} (refresh token already used${advanced ? ', newer token on disk' : ''})`)
-        if (advanced) continue
+        const streak = (usedStreak.get(id) ?? 0) + 1
+        usedStreak.set(id, streak)
+        // 早先这里「磁盘没有更新的令牌」就直接判死，正是 2026-11-18 00:06 两个账号
+        // 同时失效的直接原因：插件正在刷、还没写回磁盘的那一小会儿，守护进程读到的
+        // 还是旧令牌，于是把两个号一起标成了需要重新登录。现在只有连续撞满
+        // USED_MAX_STREAK 轮才认账。
+        markStale = !advanced && streak >= USED_MAX_STREAK
+        log(`refresh SKIPPED ${id.slice(0, 12)} (refresh token already used${advanced ? ', newer token on disk' : ''}, streak ${streak}/${USED_MAX_STREAK})`)
+      } else {
+        usedStreak.delete(id)
+        // 只有 invalid_grant 这一类才把号判死。网络/超时/5xx/429 留到下一轮（20 分钟）
+        // 再试 —— 任何失败就写 stale 会让一次网络抖动变成「必须重新登录」（issue #8）。
+        markStale = error instanceof OAuthTokenError && error.permanent
       }
-      // 只有 invalid_grant 这一类才把号判死。网络/超时/5xx/429 留到下一轮（20 分钟）
-      // 再试 —— 任何失败就写 stale 会让一次网络抖动变成「必须重新登录」（issue #8）。
-      const permanent = !used && error instanceof OAuthTokenError && error.permanent
-      if (permanent) {
+      if (markStale) {
         doc.accounts[id] = { ...cred, stale: true }
         dirty = true
         needsLogin.push(id)
@@ -162,7 +205,7 @@ async function tick(state: CodeArtsKeeperState): Promise<void> {
       const reason = error instanceof OAuthTokenError
         ? `HTTP ${error.status} ${error.body.slice(0, 200)}`
         : error instanceof Error ? error.message : String(error)
-      log(`refresh FAILED ${id.slice(0, 12)} (${permanent ? 'permanent, marked stale' : 'transient, retry next pass'}): ${reason}`)
+      log(`refresh FAILED ${id.slice(0, 12)} (${markStale ? 'permanent, marked stale' : 'transient, retry next pass'}): ${reason}`)
     }
   }
 
@@ -286,6 +329,7 @@ async function main(): Promise<void> {
 
   // 立刻跑一轮：DSH 刚启动时凭证可能已经过期，等 20 分钟才刷就白等了。
   let timer: ReturnType<typeof setTimeout> | undefined
+  let lastPassAt = 0
   const loop = async (): Promise<void> => {
     if (stopped) return
     if (stopRequested(home)) {
@@ -297,11 +341,31 @@ async function main(): Promise<void> {
     } catch (error: unknown) {
       log(`pass failed: ${error instanceof Error ? error.message : String(error)}`)
     }
-    state.heartbeatAt = Date.now()
+    lastPassAt = Date.now()
+    state.heartbeatAt = lastPassAt
     writeKeeperState(state, home)
     if (stopped) return
     timer = setTimeout(() => void loop(), KEEPER_TICK_MS)
   }
+
+  /**
+   * 睡眠/休眠补偿：setTimeout 只保证「不早于」，机器睡过去的那段时间它是停摆的。
+   *
+   * 2026-11-18 的现场：守护进程 pid 全程活着，日志却在 06:46–08:06 之间缺了 4 轮
+   * tick —— 机器睡了，定时器跟着停。而插件那边看到心跳文件在、pid 也活，就按
+   * `keeperRunning()` 让路，于是两边一起不刷，等醒过来凭证已经过期。
+   *
+   * 这里每 30 秒对一次表：超过一个 tick 周期没跑过一轮就立刻补一轮。补跑会重排
+   * 定时器，所以睡醒后不会连撞两次。
+   */
+  setInterval(() => {
+    if (stopped || timer === undefined) return
+    if (Date.now() - lastPassAt < KEEPER_TICK_MS + SLEEP_GAP_GRACE_MS) return
+    clearTimeout(timer)
+    log(`wake-from-sleep: no pass for ${Math.round((Date.now() - lastPassAt) / 1000)}s, running one now`)
+    void loop()
+  }, SLEEP_WATCHDOG_MS)
+
   void loop()
 }
 

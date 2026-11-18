@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawn } from 'node:child_process'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   KEEPER_STALE_MS,
@@ -103,6 +104,21 @@ describe('keeperStats', () => {
     expect(pidAlive(0)).toBe(false)
     expect(pidAlive(-1)).toBe(false)
     expect(pidAlive(process.pid)).toBe(true)
+  })
+
+  // Windows 上 `process.kill(pid, 0)` 会 TerminateProcess 真的把进程杀掉；这个探活的
+  // 调用方是 keeperStats()，用错实现就是「每查一次状态杀一次守护进程」。
+  it('probes a live pid without killing it', async () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'], { stdio: 'ignore' })
+    try {
+      await new Promise(resolve => child.once('spawn', resolve))
+      expect(pidAlive(child.pid as number)).toBe(true)
+      // 探活之后它必须还活着。
+      expect(child.exitCode).toBeNull()
+      expect(pidAlive(child.pid as number)).toBe(true)
+    } finally {
+      child.kill()
+    }
   })
 })
 

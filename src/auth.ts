@@ -14,6 +14,7 @@ import { mkdir, readFile, writeFile, chmod, rename, unlink } from 'node:fs/promi
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { refreshToken, defaultLoginConfig, OAuthTokenError, type OAuthToken } from './oauth.ts'
+import { refreshLockPath, withRefreshLock } from './refresh-lock.ts'
 import type { CallerIdentity } from './upstream.ts'
 
 /** 福利领取的上限；失败无所谓，卡住登录才是问题。 */
@@ -196,6 +197,15 @@ const REFRESH_RETRY_BASE_MS = 250
  * 一次性 refresh_token 反复烧掉，把「暂时失败」放大成「真的失效」。
  */
 const REFRESH_TRANSIENT_BLOCK_MS = 60_000
+/**
+ * `STS5.1806`（refresh_token 已被用掉）连续撞上几次才判死。
+ *
+ * 这个码本身**不能**证明凭证坏了：另一个写入方（守护进程）恰好先用掉了同一个令牌，
+ * 撞上的这一方手里拿的就是旧值。绝大多数情况下下一轮重读磁盘就能拿到新令牌。
+ * 连续 3 次、每次之间隔一个瞬时冷却还都是这个结果，才算真的没救了 ——
+ * 早先一次就判死，2026-11-18 00:06 两个号同时被误杀（见 `refresh-lock.ts` 的说明）。
+ */
+const REFRESH_USED_MAX_STREAK = 3
 
 /** 失败是不是「凭证真的没了」；只有这一类才允许写 `stale`。 */
 function isPermanentRefreshFailure(error: unknown): boolean {
@@ -541,19 +551,25 @@ class AccountSlot {
   // `node --experimental-strip-types` 直接跑源码，那个模式不支持参数属性。
   private readonly persist: (cred: CodeArtsCredential) => Promise<void>
   private readonly log?: (message: string) => void
+  /** 跨进程续期锁的路径（由 store 注入；单凭证时代用默认目录）。 */
+  private readonly lockPath: string
   /** 瞬时失败后的冷却：这之前不再拿 refresh_token 去撞上游。 */
   private _refreshBlockedUntil = 0
   /** 最近一次续期失败的类型，供 store 判断要不要「重读磁盘再试一次」。 */
   private _lastFailure: 'used' | 'permanent' | 'transient' | undefined
+  /** `STS5.1806` 连续撞了几次（成功一次就清零）；见 `REFRESH_USED_MAX_STREAK`。 */
+  private _usedStreak = 0
 
   constructor(
     cred: CodeArtsCredential,
     persist: (cred: CodeArtsCredential) => Promise<void>,
     log?: (message: string) => void,
+    lockPath?: string,
   ) {
     this._cred = cred
     this.persist = persist
     this.log = log
+    this.lockPath = lockPath ?? refreshLockPath(dirname(codeartsAccountsPath()))
   }
 
   get credential(): CodeArtsCredential {
@@ -563,6 +579,18 @@ class AccountSlot {
   /** 最近一次续期失败的类型（只在失败后读；下一次成功会清空）。 */
   get lastFailure(): 'used' | 'permanent' | 'transient' | undefined {
     return this._lastFailure
+  }
+
+  /**
+   * 这一份凭证是不是真的完了。
+   *
+   * `_lastFailure === 'used'` 只代表「这一趟撞上了已用过的令牌」，还要看连续撞了几次：
+   * 一两次是并发轮换的正常现象，重读磁盘就能恢复。
+   */
+  get exhausted(): boolean {
+    if (this._cred.stale === true) return true
+    if (this._lastFailure === 'permanent') return true
+    return this._lastFailure === 'used' && this._usedStreak >= REFRESH_USED_MAX_STREAK
   }
 
   /** 把这份凭证标成 stale 并落库（store 在「令牌被别人用掉且磁盘也没有更新」时调）。 */
@@ -621,23 +649,64 @@ class AccountSlot {
    */
   async verifyStale(): Promise<boolean> {
     const cred = this._cred
-    if (cred.stale !== true) return true
+    if (this._cred.stale === true) {
+      // 1.3.0 及以前任何一次续期失败（含网络抖动）都会永久落 stale；重新登录时会直接
+      // 换掉整个槽位，所以走到这里的 stale 基本都是误判 —— 给它一次机会。
+      // 真失效的话一轮只多一个请求，复验成功即自动复活。
+      //
+      // 直接走 refresh()，不经过 runRefresh：那把锁是跨进程的，同一进程里同步执行的
+      // 两段代码抢它会自己把自己挡住。进程内并发由 `_inflight` 单飞负责。
+      if (!cred.refreshToken || !cred.dpopPrivateKey || !cred.clientId) return false
+      if (Date.now() < this._refreshBlockedUntil) return false
+      const outcome = await this.refresh(cred, {
+        refreshToken: cred.refreshToken,
+        dpopPrivateKey: cred.dpopPrivateKey as NonNullable<CodeArtsCredential['dpopPrivateKey']>,
+        clientId: cred.clientId,
+      })
+      if (outcome.ok) this._cred = outcome.cred
+      return outcome.ok
+    }
     if (!cred.refreshToken || !cred.dpopPrivateKey || !cred.clientId) return false
     if (Date.now() < this._refreshBlockedUntil) return false
-    const outcome = await this.runRefresh(cred)
+    const outcome = await this.refresh(cred, {
+      refreshToken: cred.refreshToken,
+      dpopPrivateKey: cred.dpopPrivateKey as NonNullable<CodeArtsCredential['dpopPrivateKey']>,
+      clientId: cred.clientId,
+    })
+    if (outcome.ok) this._cred = outcome.cred
     return outcome.ok
   }
 
-  /** 单飞执行一次续期。 */
+  /**
+   * 单飞执行一次续期，**并在跨进程文件锁里做**。
+   *
+   * 单飞只挡得住同一进程内的并发；守护进程（`keeper-main.ts`）是另一个进程，
+   * 它和我们各持一份同一个账号的 refresh_token，同时刷必然有一方撞上 `STS5.1806`。
+   * 锁保证「同一时刻只有一个进程拿 refresh_token 去撞上游」。拿不到锁（对方正在刷）
+   * 就当这一轮没轮到我们：不写 stale，只冷却一会儿等下一轮重读磁盘拿它写回的新令牌。
+   */
   private async runRefresh(cred: CodeArtsCredential): Promise<RefreshOutcome> {
-    const inflight = this._inflight ??= this.refresh(cred, {
-      refreshToken: cred.refreshToken ?? '',
-      dpopPrivateKey: cred.dpopPrivateKey as NonNullable<CodeArtsCredential['dpopPrivateKey']>,
-      clientId: cred.clientId ?? '',
-    }).finally(() => {
+    const inflight = this._inflight ??= this.refreshLocked(cred).finally(() => {
       this._inflight = undefined
     })
     return inflight
+  }
+
+  private async refreshLocked(cred: CodeArtsCredential): Promise<RefreshOutcome> {
+    const outcome = await withRefreshLock(this.lockPath, () => this.refresh(cred, {
+      refreshToken: cred.refreshToken ?? '',
+      dpopPrivateKey: cred.dpopPrivateKey as NonNullable<CodeArtsCredential['dpopPrivateKey']>,
+      clientId: cred.clientId ?? '',
+    }), {
+      onBusy: () => {
+        this._refreshBlockedUntil = Date.now() + REFRESH_TRANSIENT_BLOCK_MS
+        this.log?.(`[dsh-codearts] refresh ${cred.label ?? 'account'} skipped: another process holds the refresh lock, will reload from disk`)
+      },
+    })
+    if (outcome !== undefined) return outcome
+    // 没拿到锁 ≠ 凭证坏了。只冷却，别落 stale、别写盘。
+    this._refreshBlockedUntil = Date.now() + REFRESH_TRANSIENT_BLOCK_MS
+    return { ok: false, cred: this._cred, permanent: false, reason: 'refresh lock busy' }
   }
 
   private async refresh(cred: CodeArtsCredential, mat: RefreshMaterials): Promise<RefreshOutcome> {
@@ -663,6 +732,7 @@ class AccountSlot {
         const next = credentialFromOAuth(refreshed, cred.label)
         this._refreshBlockedUntil = 0
         this._lastFailure = undefined
+        this._usedStreak = 0
         if (!stillCurrent()) return { ok: true, cred: next }
         await this.persist(next)
         this._cred = next
@@ -670,7 +740,10 @@ class AccountSlot {
         return { ok: true, cred: next }
       } catch (error: unknown) {
         lastError = error
-        if (isPermanentRefreshFailure(error)) break
+        // `STS5.1806`（令牌已被别处用掉）也属于「再试同一个令牌毫无意义」：
+        // 一次性令牌用掉就用掉了，同一个值重试只会再撞一次。直接出循环，
+        // 由下面按 used 处理 —— 交给 store 重读磁盘拿新令牌。
+        if (isPermanentRefreshFailure(error) || isRefreshTokenUsed(error)) break
         this.log?.(`[dsh-codearts] refresh ${cred.label ?? 'account'} attempt ${attempt}/${REFRESH_MAX_ATTEMPTS} failed (transient): ${describeRefreshFailure(error)}`)
         if (attempt < REFRESH_MAX_ATTEMPTS) {
           await sleep(REFRESH_RETRY_BASE_MS * (2 ** (attempt - 1)))
@@ -683,8 +756,17 @@ class AccountSlot {
     if (used) {
       // 令牌被另一个写入方（守护进程）用掉：不能落 stale、更不能把这份旧凭证写回去
       // —— 那会把对方刚拿到的 refresh_token 覆盖掉。留给 store 重读磁盘再试。
+      // 连续撞满 REFRESH_USED_MAX_STREAK 次才认账（见 `exhausted`）。
+      this._usedStreak += 1
       this._lastFailure = 'used'
-    } else if (permanent) {
+      this._refreshBlockedUntil = Date.now() + REFRESH_TRANSIENT_BLOCK_MS
+      this.log?.(`[dsh-codearts] refresh ${cred.label ?? 'account'} hit a used refresh token (${this._usedStreak}/${REFRESH_USED_MAX_STREAK}), reloading from disk`)
+      if (!stillCurrent()) return { ok: false, cred: this._cred, permanent: false, reason }
+      this._cred = cred
+      return { ok: false, cred, permanent: false, reason }
+    }
+    this._usedStreak = 0
+    if (permanent) {
       // 只有 invalid_grant 这一类才把账号判死：落 stale 让卡片提示重新登录。
       this._lastFailure = 'permanent'
       cred.stale = true
@@ -749,6 +831,17 @@ export class CodeArtsAccountStore {
     this.log = options.log
   }
 
+  /**
+   * 所有槽位共用的跨进程续期锁（与守护进程同一个文件）。
+   *
+   * 注意是**整个文档一把锁**，不是每个账号一把：`AccountSlot` 是先刷后整份写回的，
+   * 两个账号同时在刷会让后写的那次把前一个刚轮换出来的 refresh_token 覆盖掉。
+   * 一把锁的代价只是多账号时串行几秒，换来的是不可能互相踩。
+   */
+  private slotLockPath(): string {
+    return refreshLockPath(dirname(this.path))
+  }
+
   private async loaded(): Promise<void> {
     this._loading ??= this.load()
     return this._loading
@@ -775,8 +868,9 @@ export class CodeArtsAccountStore {
   private adopt(doc: CodeArtsAccountDocument): void {
     this._doc = doc
     this._slots.clear()
+    const lockPath = this.slotLockPath()
     for (const [id, cred] of Object.entries(doc.accounts)) {
-      this._slots.set(id, new AccountSlot(cred, this.persisterFor(id), this.log))
+      this._slots.set(id, new AccountSlot(cred, this.persisterFor(id), this.log, lockPath))
     }
   }
 
@@ -834,7 +928,7 @@ export class CodeArtsAccountStore {
     this._slots.get(id)?.invalidate()
     doc.accounts[id] = cred
     if (!doc.order.includes(id)) doc.order.push(id)
-    this._slots.set(id, new AccountSlot(cred, this.persisterFor(id), this.log))
+    this._slots.set(id, new AccountSlot(cred, this.persisterFor(id), this.log, this.slotLockPath()))
     await this.persistDoc()
     await claimIfPossible(cred)
     return id
@@ -882,7 +976,7 @@ export class CodeArtsAccountStore {
         ...identity.domainId === '' ? {} : { domainId: identity.domainId },
       }
       this._slots.get(id)?.invalidate()
-      this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log))
+      this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log, this.slotLockPath()))
       await this.persistDoc()
       return 'noop'
     }
@@ -901,7 +995,7 @@ export class CodeArtsAccountStore {
     this._slots.get(id)?.invalidate()
     this._slots.delete(id)
     this._slots.get(targetKey)?.invalidate()
-    this._slots.set(targetKey, new AccountSlot(doc.accounts[targetKey], this.persisterFor(targetKey), this.log))
+    this._slots.set(targetKey, new AccountSlot(doc.accounts[targetKey], this.persisterFor(targetKey), this.log, this.slotLockPath()))
     await this.persistDoc()
     return target === undefined ? 'moved' : 'merged'
   }
@@ -935,7 +1029,7 @@ export class CodeArtsAccountStore {
     doc.accounts[id] = { ...cred, paused }
     const slot = this._slots.get(id)
     slot?.invalidate()
-    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log))
+    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log, this.slotLockPath()))
     await this.persistDoc()
     return true
   }
@@ -949,7 +1043,7 @@ export class CodeArtsAccountStore {
     doc.accounts[id] = { ...cred, pinned }
     const slot = this._slots.get(id)
     slot?.invalidate()
-    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log))
+    this._slots.set(id, new AccountSlot(doc.accounts[id], this.persisterFor(id), this.log, this.slotLockPath()))
     await this.persistDoc()
     return true
   }
@@ -1001,11 +1095,11 @@ export class CodeArtsAccountStore {
       if (advanced) {
         const retry = this._slots.get(id)
         if (retry !== undefined) cred = await retry.ensureFresh()
-        if (retry?.lastFailure === 'used') {
-          await this.markStale(id)
-          cred = this._slots.get(id)?.credential ?? cred
-        }
-      } else {
+      }
+      // 连续撞满次数才判死。单次「令牌已被用掉」只是并发轮换：对方（守护进程）刚
+      // 把新令牌写进磁盘，重读一次就好了。早先这里只要磁盘没变化就判死，正是
+      // 2026-11-18 00:06 两个账号同时失效的直接原因。
+      if (this._slots.get(id)?.exhausted === true) {
         await this.markStale(id)
         cred = this._slots.get(id)?.credential ?? cred
       }
@@ -1038,7 +1132,8 @@ export class CodeArtsAccountStore {
         slot = this._slots.get(id)
         next = slot === undefined ? undefined : await slot.forceRefresh()
       }
-      if (next === undefined) await this.markStale(id)
+      // 与 resolve() 同一套判据：只有连续撞满次数才判死。
+      if (next === undefined && this._slots.get(id)?.exhausted === true) await this.markStale(id)
     }
     return next
   }

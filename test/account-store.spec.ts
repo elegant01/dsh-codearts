@@ -277,14 +277,19 @@ describe('per-account refresh', () => {
     await store.upsert(credential('uid-a', soon()))
 
     const pending = store.resolve('uid-a')
-    await tick()
+    // 等到「刷新真的发出去」再重登：`resolve` 前面还有一次异步读盘，一个 setImmediate
+    // 不等它走到刷新那一步（实测那时还没调用 refreshToken，重登反而把刷新整个替掉了）。
+    for (let i = 0; i < 200 && refreshTokenMock.mock.calls.length === 0; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    expect(refreshTokenMock).toHaveBeenCalledTimes(1)
     // 用户重新登录了：应当拿到新凭证，旧刷新不得回头盖掉它。
-    await store.upsert(credential('uid-a', { securityToken: 'brand-new', expiration: new Date(Date.now() + 24 * 3600 * 1000).toISOString() }))
+    await store.upsert(credential('uid-a', { securityToken: 'brand-new-token', expiration: new Date(Date.now() + 24 * 3600 * 1000).toISOString() }))
     release(token({ userId: 'uid-a', securityToken: 'stale-refresh' }))
     await pending
 
-    expect((await store.credential('uid-a'))?.token).toBe('brand-new')
-    expect(JSON.parse(await readFile(accountsPath, 'utf8')).accounts['uid-a'].token).toBe('brand-new')
+    expect((await store.credential('uid-a'))?.token).toBe('brand-new-token')
+    expect(JSON.parse(await readFile(accountsPath, 'utf8')).accounts['uid-a'].token).toBe('brand-new-token')
   })
 })
 
@@ -365,7 +370,9 @@ describe('refresh token rotated by another writer', () => {
     expect(JSON.parse(await readFile(accountsPath, 'utf8')).accounts['uid-b'].refreshToken).toBe('refresh-b-new')
   })
 
-  it('marks the account stale only when the disk token did not move', async () => {
+  it('keeps retrying instead of marking stale when the disk token did not move yet', async () => {
+    // 2026-11-18 00:06 的现场回归：插件正在刷、还没写回磁盘的那一小会儿，守护进程
+    // （或这边的重读）看到的是旧令牌。旧实现在这里直接判死，两个账号一起要求重新登录。
     refreshTokenMock.mockRejectedValue(new OAuthTokenError('refresh', 400, USED))
     const store = new CodeArtsAccountStore(accountsPath)
     await store.upsert(credential('uid-a', soon()))
@@ -374,8 +381,25 @@ describe('refresh token rotated by another writer', () => {
     await store.resolve('uid-a')
 
     const doc = JSON.parse(await readFile(accountsPath, 'utf8'))
-    expect(doc.accounts['uid-a'].stale).toBe(true)
-    // 没动的账号照旧。
+    expect(doc.accounts['uid-a'].stale).toBeUndefined()
     expect(doc.accounts['uid-b'].stale).toBeUndefined()
+  })
+
+  it('marks stale only after the used streak reaches the limit', async () => {
+    refreshTokenMock.mockRejectedValue(new OAuthTokenError('refresh', 400, USED))
+    const store = new CodeArtsAccountStore(accountsPath)
+    await store.upsert(credential('uid-a', soon()))
+
+    // 前两次只是冷却，第三次才认账。冷却窗口内 ensureFresh 不会再打网络，
+    // 所以这里直接反复调 forceRefresh 把连续次数推上去。
+    for (let round = 1; round <= 3; round += 1) {
+      await store.forceRefresh('uid-a')
+      const doc = JSON.parse(await readFile(accountsPath, 'utf8'))
+      if (round < 3) expect(doc.accounts['uid-a'].stale, `round ${round}`).toBeUndefined()
+      // 让冷却早点结束，模拟下一次真实调用发生在 60 秒后。
+      vi.setSystemTime(new Date(Date.now() + 61_000))
+    }
+    const doc = JSON.parse(await readFile(accountsPath, 'utf8'))
+    expect(doc.accounts['uid-a'].stale).toBe(true)
   })
 })
