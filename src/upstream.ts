@@ -27,11 +27,19 @@ const EP_CHAT = '/api/v2/chat/completions'
 // 限时福利（免费套餐）网关：领取接口（幂等）。对齐 codearts2api 的 BenefitHost/EpBenefitClaim。
 const BENEFIT_HOST = 'https://opengw.developer.huaweicloud.com'
 const EP_BENEFIT_CLAIM = '/api/v1/benefit/claim'
-// 模型清单三路来源（对齐 codearts2api 的 const.go，2026-09 逆向自官方 CodeArts Agent 客户端）。
+// 模型清单四路来源（前三路对齐 codearts2api 的 const.go，2026-09 逆向自官方
+// CodeArts Agent 客户端；第三方模型清单是 26.11 客户端新增的企业版专属来源）。
 const EP_MODEL_BUILTIN = '/v1/model/builtin'
 const EP_BENEFIT_CONFIG = '/api/v1/gateway/config'
 const EP_AGENT_LIST = '/v1/agent-center/agents/useragents'
 const EP_AGENT_DETAIL = '/v1/agent-center/agents/detail'
+/**
+ * 企业租户设置与第三方模型清单（26.11 客户端）。官方客户端先按套餐门禁
+ * （`is_credit_package && spec_code 含 enterprise`，或白名单）判断后才请求，
+ * 普通账号不会走到。见 `fetchThirdPartyModels`。
+ */
+const EP_TENANT_SETTINGS = '/v1/llm/tenant/settings'
+const EP_THIRD_PARTY_MODELS = '/v1/third-party-model/model/list'
 /**
  * 模型的思考强度清单（26.10.0 新增）。**必须带 `Agent-Type: PromptCenter`**：
  * 不带头时上游回 `TM.00001001 请求头Agent-Type为空`（实测）。
@@ -1128,7 +1136,7 @@ export async function fetchCallerIdentity(
  * 模型清单的来源。前三路是目录本身（任一路失败都不阻断，只有三路全失败才算失败），
  * `thinking` 只是目录之上的可选增强：它失败时模型照常可用，只是没有思考档位选择器。
  */
-export type ModelSource = 'builtin' | 'benefit' | 'agent' | 'thinking'
+export type ModelSource = 'builtin' | 'benefit' | 'agent' | 'thirdparty' | 'thinking'
 
 export interface ModelDiscoveryResult {
   /** 合并后的清单（已去重、已排序）。 */
@@ -1375,6 +1383,82 @@ async function fetchAgentModels(
   return out
 }
 
+/** 租户是否启用了第三方模型；读不到明确值时返回 undefined（交给调用方决定）。 */
+function thirdPartyModelsEnabled(value: unknown): boolean | undefined {
+  const body = asRecord(value)
+  for (const candidate of [
+    body.third_party_model_enabled,
+    asRecord(body.data).third_party_model_enabled,
+    asRecord(body.settings).third_party_model_enabled,
+  ]) {
+    if (candidate === true) return true
+    if (candidate === false) return false
+  }
+  return undefined
+}
+
+/**
+ * 企业租户的第三方模型清单：先 `GET /v1/llm/tenant/settings` 拿门禁，再
+ * `GET /v1/third-party-model/model/list`（分页，官方客户端一页取 100 条）。
+ *
+ * 这类模型是企业管理员注册的 MaaS 通道（企业内部专业版的主力），与 agent-center
+ * 的 `gpts.models` 同源但不完全重合：没挂到 CodeAgent 上的模型只在清单里出现。
+ *
+ * 门禁失败或未启用时返回空数组且不记 errors —— 官方客户端对普通账号根本不会
+ * 请求这两条接口，我们照做，免得每个个人账号每轮刷新都多两条噪音。只有租户明确
+ * 启用后清单仍失败，才把失败带回去（那说明企业账号的发现链路真断了）。
+ *
+ * 条目形状以 `model_parameters` 为准，也兼容参数摊平在顶层的写法（官方客户端两处
+ * 都兼容）。输出上限同样可能放在 `output_context_window`（#11）。
+ */
+async function fetchThirdPartyModels(
+  credential: CodeArtsResolved,
+  signal?: AbortSignal,
+): Promise<readonly CodeArtsModelInfo[]> {
+  const settingsResp = await signedGet(`${SNAP_HOST}${EP_TENANT_SETTINGS}`, credential, 'PromptCenter', signal)
+  if (!settingsResp.ok) return []
+  const enabled = thirdPartyModelsEnabled(parseJson(settingsResp.text))
+  if (enabled === false) return []
+
+  const listResp = await signedGet(
+    `${SNAP_HOST}${EP_THIRD_PARTY_MODELS}?page_num=1&page_size=100`,
+    credential,
+    'PromptCenter',
+    signal,
+  )
+  if (!listResp.ok) {
+    if (enabled === true) throw new Error(`third-party model list HTTP ${listResp.status} ${listResp.message}`)
+    return []
+  }
+  const body = asRecord(parseJson(listResp.text))
+  const error = body.error ?? asRecord(body.data).error
+  if (error !== undefined) {
+    if (enabled === true) throw new Error(`third-party model list error: ${JSON.stringify(error).slice(0, 200)}`)
+    return []
+  }
+  const out: CodeArtsModelInfo[] = []
+  for (const raw of asArray(body.list ?? asRecord(body.data).list)) {
+    const item = asRecord(raw)
+    const params = asRecord(item.model_parameters)
+    const flat = Object.keys(params).length > 0 ? params : item
+    if (item.enable === false || item.display_enabled === false) continue
+    const id = firstString(flat.model_id, item.model_id, item.model_alias, flat.service_name, flat.third_party_model)
+    if (id === '') continue
+    const ratio = creditRatioOf(item) ?? creditRatioOf(flat)
+    const contextWindow = positive(flat.context_window)
+    out.push({
+      id,
+      name: firstString(item.model_name, item.model_alias, flat.model_name, id),
+      contextWindow,
+      ...(contextWindow > 0 ? { contextWindowKnown: true } : {}),
+      maxTokens: positive(flat.max_tokens) || positive(flat.output_context_window),
+      supportsImages: item.supports_images === true || flat.supports_images === true,
+      ...(ratio === undefined ? {} : { ratio }),
+    })
+  }
+  return out
+}
+
 /**
  * 思考强度清单：`POST /v1/model/thinking-variants`，body `{ model_names }`。
  *
@@ -1531,10 +1615,11 @@ export async function clearQueueStatus(
 }
 
 /**
- * 动态发现当前账号可用的模型清单（三路合并）。
+ * 动态发现当前账号可用的模型清单（四路合并）。
  *
- * 与 codearts2api 的 `Client.FetchModels` 等价：内置、限时福利、agent-center 三路
- * 各自独立，任一路失败只记进 `errors` 不阻断 —— 福利网关抖动时仍能拿到内置模型。
+ * 内置、限时福利、agent-center、企业第三方模型四路各自独立，任一路失败只记进
+ * `errors` 不阻断 —— 福利网关抖动时仍能拿到内置模型。第三方模型那一路有门禁：
+ * 租户未启用时返回空且不算来源（见 `fetchThirdPartyModels`）。
  *
  * 上标的两个「实测 vs 标称」处理（很重要，别照搬标称值）：
  *  - **maxTokens 钳到该模型的实测上限**（`MEASURED_MAX_TOKENS`）。上游
@@ -1545,7 +1630,7 @@ export async function clearQueueStatus(
  *    用户配置的按模型覆盖值与进程内学到的真实上界在这里压过发现值（issue #9）。
  *
  * @param contextWindowOverrides 按模型 id 覆盖 contextWindow（大小写不敏感）
- * @throws 三路全失败，或合并结果为空。
+ * @throws 所有来源全失败，或合并结果为空。
  */
 export async function fetchModels(
   credential: CodeArtsResolved,
@@ -1565,6 +1650,10 @@ export async function fetchModels(
       models => ({ source: 'agent' as const, models }),
       error => ({ source: 'agent' as const, error: error as Error }),
     ),
+    fetchThirdPartyModels(credential, signal).then(
+      models => ({ source: 'thirdparty' as const, models }),
+      error => ({ source: 'thirdparty' as const, error: error as Error }),
+    ),
   ])
 
   const sources: ModelSource[] = []
@@ -1572,6 +1661,8 @@ export async function fetchModels(
   const discovered: (readonly CodeArtsModelInfo[])[] = []
   for (const item of settled) {
     if ('error' in item) errors.push({ source: item.source, message: item.error.message })
+    // 第三方模型的门禁未通过（普通账号/未启用）：空清单不算一个来源。
+    else if (item.source === 'thirdparty' && item.models.length === 0) continue
     else {
       sources.push(item.source)
       discovered.push(item.models)

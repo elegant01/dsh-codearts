@@ -520,6 +520,90 @@ describe('fetchModels', () => {
     expect(byId.get('ae0fa0ec00000000000000000000abcd')?.maxTokens).toBe(65_536)
   })
 
+  // 企业租户（#11 那类用户）的第三方模型清单：先租户设置门禁，再拉清单。
+  it('merges the third-party model list when the tenant enables it', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/llm/tenant/settings': () => json(JSON.stringify({ third_party_model_enabled: true })),
+      '/v1/third-party-model/model/list': () =>
+        json(
+          JSON.stringify({
+            total: 2,
+            list: [
+              {
+                // 官方清单的常见形状：参数挂在 model_parameters 下。
+                model_name: 'kimi-k2.6-256k-企业自定义模型',
+                model_parameters: {
+                  model_id: '6237543e00000000000000000000abcd',
+                  context_window: 216_000,
+                  input_context_window: 200_000,
+                  output_context_window: 16_000,
+                  max_tokens: 0,
+                },
+              },
+              {
+                // 也兼容参数摊平在顶层，且缺 context_window 时靠参数表兜底。
+                model_id: 'flat-model',
+                model_name: 'flat-model',
+                max_tokens: 4_000,
+              },
+            ],
+          }),
+        ),
+      '/v1/model/thinking-variants': () => json('{"variants":{}}'),
+    })
+
+    const result = await fetchModels(credential)
+    expect(result.sources).toContain('thirdparty')
+    const byId = new Map(result.models.map(m => [m.id, m]))
+    expect(byId.get('6237543e00000000000000000000abcd')?.maxTokens).toBe(16_000)
+    expect(byId.get('6237543e00000000000000000000abcd')?.contextWindow).toBe(216_000)
+    expect(byId.get('6237543e00000000000000000000abcd')?.contextWindowKnown).toBe(true)
+    expect(byId.get('flat-model')?.maxTokens).toBe(4_000)
+  })
+
+  it('skips the third-party model list for tenants that do not enable it', async () => {
+    const calls: string[] = []
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/llm/tenant/settings': () => json(JSON.stringify({ third_party_model_enabled: false })),
+      '/v1/third-party-model/model/list': () => {
+        calls.push('list')
+        return json(JSON.stringify({ total: 0, list: [] }))
+      },
+      '/v1/model/thinking-variants': () => json('{"variants":{}}'),
+    })
+
+    const result = await fetchModels(credential)
+    expect(calls).toEqual([])
+    // 普通账号这两条接口本来就不该出现，不能算来源、也不能记错误。
+    expect(result.sources).not.toContain('thirdparty')
+    expect(result.errors).toEqual([])
+  })
+
+  it('keeps discovering other sources when an enabled tenant list fails', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/llm/tenant/settings': () => json(JSON.stringify({ third_party_model_enabled: true })),
+      '/v1/third-party-model/model/list': () => new Response('boom', { status: 500 }),
+      '/v1/model/thinking-variants': () => json('{"variants":{}}'),
+    })
+
+    const result = await fetchModels(credential)
+    expect(result.sources).toEqual(expect.arrayContaining(['builtin', 'benefit', 'agent']))
+    expect(result.errors.some(e => e.source === 'thirdparty')).toBe(true)
+    expect(result.models.some(m => m.id === 'GLM-5.2')).toBe(true)
+  })
+
   // issue #9：目录给的 1M 是标称值，免费档实际窗口小得多。用户配置必须能压过发现值，
   // 且 id 大小写不敏感 —— 上游注册名是大小写混排的，用户不会照着抄。
   it('applies per-model contextWindow overrides over the discovered value', async () => {
