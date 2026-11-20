@@ -127,6 +127,15 @@ export interface Config {
    * 进程内按实测学到的上界仍会在此基础上继续往下钳。
    */
   contextWindowOverrides?: Record<string, number>
+  /**
+   * 宿主的请求重试预算（issue #14）。
+   *
+   * 账号撞上软限流/5xx 会被冷却 30s，期间所有请求回 429 交给宿主重试。宿主的
+   * 默认预算（5 次指数退避 ≈15.5s）跨不过前段 30s 窗口，会变成可见的轮次失败；
+   * 插件默认已对齐到 8 次（≈45.5s），这里允许按需调整。值在注册 provider 时被
+   * 宿主快照，改了要重载插件才生效。
+   */
+  retryPolicy?: { maxRetries?: number; initialDelayMs?: number; maxDelayMs?: number }
   /** 对话输入框下方那行「积分 N」是否显示。缺省 = 显示（老配置不改行为）。 */
   showCreditDock?: boolean
   /** 等上游开流时那行「排队第 N 位」是否显示。缺省 = 显示。 */
@@ -201,6 +210,11 @@ function unwrapConfig(value: unknown): Config {
 export const Config: z<Config> = z.object({
   enabledModels: z.array(z.string()).description('Model ids offered in the model pickers (empty means every model)').volatile(),
   contextWindowOverrides: z.dict(z.natural()).description('Per-model contextWindow overrides (model id → tokens). Discovery reports the nominal server window, which the free tier may not actually serve (issue #9); an override wins over it, and the in-process learned upper bound still clamps it.').volatile(),
+  retryPolicy: z.object({
+    maxRetries: z.natural(),
+    initialDelayMs: z.natural(),
+    maxDelayMs: z.natural(),
+  }).description('Host retry budget for this provider (issue #14). Defaults to 8 retries (≈45.5s of backoff) so it outlasts the 30s account cooldown; changes apply after the plugin reloads.').volatile(),
   showCreditDock: z.boolean().default(true).description('Show the remaining-credits line under the chat input box').volatile(),
   showQueueDock: z.boolean().default(true).description('Show the upstream queue position under the chat input box').volatile(),
   showSidebarPanel: z.boolean().default(false).description('Show a CodeArts icon in the DSH sidebar icon column, opening this page in the middle column').volatile(),
@@ -927,6 +941,7 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
         shim,
         catalog,
         enabledModels,
+        retryPolicy: current().retryPolicy,
         resolveAttachments: () => ctx.get('attachments'),
       })
 

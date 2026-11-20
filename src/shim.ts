@@ -140,7 +140,8 @@ function writeOpenAIError(res: ServerResponse, status: number, kind: string, mes
  * 种还把真因（比如 billion-context 本地拒签的 403）整个吞掉（issue #1）。
  *
  * 全部被禁用时回 401（宿主只自动重试 429，401 一次就把「去重新登录」说清）；
- * 只要还有会自己恢复的（冷却/槽位满）就回 429，宿主重试有概率直接救回来。
+ * 只要还有会自己恢复的（冷却/槽位满）就回 429，让宿主重试接住。默认重试预算
+ * 已对齐 30s 冷却窗（8 次指数退避 ≈45.5s，见 `adapter.ts`），冷却前段也跨得过。
  */
 function noAccountError(
   accounts: readonly AccountRuntime[],
@@ -338,9 +339,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
   /**
    * 本地槽位满时的等待预算。
    *
-   * 以前「本地 2 个槽位都占着」立刻回 429「没有可用账号」，而 DSH 的 llm-retry 对
-   * soft_rate 只有 5 次 / 最长 10s 间隔，熬不过一段流式响应 ⇒ 并发派发（一次 5 个
-   * subagent）必然有请求整轮失败（issue #8）。改成先等槽位释放，等不到再报错。
+   * 以前「本地 2 个槽位都占着」立刻回 429「没有可用账号」，而 DSH 的 llm-retry
+   * 预算有限、熬不过一段并发流式响应 ⇒ 并发派发（一次 5 个 subagent）必然有请求
+   * 整轮失败（issue #8）。改成先等槽位释放，等不到再报错。
    * 30 秒上限：pi-ai 的 90 秒 idle 超时还没有开始计时（我们连响应头都没发）。
    */
   const LOCAL_SLOT_WAIT_MS = 30_000

@@ -19,7 +19,7 @@ import { createProvider } from '@earendil-works/pi-ai'
 import type { Api, Model, Provider, ThinkingLevelMap } from '@earendil-works/pi-ai'
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy'
 import { resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
-import type { LlmModelInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm'
+import type { LlmModelInfo, LlmResolvedModelInfo, ResolvedNormalRetryPolicy, RetryPolicyConfig } from '@deepseek-ai/dsh-llm'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
@@ -34,10 +34,57 @@ export const CODEARTS_PROVIDER = 'codearts'
  *
  * 90s 而不是常见的 300s：华为免费推理后端实测会流中途停摆（吐几个 token 后
  * 长时间静默），300s 意味着用户要在"等待"里干等 5 分钟才进入自动重试。
- * 90s 足够容忍首 token 冷启动与推理间隙，又能让 DSH 的重试策略
- * （maxRetries=5, TIMEOUT 可重试）更快接管。
+ * 90s 足够容忍首 token 冷启动与推理间隙，又能让 DSH 的重试策略（TIMEOUT
+ * 可重试）更快接管。
  */
 export const CODEARTS_STREAM_IDLE_TIMEOUT_MS = 90_000
+
+/**
+ * 重试预算：必须跨得过插件自己的账号冷却窗（issue #14）。
+ *
+ * 软限流 / 5xx 会把账号冷却 30s（`shim.ts` 的 `SERVER_COOLDOWN_MS`），期间所有
+ * 请求回 429 `soft_rate` 交给宿主重试。宿主默认预算是 5 次、0.5s 起指数退避
+ * （累计 ≈15.5s）—— 在冷却窗**前段**撞上时，预算必定先烧尽，变成一次可见的轮次
+ * 失败。默认次数因此对齐到 8 次（0.5+1+2+4+8+10+10+10 ≈45.5s，含 0.9 抖动下限
+ * 也稳过 30s），并且可以通过插件配置 `retryPolicy` 自己调。
+ *
+ * 代价：持续性故障（等完再被拒、贯穿整个预算）的暴露时间从 ≈15.5s 变 ≈45.5s。
+ * 实测这种型态很少见，而「等完即放行」是常态，所以默认选跨得过窗口这边。
+ */
+export const DEFAULT_CODEARTS_MAX_RETRIES = 8
+const DEFAULT_CODEARTS_INITIAL_DELAY_MS = 500
+const DEFAULT_CODEARTS_MAX_DELAY_MS = 10_000
+
+/** 用户在 `llm-codearts.config.retryPolicy` 里可调的三个旋钮。 */
+export interface CodeArtsRetryPolicyConfig {
+  /** 首次请求之后最多重试几次（默认 8，覆盖 30s 冷却窗）。 */
+  maxRetries?: number
+  /** 首档退避毫秒数（默认 500）。 */
+  initialDelayMs?: number
+  /** 单档退避上限毫秒数（默认 10000）。 */
+  maxDelayMs?: number
+}
+
+/** 只认有限正整数；非法值忽略而不是抛错（值来自用户写的配置文件）。 */
+function positiveInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
+}
+
+/** 把插件配置解析成宿主快照用的重试策略；缺省值按上面注释对齐冷却窗。 */
+export function resolveCodeArtsRetryPolicy(config?: CodeArtsRetryPolicyConfig): ResolvedNormalRetryPolicy {
+  const resolved: RetryPolicyConfig = {
+    mode: 'normal',
+    maxRetries: positiveInt(config?.maxRetries) ?? DEFAULT_CODEARTS_MAX_RETRIES,
+    backoff: {
+      initialDelayMs: positiveInt(config?.initialDelayMs) ?? DEFAULT_CODEARTS_INITIAL_DELAY_MS,
+      maxDelayMs: positiveInt(config?.maxDelayMs) ?? DEFAULT_CODEARTS_MAX_DELAY_MS,
+    },
+  }
+  const policy = resolveRetryPolicy(resolved, 'dsh-codearts retryPolicy')
+  // 这里构造的永远是 normal；收窄类型，调用方不必各自判别。
+  if (policy.mode !== 'normal') throw new Error('dsh-codearts retry policy must be normal')
+  return policy
+}
 
 /** No per-token pricing is knowable for a subscription quota; report zero. */
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
@@ -76,6 +123,8 @@ export interface CodeArtsAdapterOptions {
   shim: CodeArtsShim
   catalog: CodeArtsCatalog
   enabledModels?: () => readonly string[] | undefined
+  /** issue #14 的 `retryPolicy` 配置；缺省按默认预算（8 次）注册。 */
+  retryPolicy?: CodeArtsRetryPolicyConfig
   resolveAttachments?: () => AttachmentStore | undefined
 }
 
@@ -157,7 +206,8 @@ export function createCodeArtsAdapter(options: CodeArtsAdapterOptions): CodeArts
     provider: CODEARTS_PROVIDER,
     displayName: 'CodeArts',
     streamIdleTimeoutMs: CODEARTS_STREAM_IDLE_TIMEOUT_MS,
-    retryPolicy: resolveRetryPolicy(undefined, 'dsh-codearts retryPolicy'),
+    // 宿主在注册时快照策略，改配置需要重载插件（不能热切）。
+    retryPolicy: resolveCodeArtsRetryPolicy(options.retryPolicy),
     configuredMaxTokens: new Map(),
     modelErrors: new Map<string, string>(),
     ...REQUEST_IMAGE_BUDGETS,
