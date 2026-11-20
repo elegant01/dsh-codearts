@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   backfillParams,
   benefitBlockedModels,
+  carryKnownWindows,
   clearBenefitBlocked,
   clearModelUnavailable,
   CodeArtsCatalog,
@@ -103,6 +104,54 @@ describe('mergeModelLists', () => {
       [model('kimi-k3', { contextWindow: 32_768 })],
     ])
     expect(merged[0]?.contextWindowKnown).toBeUndefined()
+  })
+})
+
+// issue #12：某一路瞬时失败时，同一模型会由别的路「成功但不完整」地返回，
+// 兜底 32768 把上一轮确认过的好窗口抹掉，且一直错到下一轮完整发现。
+describe('carryKnownWindows', () => {
+  it('keeps the last known-good window when this round lost it', () => {
+    const previous = [model('Custom-1M', { contextWindow: 1_016_000, contextWindowKnown: true, maxTokens: 65_536 })]
+    const next = [model('Custom-1M', { contextWindow: 32_768, maxTokens: 65_536 })]
+    const carried = carryKnownWindows(previous, next)
+    expect(carried[0]?.contextWindow).toBe(1_016_000)
+    expect(carried[0]?.contextWindowKnown).toBe(true)
+  })
+
+  it('carries the nominal window too so "follow upstream" still works', () => {
+    const previous = [model('Custom-1M', {
+      contextWindow: 500_000,
+      contextWindowKnown: true,
+      contextWindowDiscovered: 1_016_000,
+    })]
+    const carried = carryKnownWindows(previous, [model('Custom-1M', { contextWindow: 32_768 })])
+    expect(carried[0]?.contextWindow).toBe(500_000)
+    expect(carried[0]?.contextWindowDiscovered).toBe(1_016_000)
+  })
+
+  it('never overrides a window this round can already trust', () => {
+    const previous = [model('GLM-5.2', { contextWindow: 128_000, contextWindowKnown: true })]
+    const next = [model('GLM-5.2', { contextWindow: 202_752, contextWindowKnown: true })]
+    expect(carryKnownWindows(previous, next)[0]?.contextWindow).toBe(202_752)
+  })
+
+  it('does not resurrect models that disappeared upstream', () => {
+    const previous = [model('retired', { contextWindow: 128_000, contextWindowKnown: true })]
+    const carried = carryKnownWindows(previous, [model('GLM-5.2', { contextWindow: 32_768 })])
+    expect(carried.map(m => m.id)).toEqual(['GLM-5.2'])
+  })
+
+  it('matches ids case-insensitively', () => {
+    const previous = [model('custom-1m', { contextWindow: 1_016_000, contextWindowKnown: true })]
+    const carried = carryKnownWindows(previous, [model('Custom-1M', { contextWindow: 32_768 })])
+    expect(carried[0]?.contextWindow).toBe(1_016_000)
+  })
+
+  it('does nothing when the previous round had no trustworthy window either', () => {
+    const previous = [model('Custom-1M', { contextWindow: 32_768 })]
+    const carried = carryKnownWindows(previous, [model('Custom-1M', { contextWindow: 32_768 })])
+    expect(carried[0]?.contextWindow).toBe(32_768)
+    expect(carried[0]?.contextWindowKnown).toBeUndefined()
   })
 })
 
@@ -747,5 +796,33 @@ describe('refreshCatalog 的显示名', () => {
     expect(byId.get('glm-5.2-sft-harmony')?.name).toBe('GLM-5.2-ArkTS-SPARK · x0.70')
     // 上游没给 credit 的保持原名，不硬编 x1.00。
     expect(byId.get('Qwen3-VL-235B')?.name).toBe('Qwen3-VL-235B')
+  })
+
+  // issue #12：第二轮某路失败，模型只会从别的路「成功但不完整」地回来（不带窗口，
+  // 由参数表补 128000）。上一轮确认过的 202752 不能就此被抹掉。
+  it('第二轮缺窗口时沿用上一轮的已知窗口', async () => {
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () => json(AGENT_DETAIL_BODY),
+      '/v1/model/thinking-variants': () => json(THINKING_BODY),
+    })
+    const catalog = new CodeArtsCatalog()
+    await refreshCatalog(oneAccountStore(), catalog)
+    expect(catalog.current().find(m => m.id === 'GLM-5.2')?.contextWindow).toBe(202_752)
+
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => new Response('nope', { status: 500 }),
+      '/v1/model/thinking-variants': () => new Response('nope', { status: 500 }),
+    })
+    const outcome = await refreshCatalog(oneAccountStore(), catalog)
+    // 这一轮仍算「成功」—— 失败的是其中一路，不是整轮。
+    expect(outcome?.anySucceeded).toBe(true)
+    const glm = catalog.current().find(m => m.id === 'GLM-5.2')
+    expect(glm?.contextWindow).toBe(202_752)
+    expect(glm?.contextWindowKnown).toBe(true)
   })
 })

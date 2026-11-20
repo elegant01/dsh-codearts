@@ -12,13 +12,14 @@
  */
 
 import {
+  carryKnownWindows,
   isBenefitModel,
+  mergeModelLists,
   modelDisplayName,
   setDiscoveredBenefitModels,
   type CodeArtsCatalog,
   type CodeArtsModelInfo,
 } from './catalog.ts'
-import { mergeModelLists } from './catalog.ts'
 import { fetchModels, type ModelSource } from './upstream.ts'
 import type { CodeArtsAccountStore } from './auth.ts'
 
@@ -111,13 +112,16 @@ export async function refreshCatalog(
 ): Promise<DiscoveryOutcome | undefined> {
   const outcome = await discoverModels(store, signal, contextWindowOverrides)
   if (!outcome.anySucceeded || outcome.models.length === 0) return outcome
+  // 「成功但不完整」的一轮不许把已知窗口降级（issue #12）：本轮没拿到可信窗口的
+  // 记录沿用上一轮同 id 的值，其余一切以本轮为准（下架的模型照常消失）。
+  const models = carryKnownWindows(catalog.current(), outcome.models)
   // 福利名单取所有成功账号的并集：漏标一次就是一次 InferHub.002002009.404。
-  setDiscoveredBenefitModels(outcome.models.filter(model => model.benefit === true).map(model => model.id))
+  setDiscoveredBenefitModels(models.filter(model => model.benefit === true).map(model => model.id))
   // 名字必须按**提交后**的福利集合来定：福利模型的 id 也可能同时出现在内置 / agent 两路里，
   // 只看单条 model.benefit 会漏标。宿主模型下拉只渲染文字，「 · x0.18 · 福利」
   // 这类尾巴就是它唯一能看见的倍率与福利标记。
   catalog.set(
-    outcome.models.map(model => {
+    models.map(model => {
       const benefit = isBenefitModel(model.id)
       return { ...model, name: modelDisplayName(model.name, benefit, model.ratio) }
     }),

@@ -367,6 +367,43 @@ function richerThan(a: CodeArtsModelInfo, b: CodeArtsModelInfo): boolean {
 }
 
 /**
+ * 提交前用上一轮目录兜住上下文窗口（issue #12）。
+ *
+ * 发现是逐路并行的：某一路（例如租户 thirdparty）瞬时失败时，同一模型仍可能由别的路
+ * 返回，但那条记录不带 `contextWindow`，`fetchModels` 于是落 32768 兜底。整份覆盖后，
+ * 已经确认过的好窗口（1M）就被抹掉了，而且一直错到下一轮完整发现。
+ *
+ * 这里只做一件事：本轮没拿到**可信窗口**的记录（`contextWindowKnown !== true`），
+ * 沿用上一轮同 id 的可信窗口。两条边界必须守住：
+ *  - 不保留上一轮多出来的模型 —— 上游下架的必须消失；
+ *  - 不覆盖本轮已可信的值（用户覆盖、实测学习、上游真给的都算）。
+ */
+export function carryKnownWindows(
+  previous: readonly CodeArtsModelInfo[],
+  next: readonly CodeArtsModelInfo[],
+): readonly CodeArtsModelInfo[] {
+  const known = new Map<string, CodeArtsModelInfo>()
+  for (const model of previous) {
+    if (model.contextWindowKnown === true && model.contextWindow > 0) {
+      known.set(model.id.trim().toLowerCase(), model)
+    }
+  }
+  if (known.size === 0) return next
+  return next.map(model => {
+    if (model.contextWindowKnown === true) return model
+    const old = known.get(model.id.trim().toLowerCase())
+    if (old === undefined) return model
+    return {
+      ...model,
+      contextWindow: old.contextWindow,
+      contextWindowKnown: true,
+      // 「改回跟随上游」要用的标称值也跟着旧记录走，不能只搬生效值。
+      ...(old.contextWindowDiscovered === undefined ? {} : { contextWindowDiscovered: old.contextWindowDiscovered }),
+    }
+  })
+}
+
+/**
  * 用参数表给**发现结果**补 0 值字段。参数表里有、上游这次没返回的模型 —— 不塞进目录。
  *
  * 为什么不能把参数表一起丢进 `mergeModelLists`：那个函数按「参数更全/大小写更像注册名」

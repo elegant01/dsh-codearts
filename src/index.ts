@@ -215,7 +215,7 @@ function settingsCompatNamespace(ctx: Context): SettingsNamespace {
   return resolveSettingsNamespaceCompat(ctx, ctx.get('settings'), CODEARTS_SETTINGS_NS)
 }
 
-export function apply(ctx: Context, rawConfig: Config): void {
+export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
   const config = unwrapConfig(rawConfig)
   const accountsPath = codeartsAccountsPath()
   /**
@@ -658,9 +658,10 @@ export function apply(ctx: Context, rawConfig: Config): void {
     void shim.close().catch(() => {})
   })
 
-  // 动态模型发现：启动后拉一次真实目录，之后每小时刷新。失败只记日志 —— 目录保留
-  // 上一次的结果，不因为上游抖动把模型选择器清空。冷启动时目录就是空的
-  // （`CodeArtsCatalog` 不拿历史名单冒充），所以下面那条快速重试是唯一的出路。
+  // 动态模型发现：启动后拉一次真实目录（启动引导会等这一轮，见 STARTUP_DISCOVERY_MS），
+  // 之后每小时刷新。失败只记日志 —— 目录保留上一次的结果，不因为上游抖动把模型选择器
+  // 清空。冷启动时目录就是空的（`CodeArtsCatalog` 不拿历史名单冒充），而首轮仍可能正好
+  // 撞上上游抖动，所以下面那条空目录快速重试继续保留。
   const CATALOG_REFRESH_MS = 60 * 60 * 1000
   // 目录还是空（启动/热重载后第一次发现正好撞上上游抖动）就尽快重试，而不是干等
   // 一小时 —— 空目录期间每条消息都会死在 pi-ai 的 "has no configured model"。
@@ -668,11 +669,22 @@ export function apply(ctx: Context, rawConfig: Config): void {
   // + 多路目录请求，越久不好刷得越凶，所以指数退避到 5 分钟封顶。
   const CATALOG_EMPTY_RETRY_MS = 60 * 1000
   const CATALOG_EMPTY_RETRY_MAX_MS = 5 * 60 * 1000
+  /**
+   * 启动首轮发现的预算（issue #13）。
+   *
+   * 一次性宿主（`--list-models`、`dsh headless`、Multica 的本机运行时）在 profile
+   * 加载完就列模型 / 解析模型，等不到后台的任何一轮重试 —— 目录空就是定论。所以
+   * 首轮发现要挡在注册之前、并让 `apply` 等它。但上游挂住时不能把启动一起拖死：
+   * 超时按空目录继续注册，循环随后照常补。手动刷新那条路是 60s，启动不能照抄。
+   */
+  const STARTUP_DISCOVERY_MS = 10_000
+  /** 启动引导的总预算：发现另有 10s 自己的预算，这里防的是 shim 启动 / probe 卡住。 */
+  const STARTUP_WAIT_MS = 15_000
   const abort = new AbortController()
-  const discover = async (): Promise<void> => {
+  const discover = async (signal: AbortSignal = abort.signal): Promise<void> => {
     if (stopped) return
     try {
-      const outcome = await refreshCatalog(store, catalog, abort.signal, current().contextWindowOverrides)
+      const outcome = await refreshCatalog(store, catalog, signal, current().contextWindowOverrides)
       if (outcome === undefined || stopped) return
       if (outcome.anySucceeded) {
         const free = outcome.models.filter(model => model.benefit === true).length
@@ -693,20 +705,25 @@ export function apply(ctx: Context, rawConfig: Config): void {
   let discoveryTimer: ReturnType<typeof setTimeout> | undefined
   /** 连续多少轮目录是空的（用来算退避）；一旦有货就归零。 */
   let emptyStreak = 0
-  /** 自我重排的发现循环：目录为空时退避着重试（60s → 5min 封顶），有货后回到每小时。 */
+  /** 下一轮发现该隔多久：目录为空时退避（60s → 5min 封顶），有货后回到每小时。 */
+  const nextDiscoveryDelay = (): number => {
+    if (catalog.current().length === 0) {
+      const delay = Math.min(CATALOG_EMPTY_RETRY_MS * 2 ** emptyStreak, CATALOG_EMPTY_RETRY_MAX_MS)
+      emptyStreak += 1
+      return delay
+    }
+    emptyStreak = 0
+    return CATALOG_REFRESH_MS
+  }
+  const scheduleDiscovery = (delay: number): void => {
+    discoveryTimer = setTimeout(() => void discoverLoop(), delay)
+    discoveryTimer.unref?.()
+  }
+  /** 自我重排的发现循环：首轮由启动引导跑完后从这里接棒，不再立刻多打一轮上游。 */
   const discoverLoop = async (): Promise<void> => {
     await discover()
     if (stopped) return
-    let delay: number
-    if (catalog.current().length === 0) {
-      delay = Math.min(CATALOG_EMPTY_RETRY_MS * 2 ** emptyStreak, CATALOG_EMPTY_RETRY_MAX_MS)
-      emptyStreak += 1
-    } else {
-      emptyStreak = 0
-      delay = CATALOG_REFRESH_MS
-    }
-    discoveryTimer = setTimeout(() => void discoverLoop(), delay)
-    discoveryTimer.unref?.()
+    scheduleDiscovery(nextDiscoveryDelay())
   }
   ctx.effect(() => () => {
     abort.abort()
@@ -887,17 +904,22 @@ export function apply(ctx: Context, rawConfig: Config): void {
   // 账本懒加载：读盘失败/文件不存在都不影响插件启动。
   void usage.load().catch(() => {})
 
-  void shim.ready
+  // 启动引导：shim 起来 → 首轮发现 → 注册 provider，整条链作为 apply 的返回值等待
+  // （issue #13）。一次性宿主（--list-models、headless 任务）在 profile 加载完立即
+  // 列模型/解析模型，原来的同步 apply 让「加载完成」不等于「provider 就绪」。
+  const bootstrap = shim.ready
     .then(async () => {
       if (stopped) return
-      // 先让 provider 挂上，再异步跑第一次发现 —— 目录是空起步的，模型要等这一轮填进来。
-      void discoverLoop()
       // 凭证保活与自动领取跟模型发现一起起步：它们的首轮都带延迟（保活立即跑一次，
       // 领取等 30 秒），不会和启动瞬间的目录请求抢上游。
       void keepAliveLoop()
       armAutoClaim()
       // 守护进程跟着启动：开关开着才起，关着什么都不做。
       armKeepAliveDaemon()
+      // 首轮发现等它完成（自带超时）；超时就按空目录继续注册，发现循环随后补上。
+      // 必须等完再注册：注册之后宿主随时会来列模型，目录还没填就是空列表。
+      await discover(AbortSignal.any([abort.signal, AbortSignal.timeout(STARTUP_DISCOVERY_MS)]))
+      if (stopped) return
       // 版本不兼容时每条消息都会死在出网之前，所以要在这里说明白（卡片上也显示）。
       const incompatible = await probePiAiCompat()
       if (incompatible !== undefined) ctx.logger.error(`dsh-codearts: ${incompatible}`)
@@ -934,8 +956,25 @@ export function apply(ctx: Context, rawConfig: Config): void {
         releaseAdapter?.()
         releaseDirectory?.()
       }
+      // 全静默是 issue #13 的 C 项：注册时目录仍是空的，至少留一条 warn（宿主侧
+      // 拿不到模型时不会报错）。有货的这一轮由 discover 自己打 debug。
+      if (catalog.current().length === 0) {
+        ctx.logger.warn(
+          'dsh-codearts: CodeArts provider registered with an empty model catalog; '
+            + 'models stay unavailable until discovery succeeds',
+        )
+      }
+      if (!stopped) scheduleDiscovery(nextDiscoveryDelay())
     })
-    .catch((error: unknown) => {
-      ctx.logger.error('dsh-codearts: loopback shim failed to start; provider not registered', error)
-    })
+  const settled = bootstrap.catch((error: unknown) => {
+    ctx.logger.error('dsh-codearts: loopback shim failed to start; provider not registered', error)
+  })
+  // 外层兜底：shim 启动或 probe 自己卡住时，不能无限期拖住 profile 加载。
+  await Promise.race([
+    settled,
+    new Promise<void>(resolve => {
+      const timer = setTimeout(resolve, STARTUP_WAIT_MS)
+      timer.unref?.()
+    }),
+  ])
 }
