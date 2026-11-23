@@ -2233,7 +2233,9 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                               className={[
                                 styles.windowButton,
                                 windowOpenFor === choice.id ? styles.windowButtonOpen : '',
-                                choice.contextWindowOverride === undefined ? '' : styles.windowButtonSet,
+                                choice.contextWindowOverride === undefined && choice.maxTokensOverride === undefined
+                                  ? ''
+                                  : styles.windowButtonSet,
                               ].filter(Boolean).join(' ')}
                               aria-expanded={windowOpenFor === choice.id}
                               aria-label={t('modelWindowLabel', { model: modelName(choice) })}
