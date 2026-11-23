@@ -17,6 +17,8 @@ import {
   modelUnavailableReason,
   setDiscoveredBenefitModels,
   stripModelSuffixes,
+  withContextWindowOverride,
+  withMaxTokensOverride,
   type CodeArtsModelInfo,
 } from '../src/catalog.ts'
 import { refreshCatalog } from '../src/discovery.ts'
@@ -29,6 +31,8 @@ import {
   maxTokensCeilingFor,
   MAX_TOKENS_CEILING,
   resetLearnedContextWindows,
+  resetTokenCeilings,
+  setMaxTokenOverrides,
 } from '../src/upstream.ts'
 
 const model = (id: string, patch: Partial<CodeArtsModelInfo> = {}): CodeArtsModelInfo => ({
@@ -152,6 +156,81 @@ describe('carryKnownWindows', () => {
     const carried = carryKnownWindows(previous, [model('Custom-1M', { contextWindow: 32_768 })])
     expect(carried[0]?.contextWindow).toBe(32_768)
     expect(carried[0]?.contextWindowKnown).toBeUndefined()
+  })
+})
+
+// issue #17：设覆盖时原始值被解构丢弃，清除只能把覆盖值写回去（空操作）。
+describe('withContextWindowOverride', () => {
+  const base = (patch: Partial<CodeArtsModelInfo> = {}): CodeArtsModelInfo => model('GLM-5.2', {
+    contextWindow: 1_048_576,
+    contextWindowKnown: true,
+    maxTokens: 65_536,
+    ...patch,
+  })
+
+  it('records the nominal value the first time an override is set', () => {
+    const [patched] = withContextWindowOverride([base()], 'glm-5.2', 500_000)
+    expect(patched?.contextWindow).toBe(500_000)
+    expect(patched?.contextWindowDiscovered).toBe(1_048_576)
+    expect(patched?.contextWindowKnown).toBe(true)
+  })
+
+  it('keeps the first nominal when the override changes again', () => {
+    const first = withContextWindowOverride([base()], 'GLM-5.2', 500_000)
+    const [second] = withContextWindowOverride(first, 'GLM-5.2', 700_000)
+    expect(second?.contextWindow).toBe(700_000)
+    expect(second?.contextWindowDiscovered).toBe(1_048_576)
+  })
+
+  it('restores the nominal on clear', () => {
+    const set = withContextWindowOverride([base()], 'GLM-5.2', 500_000)
+    const [cleared] = withContextWindowOverride(set, 'GLM-5.2', null)
+    expect(cleared?.contextWindow).toBe(1_048_576)
+    expect(cleared?.contextWindowDiscovered).toBeUndefined()
+    expect(cleared?.contextWindowKnown).toBe(true)
+  })
+
+  // 修复前设过覆盖的条目没有标称值可回退：生效值不倒退，但不再算可信规格。
+  it('drops the trust flag when a legacy entry has no nominal to restore', () => {
+    const dirty = { ...base({ contextWindow: 500_000 }), contextWindowDiscovered: undefined }
+    const [cleared] = withContextWindowOverride([dirty], 'GLM-5.2', null)
+    expect(cleared?.contextWindow).toBe(500_000)
+    expect(cleared?.contextWindowKnown).toBeUndefined()
+  })
+
+  // 脏值不该被 #12 的携带逻辑继续兜住：下一轮没拿到可信窗口时也不能复活它。
+  it('does not let carryKnownWindows resurrect a cleared dirty value', () => {
+    const dirty = { ...base({ contextWindow: 500_000 }), contextWindowDiscovered: undefined }
+    const [cleared] = withContextWindowOverride([dirty], 'GLM-5.2', null)
+    const next = [model('GLM-5.2', { contextWindow: 32_768, maxTokens: 65_536 })]
+    expect(carryKnownWindows([cleared!], next)[0]?.contextWindow).toBe(32_768)
+  })
+})
+
+// issue #15：输出上限覆盖与窗口覆盖同一套「记原值 / 清除恢复」语义。
+describe('withMaxTokensOverride', () => {
+  const base = (): CodeArtsModelInfo => model('custom-model', { contextWindow: 1_016_000, maxTokens: 16_000 })
+
+  it('records the declared limit and restores it on clear', () => {
+    const [set] = withMaxTokensOverride([base()], 'CUSTOM-MODEL', 131_072)
+    expect(set?.maxTokens).toBe(131_072)
+    expect(set?.maxTokensDiscovered).toBe(16_000)
+    const [cleared] = withMaxTokensOverride([set!], 'custom-model', null)
+    expect(cleared?.maxTokens).toBe(16_000)
+    expect(cleared?.maxTokensDiscovered).toBeUndefined()
+  })
+
+  it('keeps the declared limit when the override changes again', () => {
+    const first = withMaxTokensOverride([base()], 'custom-model', 131_072)
+    const [second] = withMaxTokensOverride(first, 'custom-model', 98_304)
+    expect(second?.maxTokens).toBe(98_304)
+    expect(second?.maxTokensDiscovered).toBe(16_000)
+  })
+
+  it('leaves models that are not mentioned untouched', () => {
+    const other = model('GLM-5.2', { contextWindow: 128_000, maxTokens: 65_536 })
+    const out = withMaxTokensOverride([base(), other], 'custom-model', 131_072)
+    expect(out[1]).toBe(other)
   })
 })
 
@@ -468,11 +547,13 @@ describe('fetchModels', () => {
   beforeEach(() => {
     setDiscoveredBenefitModels([])
     resetLearnedContextWindows()
+    resetTokenCeilings()
   })
   afterEach(() => {
     vi.unstubAllGlobals()
     setDiscoveredBenefitModels([])
     resetLearnedContextWindows()
+    resetTokenCeilings()
   })
 
   it('merges the three sources and clamps max_tokens to the measured ceiling', async () => {
@@ -567,6 +648,43 @@ describe('fetchModels', () => {
     expect(byId.get('3ac4ab8e6f31425199088bbcf4c09a06')?.contextWindow).toBe(1_016_000)
     // 声明 100000 超过实测上限，仍要钳住。
     expect(byId.get('ae0fa0ec00000000000000000000abcd')?.maxTokens).toBe(65_536)
+  })
+
+  // issue #15：覆盖值直接当天花板 —— 越过 65536 的全局墙，目录保留声明值供回退。
+  it('lets a maxTokens override win over the declared value and the global cap', async () => {
+    setMaxTokenOverrides({ '3ac4ab8e6f31425199088bbcf4c09a06': 131_072 })
+    stubFetch({
+      '/v1/model/builtin': () => json(BUILTIN_BODY),
+      '/api/v1/gateway/config': () => json(BENEFIT_BODY),
+      '/v1/agent-center/agents/useragents': () => json(AGENT_LIST_BODY),
+      '/v1/agent-center/agents/detail': () =>
+        json(
+          JSON.stringify({
+            agent_id: 'aaa',
+            gpts: {
+              models: [
+                {
+                  model_name: 'glm-5.3-1m-自定义模型',
+                  model_parameters: {
+                    model_id: '3ac4ab8e6f31425199088bbcf4c09a06',
+                    context_window: 1_016_000,
+                    input_context_window: 1_000_000,
+                    output_context_window: 16_000,
+                    max_tokens: 0,
+                  },
+                },
+              ],
+            },
+          }),
+        ),
+      '/v1/model/thinking-variants': () => json('{"variants":{}}'),
+    })
+
+    const result = await fetchModels(credential)
+    const target = result.models.find(m => m.id === '3ac4ab8e6f31425199088bbcf4c09a06')
+    expect(target?.maxTokens).toBe(131_072)
+    // 声明值 16K 留着：卡片「跟随上游」要回到它。
+    expect(target?.maxTokensDiscovered).toBe(16_000)
   })
 
   // 企业租户（#11 那类用户）的第三方模型清单：先租户设置门禁，再拉清单。

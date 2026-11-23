@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { CodeArtsAccountStore, CodeArtsAccountSummary } from './auth.ts'
 import { MANUAL_ACCOUNT_ID, credentialFromOAuth } from './auth.ts'
-import type { AccountRuntime } from './account-pool.ts'
+import { DEFAULT_MAX_CONCURRENT, type AccountRuntime } from './account-pool.ts'
 import type { CodeArtsCatalog, CodeArtsModelInfo } from './catalog.ts'
 import type { CodeArtsCreditSnapshot, CodeArtsCreditState } from './credits.ts'
 import type { CodeArtsQueueEntry } from './queue.ts'
@@ -31,6 +31,7 @@ import {
   firstFrameError,
   isModelNotAccessible,
   modelUnavailableReasonText,
+  overrideValueFor,
   prepareChatBody,
   upstreamErrorMessage,
 } from './upstream.ts'
@@ -61,6 +62,16 @@ export const CODEARTS_MODELS_SELECTION_PATH = '/api/codearts/enabled-models'
  * `{ id, window }`，`window: null` 表示删除覆盖、回到跟随上游。
  */
 export const CODEARTS_CONTEXT_WINDOW_PATH = '/api/codearts/context-window'
+/**
+ * POST /api/codearts/max-tokens — 按模型设置/清除输出上限覆盖（issue #15）。
+ * `{ id, tokens }`，`tokens: null` 表示删除覆盖、回到跟随上游。
+ */
+export const CODEARTS_MAX_TOKENS_PATH = '/api/codearts/max-tokens'
+/**
+ * GET/POST /api/codearts/concurrency — 每账号本地并发上限（issue #16）。
+ * GET 回 `{ value, writable }`；POST 收 `{ value: number }`，改完立即生效。
+ */
+export const CODEARTS_CONCURRENCY_PATH = '/api/codearts/concurrency'
 export const CODEARTS_TOKEN_PATH = '/api/codearts/token'
 export const CODEARTS_LOGIN_PATH = '/api/codearts/login'
 export const CODEARTS_LOGIN_STATUS_PATH = '/api/codearts/login/status'
@@ -129,8 +140,12 @@ export interface CodeArtsModelChoice {
   contextWindowDiscovered?: number
   /** 用户给这个模型设的窗口覆盖值（issue #9）；undefined 表示跟随上游。 */
   contextWindowOverride?: number
-  /** 单次输出上限（endpoint 元数据或实测天花板）。 */
+  /** 单次输出上限（生效值：目录声明值或用户覆盖值）。 */
   maxTokens?: number
+  /** 上游声明的输出上限（覆盖之前的原值）；与 `maxTokens` 不等时才有（issue #15）。 */
+  maxTokensDiscovered?: number
+  /** 用户给这个模型设的输出上限覆盖值；undefined 表示跟随上游。 */
+  maxTokensOverride?: number
   /**
    * 上游今天判定该模型不可用（如 `InferHub.ModelArts.81003.401`）的原因。
    *
@@ -141,7 +156,7 @@ export interface CodeArtsModelChoice {
 
 /** enabled-models 路由返回的 selection 文档（与 codebuddy 的 shape 对齐）。 */
 export interface CodeArtsModelSelection {
-  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; contextWindow?: number; contextWindowDiscovered?: number; contextWindowOverride?: number; maxTokens?: number; error?: string }[]
+  choices: { id: string; name: string; enabled: boolean; benefit?: boolean; blocked?: boolean; ratio?: string; supportsImages?: boolean; contextWindow?: number; contextWindowDiscovered?: number; contextWindowOverride?: number; maxTokens?: number; maxTokensDiscovered?: number; maxTokensOverride?: number; error?: string }[]
   /** 已选子集是否小于全集（卡片据此显示不同提示）。 */
   restricted: boolean
   /** 是否可写（无 settings provider 时为 false，卡片只读）。 */
@@ -172,6 +187,8 @@ export function selectionOf(
     contextWindowDiscovered: m.contextWindowDiscovered,
     contextWindowOverride: m.contextWindowOverride,
     maxTokens: m.maxTokens,
+    maxTokensDiscovered: m.maxTokensDiscovered,
+    maxTokensOverride: m.maxTokensOverride,
     ...(m.error === undefined ? {} : { error: m.error }),
     enabled: restricted ? allowed.has(m.id) : true,
   }))
@@ -181,11 +198,13 @@ export function selectionOf(
 /** 目录 -> 勾选 UI 的选项（福利标记、今日不可用标记与倍率都在这里算）。 */
 function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
   const overrides = deps.contextWindowOverrides?.()
+  const maxOverrides = deps.maxTokensOverrides?.()
   return deps.models().map(m => {
     const benefit = isBenefitModel(m.id)
     const ratio = creditRatioLabel(m.ratio, benefit)
     const error = modelUnavailableReason(m.id)
     const override = contextWindowOverrideFor(overrides, m.id)
+    const maxOverride = overrideValueFor(maxOverrides, m.id)
     return {
       id: m.id,
       name: m.name,
@@ -198,6 +217,8 @@ function choicesOf(deps: CodeArtsStatusRouteOptions): CodeArtsModelChoice[] {
       ...(m.contextWindowDiscovered === undefined ? {} : { contextWindowDiscovered: m.contextWindowDiscovered }),
       ...(override === undefined ? {} : { contextWindowOverride: override }),
       ...(m.maxTokens > 0 ? { maxTokens: m.maxTokens } : {}),
+      ...(m.maxTokensDiscovered === undefined ? {} : { maxTokensDiscovered: m.maxTokensDiscovered }),
+      ...(maxOverride === undefined ? {} : { maxTokensOverride: maxOverride }),
       ...(error === undefined ? {} : { error }),
     }
   })
@@ -535,6 +556,17 @@ export interface CodeArtsStatusRouteOptions {
    * 返回 false 表示没接 settings provider，卡片据此把输入框置灰。
    */
   setContextWindowOverride?: (id: string, window: number | null) => Promise<boolean>
+  /** 用户按模型配置的输出上限覆盖值（issue #15）；省略则卡片不显示输出上限控件。 */
+  maxTokensOverrides?: () => Readonly<Record<string, number>> | undefined
+  /** 写入或清除某个模型的输出上限覆盖（`tokens: null` = 回到跟随上游）。 */
+  setMaxTokensOverride?: (id: string, tokens: number | null) => Promise<boolean>
+  /**
+   * 并发上限的当前值（issue #16）：`default` 给没单独设置过的号，`caps` 是按账号覆盖。
+   * 省略则卡片不显示并发调节。
+   */
+  concurrency?: () => { default: number; caps: Readonly<Record<string, number>> }
+  /** 给某个账号设/清并发上限（`value: null` = 回到默认），立即生效。 */
+  setAccountConcurrency?: (accountId: string, value: number | null) => Promise<boolean>
   /**
    * 对话底部那一行的显隐开关当前值。省略则 /status 不带 dock 字段（= 都显示）。
    */
@@ -1149,6 +1181,122 @@ function contextWindowHandler(deps: CodeArtsStatusRouteOptions) {
   }
 }
 
+/**
+ * POST /api/codearts/max-tokens { id, tokens } — 按模型覆盖输出上限（issue #15）。
+ *
+ * 存在的理由：企业自定义模型实测能到 128K，而插件全局天花板是 65536（对福利模型
+ * 实测的保守值），两道 `min` 把覆盖值压回去，手动设置就没意义。`tokens: null`
+ * 删除覆盖、回到跟随上游（目录声明值）。
+ */
+function maxTokensHandler(deps: CodeArtsStatusRouteOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'POST') {
+      json(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    if (deps.setMaxTokensOverride === undefined) {
+      json(res, 403, { error: 'max-tokens-not-writable' })
+      return
+    }
+    const type = req.headers['content-type']
+    if (typeof type !== 'string' || !type.trim().toLowerCase().startsWith('application/json')) {
+      json(res, 415, { error: 'content-type must be application/json' })
+      return
+    }
+    try {
+      const body = JSON.parse(await readBody(req)) as { id?: unknown; tokens?: unknown }
+      const id = typeof body.id === 'string' ? body.id.trim() : ''
+      if (id === '') {
+        json(res, 400, { error: 'expected {"id": string, "tokens": number|null}' })
+        return
+      }
+      let tokens: number | null = null
+      if (body.tokens !== null && body.tokens !== undefined) {
+        if (typeof body.tokens !== 'number' || !Number.isFinite(body.tokens) || body.tokens <= 0) {
+          json(res, 400, { error: 'tokens must be a positive number or null' })
+          return
+        }
+        tokens = Math.floor(body.tokens)
+      }
+      const ok = await deps.setMaxTokensOverride(id, tokens)
+      if (!ok) {
+        json(res, 403, { error: 'max-tokens-not-writable' })
+        return
+      }
+      // 回整份 selection（和 context-window 一样）：卡片一次替换，不用自己拼状态。
+      const all = choicesOf(deps)
+      json(res, 200, { selection: selectionOf(all, deps.enabledModels?.(), true) })
+    } catch (error: unknown) {
+      json(res, 500, { error: safeMessage(error) })
+    }
+  }
+}
+
+/**
+ * GET/POST /api/codearts/concurrency — 每个账号各自的并发上限（issue #16）。
+ *
+ * 上游会话槽位按账号算（个人 3 / 企业 5），所以上限也按账号设：`caps` 里的号用自己的，
+ * 其余用 `default`。POST 只收 `{ id, value }`，`value: null` = 删掉覆盖、回到默认。
+ * 真正的钳制与热更新在 `index.ts`（池逐账号改上限并唤醒等槽请求）。
+ */
+function concurrencyHandler(deps: CodeArtsStatusRouteOptions) {
+  const snapshot = (): { default: number; caps: Record<string, number> } =>
+    deps.concurrency?.() ?? { default: DEFAULT_MAX_CONCURRENT, caps: {} }
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (!loopbackRequest(req)) {
+      json(res, 403, { error: 'request-not-trusted' })
+      return
+    }
+    if (req.method === 'GET') {
+      const current = snapshot()
+      json(res, 200, { default: current.default, caps: current.caps, writable: deps.setAccountConcurrency !== undefined })
+      return
+    }
+    if (req.method === 'POST') {
+      if (deps.setAccountConcurrency === undefined) {
+        json(res, 403, { error: 'concurrency-not-writable' })
+        return
+      }
+      const type = req.headers['content-type']
+      if (typeof type !== 'string' || !type.trim().toLowerCase().startsWith('application/json')) {
+        json(res, 415, { error: 'content-type must be application/json' })
+        return
+      }
+      try {
+        const body = JSON.parse(await readBody(req)) as { id?: unknown; value?: unknown }
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        if (id === '') {
+          json(res, 400, { error: 'expected {"id": string, "value": number|null}' })
+          return
+        }
+        let value: number | null = null
+        if (body.value !== null && body.value !== undefined) {
+          if (typeof body.value !== 'number' || !Number.isInteger(body.value) || body.value < 1 || body.value > 16) {
+            json(res, 400, { error: 'value must be an integer between 1 and 16, or null' })
+            return
+          }
+          value = body.value
+        }
+        const ok = await deps.setAccountConcurrency(id, value)
+        if (!ok) {
+          json(res, 403, { error: 'concurrency-not-writable' })
+          return
+        }
+        const current = snapshot()
+        json(res, 200, { default: current.default, caps: current.caps, writable: true })
+      } catch (error: unknown) {
+        json(res, 500, { error: safeMessage(error) })
+      }
+      return
+    }
+    json(res, 405, { error: 'method not allowed' })
+  }
+}
+
 /** POST /api/codearts/token { token, label? } — store a pasted token. */
 function tokenPostHandler(deps: CodeArtsStatusRouteOptions) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -1514,6 +1662,16 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       path: CODEARTS_CONTEXT_WINDOW_PATH,
       handler: contextWindowHandler(deps),
     })
+    const disposeMaxTokens = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_MAX_TOKENS_PATH,
+      handler: maxTokensHandler(deps),
+    })
+    const disposeConcurrency = ctx.webServer.register({
+      kind: 'exact',
+      path: CODEARTS_CONCURRENCY_PATH,
+      handler: concurrencyHandler(deps),
+    })
     // 宿主 WebServer 对同一个 (kind, path) 只留一个席位，重复注册会抛
     // duplicate exact route —— 抛在同一次 effect 里会把它后面的注册全跳过，
     // 所以 /token 的 POST 与 DELETE 必须共用一个 handler。
@@ -1582,6 +1740,8 @@ export function registerCodeArtsStatusRoute(ctx: Context, deps: CodeArtsStatusRo
       disposeModels()
       disposeModelsSelection()
       disposeContextWindow()
+      disposeMaxTokens()
+      disposeConcurrency()
       disposeToken()
       disposeLoginStart()
       disposeLoginStatus()

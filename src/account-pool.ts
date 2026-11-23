@@ -89,7 +89,14 @@ export class CodeArtsAccountPool {
   private readonly paused = new Set<string>()
   /** 用户置顶的账号：选号时排在最前面，不再按「最久未用」轮它。 */
   private readonly preferred = new Set<string>()
-  private readonly maxConcurrent: number
+  private maxConcurrent: number
+  /**
+   * 按账号的上限覆盖（账号 id → 并发数，issue #16 后续）。
+   *
+   * 上游配额按账号算：一个号可能个人档（3 个会话）、另一个企业档（5 个）。
+   * 没有覆盖的号用 `maxConcurrent` 这个默认值。
+   */
+  private accountCaps = new Map<string, number>()
   private readonly now: () => number
   /** 等槽位的唤醒器：槽位释放 / 池里新增账号 / 账号复活时逐个唤醒。 */
   private readonly waiters = new Set<() => void>()
@@ -105,14 +112,17 @@ export class CodeArtsAccountPool {
     const wanted = new Set(ids)
     const before = this.accounts.size
     for (const id of [...this.accounts.keys()]) {
-      if (!wanted.has(id)) this.accounts.delete(id)
+      if (!wanted.has(id)) {
+        this.accounts.delete(id)
+        this.accountCaps.delete(id)
+      }
     }
     for (const id of ids) {
       if (this.accounts.has(id)) continue
       this.accounts.set(id, {
         id,
         activeConcurrent: 0,
-        maxConcurrent: this.maxConcurrent,
+        maxConcurrent: this.accountCaps.get(id) ?? this.maxConcurrent,
         coolUntil: 0,
         cappedUntil: 0,
         lastCapAt: 0,
@@ -124,6 +134,61 @@ export class CodeArtsAccountPool {
     }
     // 新增的号自带空槽位：正在等槽位的请求应该立刻醒过来。
     if (this.accounts.size !== before) this.notifyWaiters()
+  }
+
+  /**
+   * 调整「没有单独设置」的号的默认上限（issue #16）。
+   *
+   * 直接改运行时对象而不重建池：冷却、避让窗口、槽位计数都是本进程里学出来的，
+   * 重建会把它们全丢掉。调大时要唤醒等槽位的请求，否则它们会睡到下一次释放。
+   * 单独设过上限的号不动。
+   */
+  setMaxConcurrent(value: number): void {
+    if (!Number.isFinite(value)) return
+    const next = Math.max(1, Math.floor(value))
+    if (next === this.maxConcurrent) return
+    this.maxConcurrent = next
+    this.applyCaps()
+    this.notifyWaiters()
+  }
+
+  /**
+   * 一次性替换「按账号覆盖」表（设置变更时从配置整表灌进来）。
+   *
+   * 表里没有的号退回默认上限；和 `setMaxConcurrent` 一样保持运行时状态不动。
+   */
+  setAccountCaps(caps: Readonly<Record<string, number>>): void {
+    const next = new Map<string, number>()
+    for (const [id, value] of Object.entries(caps)) {
+      const key = id.trim()
+      if (key === '' || !Number.isFinite(value)) continue
+      next.set(key, Math.max(1, Math.floor(value)))
+    }
+    this.accountCaps = next
+    this.applyCaps()
+    this.notifyWaiters()
+  }
+
+  /** 单个账号设/清上限（`null` = 回到默认）。卡片上每张账号卡各有一枚加减器。 */
+  setAccountCap(id: string, value: number | null): void {
+    const key = id.trim()
+    if (key === '') return
+    if (value === null) this.accountCaps.delete(key)
+    else if (Number.isFinite(value)) this.accountCaps.set(key, Math.max(1, Math.floor(value)))
+    else return
+    this.applyCaps()
+    this.notifyWaiters()
+  }
+
+  /** 当前按账号覆盖表的副本（状态接口给卡片按号显示）。 */
+  accountCapOverrides(): Record<string, number> {
+    return Object.fromEntries(this.accountCaps)
+  }
+
+  private applyCaps(): void {
+    for (const account of this.accounts.values()) {
+      account.maxConcurrent = this.accountCaps.get(account.id) ?? this.maxConcurrent
+    }
   }
 
   list(): AccountRuntime[] {

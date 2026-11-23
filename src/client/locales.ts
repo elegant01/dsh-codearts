@@ -107,6 +107,14 @@ export interface CodeArtsSettingsKey {
   modelWindowHeading: string
   modelWindowFollow: string
   modelWindowHint: string
+  modelOutputLabel: string
+  modelOutputHeading: string
+  modelOutputHint: string
+  concurrencyLabel: string
+  concurrencyLess: string
+  concurrencyMore: string
+  concurrencyHint: string
+  concurrencyShortHint: string
   /** 账号暂停/置顶。 */
   accountPaused: string
   accountPinned: string
@@ -341,7 +349,15 @@ export const zh: CodeArtsSettingsKey = {
   modelWindowTitle: '上下文窗口：上游标称 {value} token。点击可拖动滑块或直接输入',
   modelWindowHeading: '上下文窗口',
   modelWindowFollow: '跟随上游',
-  modelWindowHint: '上游标称 {value}。拖动或输入后立即生效；清空或填回标称值 = 跟随上游',
+  modelWindowHint: '上游标称 {value}。拖动立即生效；输入后按回车或收起弹层生效；清空或填回标称值 = 跟随上游',
+  modelOutputLabel: '设置 {model} 的输出上限',
+  modelOutputHeading: '输出上限',
+  modelOutputHint: '上游声明 {value}。拖动立即生效；输入后按回车或收起弹层生效；清空或填回声明值 = 跟随上游',
+  concurrencyLabel: '并发',
+  concurrencyLess: '减少并发',
+  concurrencyMore: '增加并发',
+  concurrencyHint: '这个账号的并发上限 —— 上游个人免费版 3 个会话、企业版 5 个；留 1 个给网页端，所以个人建议 2、企业建议 5。点一下立即生效，只影响这个号。',
+  concurrencyShortHint: '并发上限按账号独立设置；个人 3 / 企业 5 个会话，留 1 个给网页端。',
   accountPaused: '已暂停',
   accountPinned: '已置顶',
   accountEnabled: '启用',
@@ -561,7 +577,15 @@ export const en: CodeArtsSettingsKey = {
   modelWindowTitle: 'Context window: upstream reports {value} tokens. Click to drag the slider or type a value',
   modelWindowHeading: 'Context window',
   modelWindowFollow: 'Follow upstream',
-  modelWindowHint: 'Upstream reports {value}. Changes apply immediately; clear the field or type the upstream value to follow it',
+  modelWindowHint: 'Upstream reports {value}. Dragging applies immediately; typed values apply on Enter or when the popover closes; clear the field or type the upstream value to follow it',
+  modelOutputLabel: 'Set the output limit for {model}',
+  modelOutputHeading: 'Output limit',
+  modelOutputHint: 'Upstream declares {value}. Dragging applies immediately; typed values apply on Enter or when the popover closes; clear the field or type the declared value to follow it',
+  concurrencyLabel: 'Concurrency',
+  concurrencyLess: 'Decrease concurrency',
+  concurrencyMore: 'Increase concurrency',
+  concurrencyHint: 'Concurrency cap for this account — upstream allows 3 sessions on the free tier and 5 on enterprise; keep 1 for the web console (2 for personal, 5 for enterprise). Clicking applies immediately and only affects this account.',
+  concurrencyShortHint: 'Concurrency is per account; the free tier allows 3 sessions, enterprise 5 — keep 1 for the web console.',
   accountPaused: 'Paused',
   accountPinned: 'Pinned',
   accountEnabled: 'Enabled',

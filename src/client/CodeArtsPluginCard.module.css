@@ -1127,6 +1127,68 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* 弹层里第二组设置（输出上限）：一条细分隔线，两组控件不必挤在同一段说明里。 */
+.windowSection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+/* 每张账号卡里的「并发 −/+」：跟账号的今日用量同一列，不另起一块。 */
+.accountConcurrencyInline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.accountConcurrencyLabel {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.concurrencyStepper {
+  display: inline-flex;
+  align-items: center;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-sm);
+  overflow: hidden;
+}
+
+.concurrencyButton {
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--dsw-alias-label-primary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.concurrencyButton:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.concurrencyButton:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.concurrencyValue {
+  min-width: 20px;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-primary);
+}
+
 /* 体检列表：一行一条，状态点 + 名称 + 说明。 */
 .doctorList {
   display: flex;

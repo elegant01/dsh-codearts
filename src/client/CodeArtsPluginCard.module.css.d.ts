@@ -3,6 +3,8 @@ declare const styles: {
   readonly "accountCard": string
   readonly "accountClear": string
   readonly "accountClearHint": string
+  readonly "accountConcurrencyInline": string
+  readonly "accountConcurrencyLabel": string
   readonly "accountEntry": string
   readonly "accountGrid": string
   readonly "accountHint": string
@@ -32,6 +34,9 @@ declare const styles: {
   readonly "choiceTail": string
   readonly "choices": string
   readonly "claimAllRow": string
+  readonly "concurrencyButton": string
+  readonly "concurrencyStepper": string
+  readonly "concurrencyValue": string
   readonly "count": string
   readonly "creditBlock": string
   readonly "creditFooter": string
@@ -116,6 +121,7 @@ declare const styles: {
   readonly "windowPopoverRow": string
   readonly "windowPopoverValue": string
   readonly "windowRange": string
+  readonly "windowSection": string
   readonly "windowUnit": string
 }
 export default styles

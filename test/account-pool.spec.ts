@@ -85,6 +85,63 @@ describe('concurrency cap', () => {
   })
 })
 
+// issue #16：上游槽位随套餐不同（个人档 3、企业档 5），上限要能运行中调整。
+describe('live concurrency updates', () => {
+  it('applies a new cap to every account without rebuilding the pool', () => {
+    const pool = poolOf(['a', 'b'], 1)
+    expect(pool.acquire('a')).toBe(true)
+    expect(pool.acquire('a')).toBe(false)
+    pool.setMaxConcurrent(2)
+    expect(pool.get('a')?.maxConcurrent).toBe(2)
+    expect(pool.get('b')?.maxConcurrent).toBe(2)
+    expect(pool.acquire('a')).toBe(true)
+  })
+
+  it('wakes a request waiting for a slot when the cap is raised', async () => {
+    const pool = poolOf(['a'], 1)
+    expect(pool.acquire('a')).toBe(true)
+    const waiting = pool.waitForFreeSlot(1_000)
+    pool.setMaxConcurrent(2)
+    await expect(waiting).resolves.toBe(true)
+  })
+
+  it('clamps a junk value instead of locking the pool', () => {
+    const pool = poolOf(['a'], 1)
+    pool.setMaxConcurrent(0)
+    expect(pool.get('a')?.maxConcurrent).toBe(1)
+    pool.setMaxConcurrent(Number.NaN)
+    expect(pool.get('a')?.maxConcurrent).toBe(1)
+  })
+
+  // issue #16 后续：上游配额按账号算，一个号个人档、另一个企业档是常态。
+  it('keeps a per-account cap when the default changes', () => {
+    const pool = poolOf(['a', 'b'], 2)
+    pool.setAccountCap('a', 3)
+    expect(pool.get('a')?.maxConcurrent).toBe(3)
+    expect(pool.get('b')?.maxConcurrent).toBe(2)
+    pool.setMaxConcurrent(1)
+    expect(pool.get('a')?.maxConcurrent).toBe(3)
+    expect(pool.get('b')?.maxConcurrent).toBe(1)
+  })
+
+  it('gives a new account its configured cap, otherwise the default', () => {
+    const pool = poolOf([], 2)
+    pool.setAccountCaps({ a: 5 })
+    pool.sync(['a', 'b'])
+    expect(pool.get('a')?.maxConcurrent).toBe(5)
+    expect(pool.get('b')?.maxConcurrent).toBe(2)
+  })
+
+  it('clearing an account cap falls back to the default', () => {
+    const pool = poolOf(['a'], 2)
+    pool.setAccountCap('a', 3)
+    expect(pool.get('a')?.maxConcurrent).toBe(3)
+    pool.setAccountCap('a', null)
+    expect(pool.get('a')?.maxConcurrent).toBe(2)
+    expect(pool.accountCapOverrides()).toEqual({})
+  })
+})
+
 describe('health', () => {
   it('skips a disabled account', () => {
     const pool = poolOf(['a', 'b'])

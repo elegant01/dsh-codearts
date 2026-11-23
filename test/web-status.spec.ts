@@ -45,10 +45,12 @@ import {
 import {
   CODEARTS_ACCOUNTS_PATH,
   CODEARTS_CLAIM_PATH,
+  CODEARTS_CONCURRENCY_PATH,
   CODEARTS_CONTEXT_WINDOW_PATH,
   CODEARTS_DOCTOR_PATH,
   CODEARTS_LOGIN_PATH,
   CODEARTS_LOGIN_STATUS_PATH,
+  CODEARTS_MAX_TOKENS_PATH,
   CODEARTS_MODELS_SELECTION_PATH,
   CODEARTS_QUEUE_PATH,
   CODEARTS_REFRESH_MODELS_PATH,
@@ -1244,6 +1246,223 @@ describe('context window override route', () => {
       CODEARTS_CONTEXT_WINDOW_PATH,
       { 'content-type': 'application/json' },
       JSON.stringify({ id: 'GLM-5.2', window: 1000 }),
+    )
+    expect(res.status).toBe(403)
+  })
+})
+
+/**
+ * 并发上限按账号独立（issue #16）：上游槽位随套餐不同（个人 3 / 企业 5），
+ * 卡片里每张账号卡各有一枚加减器。这里只测路由契约；真正生效的是
+ * `index.ts` 对池的热更新（见 account-pool.spec.ts）。
+ */
+describe('concurrency route', () => {
+  function mount(sub: {
+    snapshot?: { default: number; caps: Record<string, number> }
+    set?: (id: string, value: number | null) => Promise<boolean>
+  } = {}) {
+    // 真实实现写成功后会更新这份值，这里让假的 setter 也照做，响应才可断言。
+    const held = { default: sub.snapshot?.default ?? 2, caps: { ...(sub.snapshot?.caps ?? {}) } }
+    const set = vi.fn(sub.set ?? (async (id: string, value: number | null) => {
+      if (value === null) delete held.caps[id]
+      else held.caps[id] = value
+      return true
+    }))
+    return {
+      local: mountRoutes({
+        store,
+        models: () => [],
+        concurrency: () => ({ default: held.default, caps: held.caps }),
+        setAccountConcurrency: set,
+      }),
+      set,
+      held,
+    }
+  }
+
+  it('reports the default, the per-account caps and writability', async () => {
+    const { local } = mount({ snapshot: { default: 2, caps: { b: 5 } }, set: async () => true })
+    const res = await call(local.get(CODEARTS_CONCURRENCY_PATH)!, GET, CODEARTS_CONCURRENCY_PATH)
+    expect(res.status).toBe(200)
+    expect(res.body?.default).toBe(2)
+    expect(res.body?.caps).toEqual({ b: 5 })
+    expect(res.body?.writable).toBe(true)
+  })
+
+  it('sets one account and answers with the refreshed caps', async () => {
+    const { local, set } = mount()
+    const res = await call(
+      local.get(CODEARTS_CONCURRENCY_PATH)!,
+      POST,
+      CODEARTS_CONCURRENCY_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'a', value: 3 }),
+    )
+    expect(res.status).toBe(200)
+    expect(set).toHaveBeenCalledWith('a', 3)
+    expect(res.body?.caps).toEqual({ a: 3 })
+  })
+
+  it('clears an account cap when value is null', async () => {
+    const { local, set } = mount({ snapshot: { default: 2, caps: { a: 3 } } })
+    const res = await call(
+      local.get(CODEARTS_CONCURRENCY_PATH)!,
+      POST,
+      CODEARTS_CONCURRENCY_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'a', value: null }),
+    )
+    expect(res.status).toBe(200)
+    expect(set).toHaveBeenCalledWith('a', null)
+    expect(res.body?.caps).toEqual({})
+  })
+
+  it('rejects out-of-range or non-integer values', async () => {
+    const { local, set } = mount()
+    for (const value of [0, -1, 2.5, 17, '3']) {
+      const res = await call(
+        local.get(CODEARTS_CONCURRENCY_PATH)!,
+        POST,
+        CODEARTS_CONCURRENCY_PATH,
+        { 'content-type': 'application/json' },
+        JSON.stringify({ id: 'a', value }),
+      )
+      expect(res.status).toBe(400)
+    }
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('rejects a missing account id', async () => {
+    const { local, set } = mount()
+    const res = await call(
+      local.get(CODEARTS_CONCURRENCY_PATH)!,
+      POST,
+      CODEARTS_CONCURRENCY_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ value: 3 }),
+    )
+    expect(res.status).toBe(400)
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('is read-only when the host has no settings provider', async () => {
+    const local = mountRoutes({
+      store,
+      models: () => [],
+      concurrency: () => ({ default: 2, caps: {} }),
+    })
+    const get = await call(local.get(CODEARTS_CONCURRENCY_PATH)!, GET, CODEARTS_CONCURRENCY_PATH)
+    expect(get.body?.writable).toBe(false)
+    const post = await call(
+      local.get(CODEARTS_CONCURRENCY_PATH)!,
+      POST,
+      CODEARTS_CONCURRENCY_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'a', value: 5 }),
+    )
+    expect(post.status).toBe(403)
+  })
+})
+
+/**
+ * 输出上限覆盖（issue #15）：企业自定义模型实测 128K，而插件全局天花板是 65536。
+ * 这里同样只测路由契约，真正把值用起来的是 upstream 的天花板查询（见 pure.test.ts）
+ * 与 fetchModels（见 models.spec.ts）。
+ */
+describe('max tokens override route', () => {
+  const model = {
+    id: 'custom-model',
+    name: 'custom-model',
+    contextWindow: 1_016_000,
+    contextWindowKnown: true,
+    // 生效值：用户把天花板设成了 131072。
+    maxTokens: 131_072,
+    // 上游声明值：卡片清空后要回到这里。
+    maxTokensDiscovered: 16_000,
+    supportsImages: false,
+  }
+
+  function mount(sub: {
+    overrides?: Record<string, number>
+    set?: (id: string, tokens: number | null) => Promise<boolean>
+  } = {}) {
+    const set = vi.fn(sub.set ?? (async () => true))
+    return {
+      local: mountRoutes({
+        store,
+        models: () => [model] as never,
+        enabledModels: () => undefined,
+        maxTokensOverrides: () => sub.overrides,
+        ...(sub.set === undefined ? {} : { setMaxTokensOverride: set }),
+      }),
+      set,
+    }
+  }
+
+  type Choice = { id: string; maxTokens?: number; maxTokensDiscovered?: number; maxTokensOverride?: number }
+  const choicesOf = (body: Record<string, unknown> | undefined): Choice[] =>
+    (body?.selection as { choices: Choice[] } | undefined)?.choices ?? []
+
+  it('tells the card the effective limit, the declared value and the override', async () => {
+    const { local } = mount({ overrides: { 'custom-model': 131_072 } })
+    const res = await call(local.get(CODEARTS_MODELS_SELECTION_PATH)!, GET, CODEARTS_MODELS_SELECTION_PATH)
+    const choice = choicesOf(res.body)[0]
+    expect(choice?.maxTokens).toBe(131_072)
+    expect(choice?.maxTokensDiscovered).toBe(16_000)
+    // 大小写不敏感，和窗口覆盖同一套查找。
+    expect(choice?.maxTokensOverride).toBe(131_072)
+  })
+
+  it('writes a limit and answers with the refreshed selection', async () => {
+    const { local, set } = mount({ set: async () => true })
+    const res = await call(
+      local.get(CODEARTS_MAX_TOKENS_PATH)!,
+      POST,
+      CODEARTS_MAX_TOKENS_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'custom-model', tokens: 131_072 }),
+    )
+    expect(res.status).toBe(200)
+    expect(set).toHaveBeenCalledWith('custom-model', 131_072)
+    expect(choicesOf(res.body)[0]?.id).toBe('custom-model')
+  })
+
+  it('clears the override when tokens is null', async () => {
+    const { local, set } = mount({ set: async () => true })
+    const res = await call(
+      local.get(CODEARTS_MAX_TOKENS_PATH)!,
+      POST,
+      CODEARTS_MAX_TOKENS_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'custom-model', tokens: null }),
+    )
+    expect(res.status).toBe(200)
+    expect(set).toHaveBeenCalledWith('custom-model', null)
+  })
+
+  it('rejects a non-positive or non-finite limit instead of writing junk', async () => {
+    const { local, set } = mount({ set: async () => true })
+    for (const tokens of [0, -1, 'abc']) {
+      const res = await call(
+        local.get(CODEARTS_MAX_TOKENS_PATH)!,
+        POST,
+        CODEARTS_MAX_TOKENS_PATH,
+        { 'content-type': 'application/json' },
+        JSON.stringify({ id: 'custom-model', tokens }),
+      )
+      expect(res.status).toBe(400)
+    }
+    expect(set).not.toHaveBeenCalled()
+  })
+
+  it('is read-only when the host has no settings provider', async () => {
+    const local = mountRoutes({ store, models: () => [model] as never })
+    const res = await call(
+      local.get(CODEARTS_MAX_TOKENS_PATH)!,
+      POST,
+      CODEARTS_MAX_TOKENS_PATH,
+      { 'content-type': 'application/json' },
+      JSON.stringify({ id: 'custom-model', tokens: 131_072 }),
     )
     expect(res.status).toBe(403)
   })

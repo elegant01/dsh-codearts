@@ -11,6 +11,7 @@ import type {
 import { stripModelSuffixes } from '../catalog.ts'
 import { setSettingsEntryWanted, setSidebarPanelWanted } from './panel-switch.ts'
 import { dockSnapshot, publishDock, subscribeDock } from './dock-store.ts'
+import { concurrencySnapshot, publishConcurrency, subscribeConcurrency } from './concurrency-store.ts'
 import { latencyP95Label } from './latency-label.ts'
 import styles from './CodeArtsPluginCard.module.css'
 
@@ -42,8 +43,12 @@ interface ModelChoice {
   contextWindowDiscovered?: number
   /** 用户给这个模型设的窗口覆盖值；undefined = 跟随上游。 */
   contextWindowOverride?: number
-  /** 上游返回的最大输出 token。 */
+  /** 上游返回的最大输出 token（生效值：覆盖后的天花板）。 */
   maxTokens?: number
+  /** 上游声明的输出上限（覆盖之前的原值）：输入框清空后要回到这里（issue #15）。 */
+  maxTokensDiscovered?: number
+  /** 用户给这个模型设的输出上限覆盖值；undefined = 跟随上游。 */
+  maxTokensOverride?: number
 }
 
 interface ModelSelectionDoc {
@@ -204,6 +209,32 @@ function windowStopIndex(tokens: number | undefined): number {
   let best = 0
   for (let i = 1; i < WINDOW_STOPS.length; i += 1) {
     if (Math.abs(WINDOW_STOPS[i] - tokens) < Math.abs(WINDOW_STOPS[best] - tokens)) best = i
+  }
+  return best
+}
+
+/**
+ * 输出上限的档位（issue #15）。
+ *
+ * 和窗口刻度分开：输出上限的常见值集中在 8K~128K，把 2M 那几档摆进来只会让
+ * 前半段挤成一团。企业自定义模型实测的 131072 必须在列表里 —— 否则「开覆盖
+ * 越过 65536 的墙」这件事在滑块上根本点不出来（输入框仍可填任意值）。
+ */
+const OUTPUT_STOPS = [
+  1_024, 2_048, 4_096, 8_000, 8_192, 16_000, 16_384, 32_000, 32_768,
+  65_536, 98_304, 131_072, 196_608, 262_144,
+] as const
+
+/** 卡片上并发调节的上限。服务端允许到 16，界面按套餐留到 8 就够用了。 */
+const MAX_CONCURRENCY_UI = 8
+
+/** 当前值落在哪个输出档位上（不在刻度里就取最近的）。 */
+function outputStopIndex(tokens: number | undefined): number {
+  const fallback = OUTPUT_STOPS.indexOf(65_536)
+  if (tokens === undefined || !Number.isFinite(tokens) || tokens <= 0) return fallback
+  let best = 0
+  for (let i = 1; i < OUTPUT_STOPS.length; i += 1) {
+    if (Math.abs(OUTPUT_STOPS[i] - tokens) < Math.abs(OUTPUT_STOPS[best] - tokens)) best = i
   }
   return best
 }
@@ -980,10 +1011,15 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   /** 正在保存窗口的模型 id。 */
   const [windowSaving, setWindowSaving] = useState<string | null>(null)
   const [windowError, setWindowError] = useState<string | null>(null)
+  /** 正在编辑的输出上限草稿（issue #15），语义与窗口草稿一致。 */
+  const [outputDrafts, setOutputDrafts] = useState<Record<string, string>>({})
+  /** 正在保存输出上限的模型 id。 */
+  const [outputSaving, setOutputSaving] = useState<string | null>(null)
   /** 弹层展开的模型 id（同一时间只开一个，行内只留一个按钮）。 */
   const [windowOpenFor, setWindowOpenFor] = useState<string | null>(null)
   /** 正在提交窗口值的模型 id（state 更新有延迟，去重用 ref）。 */
   const windowCommitInFlight = useRef<Set<string>>(new Set())
+  const outputCommitInFlight = useRef<Set<string>>(new Set())
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
   /** 正在实测的模型 id；同一时间只测一个，避免把上游并发槽位占满。 */
@@ -1009,6 +1045,12 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
   /** 对话底部那一行的两个显隐开关（后端 = 插件 settings 里的两个布尔）。 */
   const [dock, setDock] = useState(() => dockSnapshot().dock)
   const [dockWritable, setDockWritable] = useState(() => dockSnapshot().writable)
+  /** 每个账号各自的并发上限（issue #16）：卡片上点一下就能改，改完立即生效。 */
+  const [concurrencyDefault, setConcurrencyDefault] = useState(() => concurrencySnapshot().default)
+  const [concurrencyCaps, setConcurrencyCaps] = useState(() => concurrencySnapshot().caps)
+  const [concurrencyWritable, setConcurrencyWritable] = useState(() => concurrencySnapshot().writable)
+  const [concurrencySavingId, setConcurrencySavingId] = useState<string | null>(null)
+  const [concurrencyError, setConcurrencyError] = useState<string | null>(null)
   /**
    * 正在保存的开关（按键记录）。
    *
@@ -1045,6 +1087,71 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       publishDock({ writable: data.writable === true })
     } catch {
       // 老后端没这条路由：保持默认（都显示 / 侧边栏关闭），勾选框置灰，别把整张卡片报成出错。
+    }
+  }
+
+  async function refreshConcurrency(): Promise<void> {
+    try {
+      const res = await fetch('/api/codearts/concurrency', { headers: { Accept: 'application/json' } })
+      if (!res.ok) return
+      const data = (await res.json()) as { default?: number; caps?: Record<string, number>; writable?: boolean }
+      publishConcurrency({
+        ...(typeof data.default === 'number' ? { default: data.default } : {}),
+        ...(typeof data.caps === 'object' && data.caps !== null ? { caps: data.caps } : {}),
+        writable: data.writable === true,
+      })
+    } catch {
+      // 老后端没这条路由：保持默认并隐藏调节器，不影响其他功能。
+    }
+  }
+
+  /**
+   * 改某个账号的并发：点一下就写，先按新值渲染、失败再退回去。
+   *
+   * 不做「攒草稿再保存」——用户点完必须马上看到结果（issue #16 的诉求就是「傻瓜式」）。
+   * 写成功后池里这个号的上限立刻生效，其他号不受影响。
+   */
+  async function saveAccountConcurrency(accountId: string, next: number): Promise<void> {
+    const previous = concurrencyCaps
+    const before = previous[accountId]
+    if (before === next || concurrencySavingId !== null) return
+    setConcurrencyCaps({ ...previous, [accountId]: next })
+    setConcurrencySavingId(accountId)
+    setConcurrencyError(null)
+    try {
+      const res = await fetch('/api/codearts/concurrency', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ id: accountId, value: next }),
+      })
+      const data = (await res.json().catch(() => ({}))) as {
+        default?: number
+        caps?: Record<string, number>
+        error?: string
+      }
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+      publishConcurrency({
+        ...(typeof data.default === 'number' ? { default: data.default } : {}),
+        ...(typeof data.caps === 'object' && data.caps !== null ? { caps: { ...data.caps } } : {}),
+        writable: true,
+      })
+      // 「用量」页的会话槽位分母取自 `/status`（池里的上限），卡片本身不轮询它 ——
+      // 不在这里顺手改掉，就要等到下一次刷新才看到 0/3，用户会以为没生效。
+      setStatus(current => {
+        if (current?.usage === undefined) return current
+        return {
+          ...current,
+          usage: {
+            ...current.usage,
+            slots: current.usage.slots.map(slot => (slot.id === accountId ? { ...slot, max: next } : slot)),
+          },
+        }
+      })
+    } catch (error: unknown) {
+      setConcurrencyCaps(previous)
+      setConcurrencyError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setConcurrencySavingId(null)
     }
   }
 
@@ -1219,12 +1326,20 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
 
   useEffect(() => {
     void refreshDock()
+    void refreshConcurrency()
   }, [])
 
   // 共享状态变了（另一张卡片改了开关）就跟着刷新，别一直显示旧快照。
   useEffect(() => subscribeDock(() => {
     setDock(dockSnapshot().dock)
     setDockWritable(dockSnapshot().writable)
+  }), [])
+
+  useEffect(() => subscribeConcurrency(() => {
+    const snap = concurrencySnapshot()
+    setConcurrencyDefault(snap.default)
+    setConcurrencyCaps(snap.caps)
+    setConcurrencyWritable(snap.writable)
   }), [])
 
   useEffect(() => {
@@ -1426,6 +1541,75 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     })
   }
 
+  /** 输出上限输入框里该显示的值：编辑中优先显示草稿，否则显示服务端生效值。 */
+  function outputValueText(choice: ModelChoice): string {
+    const draft = outputDrafts[choice.id]
+    if (draft !== undefined) return draft
+    return String(choice.maxTokensOverride ?? choice.maxTokens ?? '')
+  }
+
+  function outputNumberValue(choice: ModelChoice): number | undefined {
+    const parsed = Number(outputValueText(choice))
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+  }
+
+  function setOutputDraft(id: string, value: string): void {
+    setOutputDrafts(current => ({ ...current, [id]: value }))
+  }
+
+  function clearOutputDraft(id: string): void {
+    setOutputDrafts(current => {
+      if (!(id in current)) return current
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+  }
+
+  /**
+   * 提交一个模型的输出上限（滑块松手、回车、收起弹层都走这里）。
+   *
+   * 与窗口同一套规则：空值 / 非法值 / 填回上游声明值 = 删除覆盖（issue #15）。
+   */
+  async function commitOutput(choice: ModelChoice, raw: string): Promise<void> {
+    if (outputCommitInFlight.current.has(choice.id)) return
+    const base = choice.maxTokensDiscovered ?? choice.maxTokens
+    const text = raw.trim()
+    let target: number | null = null
+    if (text !== '') {
+      const parsed = Math.floor(Number(text))
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        clearOutputDraft(choice.id)
+        return
+      }
+      target = base !== undefined && parsed === base ? null : parsed
+    }
+    const before = choice.maxTokensOverride ?? null
+    if (target === before) {
+      clearOutputDraft(choice.id)
+      return
+    }
+    outputCommitInFlight.current.add(choice.id)
+    setOutputSaving(choice.id)
+    setWindowError(null)
+    try {
+      const res = await fetch('/api/codearts/max-tokens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ id: choice.id, tokens: target }),
+      })
+      const data = (await res.json().catch(() => null)) as (ModelSelectionDoc & { error?: string }) | null
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`)
+      if (data !== null && data.selection !== undefined) setSelection(data.selection)
+    } catch (err) {
+      setWindowError(err instanceof Error ? err.message : String(err))
+    } finally {
+      clearOutputDraft(choice.id)
+      outputCommitInFlight.current.delete(choice.id)
+      setOutputSaving(null)
+    }
+  }
+
   /**
    * 提交一个模型的窗口值（滑块松手、回车、收起弹层都走这里）。
    *
@@ -1483,9 +1667,12 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
     const id = windowOpenFor
     setWindowOpenFor(null)
     if (id === null) return
-    const draft = windowDrafts[id]
     const choice = (selection?.choices ?? []).find(entry => entry.id === id)
-    if (draft !== undefined && choice !== undefined) void commitWindow(choice, draft)
+    if (choice === undefined) return
+    const draft = windowDrafts[id]
+    if (draft !== undefined) void commitWindow(choice, draft)
+    const outputDraft = outputDrafts[id]
+    if (outputDraft !== undefined) void commitOutput(choice, outputDraft)
   }
 
   /**
@@ -1818,6 +2005,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                   {accounts.map(account => {
                     const accountLine = accountMeta(account)
                     const credit = creditFor(account.id)
+                    const accountCap = concurrencyCaps[account.id] ?? concurrencyDefault
                     return (
                       <div key={account.id} className={styles.accountEntry}>
                         <div className={styles.accountRow}>
@@ -1839,6 +2027,42 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                                 failed: formatCount(status?.usage?.failuresByAccountToday?.[account.id] ?? 0),
                               })}
                             </span>
+                            {/*
+                              这个号自己的并发上限（issue #16）：上游槽位按账号算，
+                              点一下立即写配置并生效，只影响这个号。
+                            */}
+                            {concurrencyWritable && (
+                              <span className={styles.accountConcurrencyInline}>
+                                <span className={styles.accountConcurrencyLabel} title={t('concurrencyHint')}>
+                                  {t('concurrencyLabel')}
+                                </span>
+                                <span
+                                  className={styles.concurrencyStepper}
+                                  role="group"
+                                  aria-label={`${accountName(account)} ${t('concurrencyLabel')}`}
+                                >
+                                  <button
+                                    type="button"
+                                    className={styles.concurrencyButton}
+                                    aria-label={t('concurrencyLess')}
+                                    disabled={concurrencySavingId !== null || accountCap <= 1}
+                                    onClick={() => void saveAccountConcurrency(account.id, accountCap - 1)}
+                                  >
+                                    −
+                                  </button>
+                                  <span className={styles.concurrencyValue} aria-live="polite">{accountCap}</span>
+                                  <button
+                                    type="button"
+                                    className={styles.concurrencyButton}
+                                    aria-label={t('concurrencyMore')}
+                                    disabled={concurrencySavingId !== null || accountCap >= MAX_CONCURRENCY_UI}
+                                    onClick={() => void saveAccountConcurrency(account.id, accountCap + 1)}
+                                  >
+                                    +
+                                  </button>
+                                </span>
+                              </span>
+                            )}
                           </div>
                           <div className={styles.accountRowActions}>
                             {/*
@@ -1944,6 +2168,14 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                     </div>
                   )}
                   {accounts.length > 1 && <p className={styles.accountHint}>{t('accountsRotateHint')}</p>}
+                  {/*
+                    并发上限按账号独立（issue #16）：调节器在每张账号卡里（见上面那个
+                    「并发 −/+」行），这里只说明口径。宿主没重启（没有路由）时不显示。
+                  */}
+                  {concurrencyWritable && accounts.length > 0 && (
+                    <p className={styles.accountHint}>{t('concurrencyShortHint')}</p>
+                  )}
+                  {concurrencyError !== null && <p className={styles.error}>{concurrencyError}</p>}
                 </div>
 
                 {/* 整页级破坏性动作：把影响范围写在按钮左边，别让按钮孤零零挂在底部。 */}
@@ -2065,6 +2297,58 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                                 <p className={styles.windowHint}>
                                   {t('modelWindowHint', { value: formatWindow(choice.contextWindowDiscovered ?? choice.contextWindow) })}
                                 </p>
+                                {/*
+                                  输出上限（issue #15）：企业自定义模型实测到 128K，而插件
+                                  全局天花板 65536 会把请求压回去。覆盖值直接当天花板，
+                                  越过全局墙；清空或填回声明值 = 跟随上游。
+                                */}
+                                <div className={styles.windowSection}>
+                                  <div className={styles.windowPopoverHead}>
+                                    <span>{t('modelOutputHeading')}</span>
+                                    <span className={styles.windowPopoverValue}>{outputValueText(choice) || '—'}</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    className={styles.windowRange}
+                                    min={0}
+                                    max={OUTPUT_STOPS.length - 1}
+                                    step={1}
+                                    value={outputStopIndex(outputNumberValue(choice))}
+                                    aria-label={t('modelOutputLabel', { model: modelName(choice) })}
+                                    disabled={!selection.writable || outputSaving === choice.id}
+                                    onChange={e => setOutputDraft(choice.id, String(OUTPUT_STOPS[Number(e.target.value)] ?? ''))}
+                                    onPointerUp={e => void commitOutput(choice, String(OUTPUT_STOPS[Number(e.currentTarget.value)] ?? ''))}
+                                    onKeyUp={e => void commitOutput(choice, String(OUTPUT_STOPS[Number(e.currentTarget.value)] ?? ''))}
+                                  />
+                                  <div className={styles.windowPopoverRow}>
+                                    <input
+                                      type="number"
+                                      className={
+                                        choice.maxTokensOverride === undefined
+                                          ? styles.windowInput
+                                          : `${styles.windowInput} ${styles.windowInputSet}`
+                                      }
+                                      value={outputValueText(choice)}
+                                      min={1}
+                                      step={1024}
+                                      inputMode="numeric"
+                                      placeholder={t('modelWindowFollow')}
+                                      aria-label={t('modelOutputLabel', { model: modelName(choice) })}
+                                      disabled={!selection.writable || outputSaving === choice.id}
+                                      onChange={e => setOutputDraft(choice.id, e.target.value)}
+                                      onKeyDown={e => {
+                                        if (e.key === 'Enter') {
+                                          e.preventDefault()
+                                          closeWindow()
+                                        }
+                                      }}
+                                    />
+                                    <span className={styles.windowUnit}>tokens</span>
+                                  </div>
+                                  <p className={styles.windowHint}>
+                                    {t('modelOutputHint', { value: formatWindow(choice.maxTokensDiscovered ?? choice.maxTokens) })}
+                                  </p>
+                                </div>
                               </div>
                             )}
                           </span>

@@ -48,6 +48,13 @@ export interface CodeArtsModelInfo {
    */
   contextWindowDiscovered?: number
   maxTokens: number
+  /**
+   * 上游声明的输出上限（用户覆盖之前的原值，issue #15）。
+   *
+   * `maxTokens` 是**生效值**：用户按模型覆盖、或进程内降档都会改它。卡片把输出上限
+   * 「改回跟随上游」时需要这个原值，所以只在两者不等时才带出来。
+   */
+  maxTokensDiscovered?: number
   supportsImages: boolean
   /**
    * 该模型可选的思考强度。
@@ -400,6 +407,75 @@ export function carryKnownWindows(
       // 「改回跟随上游」要用的标称值也跟着旧记录走，不能只搬生效值。
       ...(old.contextWindowDiscovered === undefined ? {} : { contextWindowDiscovered: old.contextWindowDiscovered }),
     }
+  })
+}
+
+/**
+ * 目录里某个模型的窗口覆盖改动（issue #9 / #17）。纯函数，`window: null` = 清除。
+ *
+ * 设覆盖时**定格里游标称值**：首次覆盖记下当时的标称，之后改覆盖沿用它；清除时
+ * 恢复它。修复前的实现把 `contextWindowDiscovered` 解构后就丢了，于是清除只能
+ * 把覆盖值自己写回去 —— 空操作（#17）。
+ *
+ * 没有标称值可回退的条目（上游从没给过窗口、或修复前已经丢过原值）在清除时摘掉
+ * `contextWindowKnown`：生效值原样留着（守卫不倒退），但不再算「可信规格」，下一轮
+ * 发现能用上游值覆盖它。否则 #12 的携带逻辑会把这个脏值继续兜住。
+ */
+export function withContextWindowOverride(
+  models: readonly CodeArtsModelInfo[],
+  id: string,
+  window: number | null,
+): readonly CodeArtsModelInfo[] {
+  const lower = id.trim().toLowerCase()
+  return models.map(model => {
+    if (model.id.trim().toLowerCase() !== lower) return model
+    if (window !== null) {
+      const nominal = model.contextWindowDiscovered
+        ?? (model.contextWindowKnown === true ? model.contextWindow : undefined)
+      const { contextWindowDiscovered: _replaced, ...rest } = model
+      return {
+        ...rest,
+        contextWindow: window,
+        contextWindowKnown: true,
+        ...(nominal === undefined || nominal === window ? {} : { contextWindowDiscovered: nominal }),
+      }
+    }
+    if (model.contextWindowDiscovered !== undefined) {
+      const { contextWindowDiscovered: discovered, ...rest } = model
+      return { ...rest, contextWindow: discovered, contextWindowKnown: true }
+    }
+    if (model.contextWindowKnown !== true) return model
+    const { contextWindowKnown: _dropped, ...rest } = model
+    return rest
+  })
+}
+
+/**
+ * 目录里某个模型的输出上限覆盖改动（issue #15）。纯函数，`tokens: null` = 清除。
+ *
+ * 与窗口覆盖同一套语义：设覆盖时记下声明值（`maxTokensDiscovered`），清除时恢复。
+ * 历史条目没有声明值可恢复时保持现状 —— 输出上限没有「可信规格」概念，不需要摘标记。
+ */
+export function withMaxTokensOverride(
+  models: readonly CodeArtsModelInfo[],
+  id: string,
+  tokens: number | null,
+): readonly CodeArtsModelInfo[] {
+  const lower = id.trim().toLowerCase()
+  return models.map(model => {
+    if (model.id.trim().toLowerCase() !== lower) return model
+    if (tokens !== null) {
+      const nominal = model.maxTokensDiscovered ?? model.maxTokens
+      const { maxTokensDiscovered: _replaced, ...rest } = model
+      return {
+        ...rest,
+        maxTokens: tokens,
+        ...(nominal === tokens ? {} : { maxTokensDiscovered: nominal }),
+      }
+    }
+    if (model.maxTokensDiscovered === undefined) return model
+    const { maxTokensDiscovered: discovered, ...rest } = model
+    return { ...rest, maxTokens: discovered }
   })
 }
 

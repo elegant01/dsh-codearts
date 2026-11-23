@@ -15,6 +15,8 @@ import {
   prepareChatBody,
   rateLimitFrame,
   resetTokenCeilings,
+  setMaxTokenOverride,
+  setMaxTokenOverrides,
   SNAP_HOST,
   MAX_TOKENS_CEILING,
   upstreamErrorMessage,
@@ -340,6 +342,63 @@ describe('degradeTokenCeiling', () => {
     expect([degradeTokenCeiling('GLM-5.2'), degradeTokenCeiling('GLM-5.2'), degradeTokenCeiling('GLM-5.2')])
       .toEqual([32_768, 16_384, 8_192])
     expect(degradeTokenCeiling('GLM-5.2')).toBe(0)
+  })
+})
+
+// issue #15：企业自定义模型实测 128K，而全局墙是 65536 —— 覆盖值必须能越过它。
+describe('maxTokens override', () => {
+  afterEach(() => {
+    resetTokenCeilings()
+  })
+
+  it('lets a user override exceed the global ceiling', () => {
+    expect(maxTokensCeilingFor('vendor-model')).toBe(MAX_TOKENS_CEILING)
+    setMaxTokenOverrides({ 'Vendor-Model': 131_072 })
+    expect(maxTokensCeilingFor('vendor-model')).toBe(131_072)
+  })
+
+  it('degrades from the override, not from the global ceiling', () => {
+    setMaxTokenOverrides({ 'vendor-model': 131_072 })
+    expect(degradeTokenCeiling('vendor-model')).toBe(65_536)
+    expect(maxTokensCeilingFor('vendor-model')).toBe(65_536)
+  })
+
+  it('a changed override clears the learned downgrade', () => {
+    setMaxTokenOverrides({ 'glm-5.2': 131_072 })
+    expect(degradeTokenCeiling('GLM-5.2')).toBe(65_536)
+    setMaxTokenOverrides({ 'glm-5.2': 98_304 })
+    expect(maxTokensCeilingFor('GLM-5.2')).toBe(98_304)
+  })
+
+  it('ignores junk values instead of pinning the model to zero', () => {
+    setMaxTokenOverrides({ 'glm-5.2': 0, junk: Number.NaN })
+    expect(maxTokensCeilingFor('GLM-5.2')).toBe(65_536)
+  })
+
+  // 卡片一次只改一个模型：不能按一份可能过期的整表重算，把别的模型的覆盖冲掉。
+  it('updates one model without dropping the others', () => {
+    setMaxTokenOverrides({ 'model-a': 131_072 })
+    setMaxTokenOverride('model-b', 98_304)
+    expect(maxTokensCeilingFor('model-a')).toBe(131_072)
+    expect(maxTokensCeilingFor('model-b')).toBe(98_304)
+    setMaxTokenOverride('model-a', null)
+    expect(maxTokensCeilingFor('model-a')).toBe(MAX_TOKENS_CEILING)
+    expect(maxTokensCeilingFor('model-b')).toBe(98_304)
+  })
+
+  // 入口那道钳制也要跟着走：覆盖了天花板却在外层被 65536 压回，等于没设。
+  it('lets the outgoing request use the overridden ceiling', () => {
+    const request = (): number => {
+      const { body } = prepareChatBody(JSON.stringify({
+        model: 'vendor-model',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 131_072,
+      }))
+      return (JSON.parse(body) as { max_tokens: number }).max_tokens
+    }
+    expect(request()).toBe(MAX_TOKENS_CEILING)
+    setMaxTokenOverrides({ 'vendor-model': 131_072 })
+    expect(request()).toBe(131_072)
   })
 })
 

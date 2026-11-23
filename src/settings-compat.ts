@@ -80,6 +80,40 @@ export function settingsNamespaceCompat(value: string): SettingsNamespace {
   return compatModule.settingsNamespace?.(value) ?? (value as SettingsNamespace)
 }
 
+/** 一次路径编辑，与宿主 `SettingsPathOp` 同形（0.2.x 起提供）。 */
+export type SettingsPathOpCompat =
+  | { op: 'set'; path: readonly string[]; value: unknown }
+  | { op: 'unset'; path: readonly string[] }
+
+interface SettingsDictWriter {
+  update(ns: SettingsNamespace, patch: object): Promise<void>
+  mutate?(ns: SettingsNamespace, ops: readonly SettingsPathOpCompat[]): Promise<void>
+}
+
+/**
+ * 从 settings 的某个 dict 字段里删键，并可顺带写入一个键（issue #17）。
+ *
+ * `update` 是**深合并**：传一份「过滤掉目标键的整表」删不掉那个键 —— 它还留在
+ * `cordis.patch.yml` 里，重启后覆盖照常生效，用户以为清了其实没清。真正能删键的是
+ * `mutate` + `unset`。老宿主没有这个方法时退回 `update`：只能设新值、删不掉，
+ * 与 1.4.8 行为相同，至少设置路径不炸。
+ */
+export async function writeSettingsDictKey(
+  settings: SettingsDictWriter,
+  ns: SettingsNamespace,
+  field: string,
+  remove: readonly string[],
+  put?: { key: string; value: number },
+): Promise<void> {
+  if (settings.mutate !== undefined) {
+    const ops: SettingsPathOpCompat[] = remove.map(key => ({ op: 'unset', path: [field, key] }))
+    if (put !== undefined) ops.push({ op: 'set', path: [field, put.key], value: put.value })
+    if (ops.length > 0) await settings.mutate(ns, ops)
+    return
+  }
+  if (put !== undefined) await settings.update(ns, { [field]: { [put.key]: put.value } })
+}
+
 export function resolveSettingsNamespaceCompat(
   ctx: Context,
   provider: unknown,

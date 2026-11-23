@@ -27,8 +27,15 @@ import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { CodeArtsAccountStore, codeartsAccountsPath, codeartsDebugLogPath, codeartsRefreshLogPath } from './auth.ts'
-import { CodeArtsAccountPool } from './account-pool.ts'
-import { CodeArtsCatalog, filterEnabledModels, isBenefitModel, type CodeArtsModelInfo } from './catalog.ts'
+import { CodeArtsAccountPool, DEFAULT_MAX_CONCURRENT } from './account-pool.ts'
+import {
+  CodeArtsCatalog,
+  filterEnabledModels,
+  isBenefitModel,
+  withContextWindowOverride,
+  withMaxTokensOverride,
+  type CodeArtsModelInfo,
+} from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
 import { CodeArtsUsageTracker, codeartsUsagePath } from './usage.ts'
 import { CodeArtsQueueGate } from './queue.ts'
@@ -44,7 +51,7 @@ import type {
   CodeArtsDockFlags,
   CodeArtsKeeperView,
 } from './web-status.ts'
-import { installSettingsSectionCompat, resolveSettingsNamespaceCompat } from './settings-compat.ts'
+import { installSettingsSectionCompat, resolveSettingsNamespaceCompat, writeSettingsDictKey } from './settings-compat.ts'
 import {
   KEEPER_STALE_MS,
   clearKeeperHandoff,
@@ -93,7 +100,7 @@ export {
   type UsageSnapshot,
   type UsageTotals,
 } from './usage.ts'
-import { claimDailyWelfare } from './upstream.ts'
+import { claimDailyWelfare, setMaxTokenOverride, setMaxTokenOverrides } from './upstream.ts'
 export { discoverModels, refreshCatalog, type DiscoveryOutcome } from './discovery.ts'
 export {
   SNAP_HOST,
@@ -127,6 +134,30 @@ export interface Config {
    * 进程内按实测学到的上界仍会在此基础上继续往下钳。
    */
   contextWindowOverrides?: Record<string, number>
+  /**
+   * 按模型 id 强制覆盖 `maxTokens`（单次输出上限，id 大小写不敏感，issue #15）。
+   *
+   * 企业自定义模型实测能到 128K，而插件全局天花板是 65536（2026-09-30 对福利模型
+   * 实测的值）。覆盖值直接作为该模型的天花板、可越过那道墙；设过头的值仍由
+   * 「400 → 折半重发」的降档机制自愈。
+   */
+  maxTokensOverrides?: Record<string, number>
+  /**
+   * 每个账号的本地并发上限（issue #16），缺省 2。
+   *
+   * 上游会话槽位随套餐不同：个人免费档实测 3、企业版实测 5（上游报错原话
+   * 「并发会话数已达上限(5个)」）。默认留 1 个给 CodeArts 网页端，所以是 3−1；
+   * 企业档用户调大才能用上闲置的并行槽位。改完立即生效，无需重启。
+   */
+  maxConcurrentPerAccount?: number
+  /**
+   * 按**账号**覆盖并发上限（账号 id → 并发数，issue #16 后续）。
+   *
+   * 上游配额按账号算：一个号可能个人档（3 个会话）、另一个企业档（5 个）。
+   * 没写在这里的号用 `maxConcurrentPerAccount`（默认 2）。卡片上每张账号卡各有一个
+   * −/＋，改的就是这张表；也可以直接写配置。
+   */
+  maxConcurrentOverrides?: Record<string, number>
   /**
    * 宿主的请求重试预算（issue #14）。
    *
@@ -210,6 +241,9 @@ function unwrapConfig(value: unknown): Config {
 export const Config: z<Config> = z.object({
   enabledModels: z.array(z.string()).description('Model ids offered in the model pickers (empty means every model)').volatile(),
   contextWindowOverrides: z.dict(z.natural()).description('Per-model contextWindow overrides (model id → tokens). Discovery reports the nominal server window, which the free tier may not actually serve (issue #9); an override wins over it, and the in-process learned upper bound still clamps it.').volatile(),
+  maxTokensOverrides: z.dict(z.natural()).description('Per-model max output tokens (model id → tokens, issue #15). The override becomes that model\'s ceiling and may exceed the 65536 global cap; rejected values still self-heal by halving the ceiling.').volatile(),
+  maxConcurrentPerAccount: z.natural().default(DEFAULT_MAX_CONCURRENT).description('Default per-account in-flight request cap (default 2). Upstream session slots depend on the plan: measured 3 on the free tier and 5 on enterprise (issue #16); leave one spare for the CodeArts web console. Applies immediately.').volatile(),
+  maxConcurrentOverrides: z.dict(z.natural()).description('Per-account overrides of the concurrency cap (account id → slots, issue #16). Accounts listed here ignore maxConcurrentPerAccount; the card stepper on each account writes this map.').volatile(),
   retryPolicy: z.object({
     maxRetries: z.natural(),
     initialDelayMs: z.natural(),
@@ -229,8 +263,32 @@ function settingsCompatNamespace(ctx: Context): SettingsNamespace {
   return resolveSettingsNamespaceCompat(ctx, ctx.get('settings'), CODEARTS_SETTINGS_NS)
 }
 
+/**
+ * 每账号并发上限的兜底解析：坏值（0 / 负数 / NaN）回默认，别把池子锁成 0 槽。
+ * 上限 16 是拍得住的宽松值 —— 真实套餐最多也就个位数，再大只说明用户乱填。
+ */
+function concurrencyCap(value: number | undefined): number {
+  const n = value === undefined ? DEFAULT_MAX_CONCURRENT : Math.floor(value)
+  return Number.isFinite(n) && n >= 1 ? Math.min(n, 16) : DEFAULT_MAX_CONCURRENT
+}
+
+/** 按账号覆盖表：坏值丢掉、逐项钳制（值来自用户写的配置）。 */
+function concurrencyCaps(value: Readonly<Record<string, number>> | undefined): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [key, cap] of Object.entries(value ?? {})) {
+    const id = key.trim()
+    if (id === '') continue
+    if (typeof cap !== 'number' || !Number.isFinite(cap)) continue
+    out[id] = Math.min(Math.max(1, Math.floor(cap)), 16)
+  }
+  return out
+}
+
 export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
   const config = unwrapConfig(rawConfig)
+  // 输出上限覆盖是模块级状态（`upstream.maxTokensCeilingFor` 在 shim 的两道钳制里查它），
+  // 首轮发现与本进程的第一条请求就要用上，所以先灌进去（issue #15）。
+  setMaxTokenOverrides(config.maxTokensOverrides)
   const accountsPath = codeartsAccountsPath()
   /**
    * 续期失败日志。
@@ -254,7 +312,11 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
   }
   // 多账号：池与账号文档分离——文档管凭证，池管「谁现在能接活」。
   const store = new CodeArtsAccountStore(accountsPath, undefined, { log: appendRefreshLog })
-  const pool = new CodeArtsAccountPool([])
+  const pool = new CodeArtsAccountPool([], { maxConcurrent: concurrencyCap(config.maxConcurrentPerAccount) })
+  /** 卡片按号显示的「默认并发 + 按账号覆盖」（配置可能因旧宿主不刷新，所以单独记一份）。 */
+  let concurrencyNow = concurrencyCap(config.maxConcurrentPerAccount)
+  let concurrencyCapsNow = concurrencyCaps(config.maxConcurrentOverrides)
+  pool.setAccountCaps(concurrencyCapsNow)
   const catalog = new CodeArtsCatalog()
   // 用量账本：记本机经插件发出的请求（账号总额度见 credits.ts，这里只记本机）。
   const usage = new CodeArtsUsageTracker({ path: codeartsUsagePath() })
@@ -309,6 +371,66 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
   let current = (): Config => config
   const enabledModels = (): readonly string[] | undefined => current().enabledModels
 
+  /**
+   * 把「改了立即生效」的配置推给运行时（issue #15 #16）。
+   *
+   * 走设置变更而不是重建组件：并发上限在池里逐账号生效，重建会把冷却/避让/槽位
+   * 计数这些本进程学出来的状态全丢掉。
+   */
+  const applyLiveConfig = (): void => {
+    setMaxTokenOverrides(current().maxTokensOverrides)
+    concurrencyNow = concurrencyCap(current().maxConcurrentPerAccount)
+    concurrencyCapsNow = concurrencyCaps(current().maxConcurrentOverrides)
+    pool.setMaxConcurrent(concurrencyNow)
+    pool.setAccountCaps(concurrencyCapsNow)
+  }
+
+  /**
+   * 卡片上某个账号的并发加减器（issue #16）。写配置 + 立刻改组运行中的池。
+   *
+   * `value: null` = 删掉这个号的覆盖、回到默认值。不需要重启也不用等设置事件：
+   * 用户点一下就要看到槽位变化。
+   */
+  const setAccountConcurrency = async (accountId: string, value: number | null): Promise<boolean> => {
+    const settings = ctx.get('settings')
+    if (settings === undefined) return false
+    const id = accountId.trim()
+    if (id === '') return false
+    const lower = id.toLowerCase()
+    // 账号 id 是稳定键，但配置是手写的：同名的旧拼写顺手删掉。
+    const stored = Object.keys(current().maxConcurrentOverrides ?? {})
+      .filter(key => key.trim().toLowerCase() === lower)
+    const cap = value === null ? null : concurrencyCap(value)
+    await writeDictKey(
+      settings,
+      'maxConcurrentOverrides',
+      value === null ? stored : stored.filter(key => key !== id),
+      cap === null ? undefined : { key: id, value: cap },
+    )
+    const next = { ...concurrencyCapsNow }
+    for (const key of stored) delete next[key]
+    if (cap === null) delete next[id]
+    else next[id] = cap
+    concurrencyCapsNow = next
+    pool.setAccountCap(id, cap)
+    return true
+  }
+
+  type DictOp = { op: 'set'; path: readonly string[]; value: unknown } | { op: 'unset'; path: readonly string[] }
+
+  /** 设置里 dict 字段的删键/写入（issue #17 的落地，见 `writeSettingsDictKey`）。 */
+  const writeDictKey = async (
+    settings: {
+      update: (ns: SettingsNamespace, patch: object) => Promise<void>
+      mutate?: (ns: SettingsNamespace, ops: readonly DictOp[]) => Promise<void>
+    },
+    field: string,
+    remove: readonly string[],
+    put?: { key: string; value: number },
+  ): Promise<void> => {
+    await writeSettingsDictKey(settings, settingsCompatNamespace(ctx), field, remove, put)
+  }
+
   const setEnabledModels = async (ids: readonly string[]): Promise<boolean> => {
     const settings = ctx.get('settings')
     if (settings === undefined) return false
@@ -327,29 +449,44 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
     const settings = ctx.get('settings')
     if (settings === undefined) return false
     const lower = id.trim().toLowerCase()
-    const next: Record<string, number> = {}
-    for (const [key, value] of Object.entries(current().contextWindowOverrides ?? {})) {
-      // id 大小写不敏感：上游注册名是大小写混排的，用户不会照着抄。
-      if (key.trim().toLowerCase() !== lower) next[key] = value
-    }
-    if (window !== null) next[id.trim()] = window
-    await settings.update(settingsCompatNamespace(ctx), { contextWindowOverrides: next })
-    catalog.set(catalog.current().map(model => {
-      if (model.id.toLowerCase() !== lower) return model
-      const target = window ?? model.contextWindowDiscovered ?? model.contextWindow
-      const { contextWindowDiscovered, ...rest } = model
-      // 用户显式设的覆盖值是可以展示的真值（就算上游没给过窗口）；清空（window=null）
-      // 只是回到原值，标记维持原样，别顺手把一个兜底值洗成「上游规格」。
-      const known = window === null ? model.contextWindowKnown : true
-      const patched: CodeArtsModelInfo = {
-        ...rest,
-        contextWindow: target,
-        ...(known === true ? { contextWindowKnown: true } : {}),
-      }
-      return contextWindowDiscovered === undefined || contextWindowDiscovered === target
-        ? patched
-        : { ...patched, contextWindowDiscovered }
-    }))
+    // id 大小写不敏感：上游注册名是大小写混排的，用户不会照着抄。同名的旧拼写顺手删掉。
+    const stored = Object.keys(current().contextWindowOverrides ?? {})
+      .filter(key => key.trim().toLowerCase() === lower)
+    await writeDictKey(
+      settings,
+      'contextWindowOverrides',
+      window === null ? stored : stored.filter(key => key !== id.trim()),
+      window === null ? undefined : { key: id.trim(), value: window },
+    )
+    // 清除一个本来就不存在的覆盖：别动目录 —— 否则会把上游给的信任标记顺手摘掉。
+    if (window === null && stored.length === 0) return true
+    catalog.set(withContextWindowOverride(catalog.current(), id, window))
+    return true
+  }
+
+  /**
+   * 写/清某个模型的输出上限覆盖（issue #15），语义与窗口覆盖一致。
+   *
+   * 生效值是模块级状态（`upstream.maxTokensCeilingFor`），必须同时更新它，否则
+   * 卡片显示改了、下一条请求仍按旧天花板钳制。
+   */
+  const setMaxTokensOverride = async (id: string, tokens: number | null): Promise<boolean> => {
+    const settings = ctx.get('settings')
+    if (settings === undefined) return false
+    const lower = id.trim().toLowerCase()
+    const stored = Object.keys(current().maxTokensOverrides ?? {})
+      .filter(key => key.trim().toLowerCase() === lower)
+    await writeDictKey(
+      settings,
+      'maxTokensOverrides',
+      tokens === null ? stored : stored.filter(key => key !== id.trim()),
+      tokens === null ? undefined : { key: id.trim(), value: tokens },
+    )
+    if (tokens === null && stored.length === 0) return true
+    catalog.set(withMaxTokensOverride(catalog.current(), id, tokens))
+    // 设置变更（document-updated → setSource → applyLiveConfig）会再灌一次；
+    // 这里先写，保证接口返回与下一次出网请求之间没有空窗。
+    setMaxTokenOverride(id, tokens)
     return true
   }
 
@@ -597,9 +734,13 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
     models: () => catalog.current(),
     enabledModels,
     setEnabledModels,
-    // 卡片模型列表里那个窗口输入框/滑块（issue #9）：读当前覆盖值 + 写入。
+    // 卡片模型列表里那个窗口/输出上限输入框（issue #9 / #15）：读当前覆盖值 + 写入。
     contextWindowOverrides: () => current().contextWindowOverrides,
     setContextWindowOverride,
+    maxTokensOverrides: () => current().maxTokensOverrides,
+    setMaxTokensOverride,
+    concurrency: () => ({ default: concurrencyNow, caps: { ...concurrencyCapsNow } }),
+    setAccountConcurrency,
     pool: () => pool.list(),
     // 重新登录/贴新 token 成功后，把这个号从禁用里捞出来（disabled 不清的话登录也救不回来）。
     reviveAccount: id => pool.revive(id),
@@ -652,12 +793,14 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
   installSettingsSectionCompat(ctx, CODEARTS_SETTINGS_NS, Config, config, {
     setSource(source) {
       current = () => unwrapConfig(source())
+      applyLiveConfig()
       // 开关一变就按新状态重排自动领取：打开了要立刻跟上，关掉了要立刻停手。
       armAutoClaim()
       armKeepAliveDaemon()
     },
     onChange() {
       // 设置项变化时同样重排（有些宿主的 setSource 不会因值变化重新触发）。
+      applyLiveConfig()
       armAutoClaim()
       armKeepAliveDaemon()
     },

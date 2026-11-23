@@ -142,6 +142,15 @@ other local processes cannot impersonate it.
   `max_tokens` is already at the 8192 floor and upstream still rejects the request, the plugin
   records this request’s prompt estimate as that model’s upper bound (in-process, tighten-only),
   so the next round is blocked locally with a `/compact` or new-session hint.
+- **Output limit** is overridable per model too (issue #15): enterprise custom models were
+  measured at 131072, while the conservative global cap is 65536. Set that model’s ceiling with
+  `maxTokensOverrides`, e.g. `{ "my-enterprise-model": 131072 }` (the card popover has an
+  “Output limit” slider as well). Values that are too high self-heal via the 400 → halve retry.
+- **Concurrency**: each account has its own in-flight cap, default 2 (the free tier allows
+  3 sessions, leaving one for the CodeArts web console). Enterprise plans were measured at 5 —
+  raise just that account with the −/＋ stepper inside its card; changes apply immediately and
+  only affect that account. Config keys: `maxConcurrentOverrides` (per account) and
+  `maxConcurrentPerAccount` (the default).
 - The usage ledger counts only requests **this machine sent through the plugin**, so its
   numbers are not an account total; the card links to the official page. The ledger keeps
   60 days and is lost when you move machines or clear `$DSH_HOME`.

@@ -144,11 +144,18 @@ const MEASURED_MAX_TOKENS: Readonly<Record<string, number>> = {
   'glm-5.2': 65_536,
 }
 
-/** 该模型可用的 max_tokens 上限（实测值与会话内学到的更低值取小）。 */
+/**
+ * 该模型可用的 max_tokens 上限（用户覆盖 > 实测值，再被会话内学到的更低值压住）。
+ *
+ * 用户覆盖（issue #15）就是**天花板本身**，不只是替换目录声明值：企业自定义模型的
+ * 实测上限是 131072，而全局 `MAX_TOKENS_CEILING` 是 65536，不给覆盖值穿透这道墙，
+ * 手动设置对 128K 的用例就没意义。设过头的值由降档机制（400 → 折半重发）自愈。
+ */
 export function maxTokensCeilingFor(id: string): number {
-  const measured = measuredCeilingFor(id)
+  const override = maxTokensOverrides.get(ceilingKey(id))
+  const base = override ?? measuredCeilingFor(id)
   const learned = learnedMaxTokens.get(ceilingKey(id))
-  return learned === undefined ? measured : Math.min(measured, learned)
+  return learned === undefined ? base : Math.min(base, learned)
 }
 
 /**
@@ -171,6 +178,56 @@ export function isParamInvalidFrame(text: string): boolean {
  * 免得该模型后面每一轮都先白撞一次。
  */
 const learnedMaxTokens = new Map<string, number>()
+
+/**
+ * 用户按模型覆盖的输出上限（小写 id → tokens，issue #15）。
+ *
+ * 配置里的 `maxTokensOverrides` 由 `index.ts` 在启动与设置变更时灌进来。这里用
+ * 模块级状态而不是逐层传参：`prepareChatBody` 只在出口拿到模型 id，天花板查询
+ * 又散在 shim 的降档路径里，逐层加参数只会漏掉某一处。
+ */
+let maxTokensOverrides: ReadonlyMap<string, number> = new Map()
+
+/**
+ * 用配置替换覆盖表。**值变了的模型会清掉会话内降档记忆**：用户声明「这个模型能
+ * 到 131072」是一次新断言，不该被之前自动降下来的 32768 继续压着；真突破不了时
+ * 下一轮请求会被拒，再折半学回来。
+ */
+export function setMaxTokenOverrides(overrides: Readonly<Record<string, number>> | undefined): void {
+  const next = new Map<string, number>()
+  for (const [rawKey, value] of Object.entries(overrides ?? {})) {
+    if (!Number.isFinite(value) || value <= 0) continue
+    const key = ceilingKey(rawKey)
+    if (key !== '') next.set(key, Math.floor(value))
+  }
+  for (const [key, value] of next) {
+    if (maxTokensOverrides.get(key) !== value) learnedMaxTokens.delete(key)
+  }
+  maxTokensOverrides = next
+}
+
+/** 该模型的输出上限覆盖值；没配返回 undefined。 */
+export function maxTokensOverrideFor(id: string): number | undefined {
+  return maxTokensOverrides.get(ceilingKey(id))
+}
+
+/**
+ * 只改一个模型的覆盖值（卡片 `POST /api/codearts/max-tokens` 走这里）。
+ *
+ * 不重建整张表：设置事件在部分宿主上不会把新值立刻反映到 `current()`，按那份
+ * 可能过期的配置重算会把**别的**模型的覆盖一起丢掉。值变了的模型同样清掉降档记忆。
+ */
+export function setMaxTokenOverride(id: string, tokens: number | null): void {
+  const key = ceilingKey(id)
+  if (key === '') return
+  const next = new Map(maxTokensOverrides)
+  if (tokens === null) next.delete(key)
+  else if (Number.isFinite(tokens) && tokens > 0) next.set(key, Math.floor(tokens))
+  else return
+  if (next.get(key) !== maxTokensOverrides.get(key)) learnedMaxTokens.delete(key)
+  maxTokensOverrides = next
+}
+
 /**
  * 降档下限：再低就没有可用的生成长度了，此时宁可把具体错误报给用户。
  *
@@ -198,9 +255,10 @@ export function degradeTokenCeiling(id: string): number {
   return next
 }
 
-/** 清空降档记忆。进程内状态，测试之间必须能重置。 */
+/** 清空降档记忆与覆盖表（测试专用：进程内状态，测试之间必须能重置）。 */
 export function resetTokenCeilings(): void {
   learnedMaxTokens.clear()
+  maxTokensOverrides = new Map()
 }
 
 /**
@@ -242,12 +300,13 @@ export function resetLearnedContextWindows(): void {
 }
 
 /**
- * 从用户配置里取某模型的 contextWindow 覆盖值（id 大小写不敏感）。
+ * 从用户配置的某个覆盖表里取某模型的值（id 大小写不敏感）。
  *
  * 非正数、NaN、Infinity 一律视为「没配」：这些值只会让守卫把每一次请求都判成
- * 放不下，比目录值更糟。用户真要表达「不知道窗口」，删掉这个键即可。
+ * 放不下（窗口）或让每轮请求首帧就被拒（输出上限），比目录值更糟。用户真要表达
+ * 「不知道」，删掉这个键即可。
  */
-export function contextWindowOverrideFor(
+export function overrideValueFor(
   overrides: Readonly<Record<string, number>> | undefined,
   id: string,
 ): number | undefined {
@@ -258,6 +317,14 @@ export function contextWindowOverrideFor(
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
   }
   return undefined
+}
+
+/** 取某模型的 contextWindow 覆盖值（见 `overrideValueFor`）。 */
+export function contextWindowOverrideFor(
+  overrides: Readonly<Record<string, number>> | undefined,
+  id: string,
+): number | undefined {
+  return overrideValueFor(overrides, id)
 }
 
 /**
@@ -1625,7 +1692,8 @@ export async function clearQueueStatus(
  *  - **maxTokens 钳到该模型的实测上限**（`MEASURED_MAX_TOKENS`）。上游
  *    `gateway/config` 给福利模型标的是 393216 / 384000，而聊天端点实测超过 65536
  *    就流内报 InferHub.001001005.400；DSH 会把 catalog 的 maxTokens 原样当
- *    max_tokens 发出去，照抄标称值等于让每个请求都失败。
+ *    max_tokens 发出去，照抄标称值等于让每个请求都失败。用户按模型设了覆盖值时
+ *    覆盖值直接当天花板，不再被 65536 压住（issue #15）。
  *  - contextWindow 用发现值（只影响 DSH 的上下文计量与截断余量，不影响路由）；
  *    用户配置的按模型覆盖值与进程内学到的真实上界在这里压过发现值（issue #9）。
  *
@@ -1696,6 +1764,13 @@ export async function fetchModels(
     const discovered = model.contextWindow > 0 ? model.contextWindow : learned ?? UNKNOWN_CONTEXT_WINDOW
     const base = override ?? discovered
     const contextWindow = learned === undefined ? base : Math.min(base, learned)
+    // 输出上限（issue #15）：用户覆盖值就是天花板，可越过 65536 的全局墙；未覆盖时
+    // 仍按「目录声明值 vs 实测上限」取小。覆盖生效时保留声明值供卡片「跟随上游」回退。
+    const declaredMaxTokens = model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS
+    const maxOverride = maxTokensOverrideFor(model.id)
+    const maxTokens = maxOverride === undefined
+      ? Math.min(declaredMaxTokens, maxTokensCeilingFor(model.id))
+      : maxTokensCeilingFor(model.id)
     return {
       ...model,
       ...(thinking === undefined ? {} : { thinking }),
@@ -1706,10 +1781,8 @@ export async function fetchModels(
       // 生效值和「上游标称」不同时留一份原值：卡片把窗口「改回跟随上游」要靠它。
       // 只在上游真的给过时才带，兜底值不是标称值。
       ...(upstreamKnown && contextWindow !== model.contextWindow ? { contextWindowDiscovered: model.contextWindow } : {}),
-      maxTokens: Math.min(
-        model.maxTokens > 0 ? model.maxTokens : UNKNOWN_MAX_TOKENS,
-        maxTokensCeilingFor(model.id),
-      ),
+      maxTokens,
+      ...(maxOverride !== undefined && maxTokens !== declaredMaxTokens ? { maxTokensDiscovered: declaredMaxTokens } : {}),
     }
   })
 
