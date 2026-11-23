@@ -2243,7 +2243,16 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
                                 model: modelName(choice),
                                 value: formatWindow(choice.contextWindowDiscovered ?? choice.contextWindow),
                               })}
-                              onClick={() => setWindowOpenFor(current => (current === choice.id ? null : choice.id))}
+                              onClick={() => {
+                                // 收起必须走 closeWindow：它会提交两处草稿。直接置 null 会
+                                // 让「清空后点 ▾ 收起」静默丢掉改动，徽标也就一直停在旧值。
+                                if (windowOpenFor === choice.id) {
+                                  closeWindow()
+                                  return
+                                }
+                                if (windowOpenFor !== null) closeWindow()
+                                setWindowOpenFor(choice.id)
+                              }}
                             >
                               {t('modelSpec', {
                                 context: formatWindow(windowNumberValue(choice)),
