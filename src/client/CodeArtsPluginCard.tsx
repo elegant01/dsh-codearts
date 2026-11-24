@@ -1348,6 +1348,8 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
 
   // 窗口弹层：点别处、按 Esc 收起。用 closest 查锚点，避免给每一行挂 ref。
   // 用 click 而不是 mousedown —— 先让浏览器把焦点挪走再收起，输入框里的草稿不会丢。
+  // 监听器闭包拿的是注册那一刻的草稿快照，所以两处草稿（窗口/输出）都必须进依赖：
+  // 第一版只依赖窗口草稿，清空输出后点外面收起，提交的是不含输出值的旧快照（#15）。
   useEffect(() => {
     if (windowOpenFor === null) return
     function onPointerDown(event: MouseEvent): void {
@@ -1367,7 +1369,7 @@ export function CodeArtsPluginCard({ t }: CodeArtsPluginCardInjected): React.Rea
       document.removeEventListener('click', onPointerDown)
       document.removeEventListener('keydown', onKeyDown)
     }
-  }, [windowOpenFor, windowDrafts, selection])
+  }, [windowOpenFor, windowDrafts, outputDrafts, selection])
 
   // 账号行尾「⋯」菜单：点别处、按 Esc 收起（与窗口弹层同一套做法）。
   useEffect(() => {
