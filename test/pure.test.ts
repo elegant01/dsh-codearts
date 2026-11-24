@@ -10,10 +10,14 @@ import {
   degradeTokenCeiling,
   estimatePromptTokens,
   estimateTokens,
+  isContextOverflowText,
   isTpmLimit,
+  learnContextWindow,
+  learnedContextWindowFor,
   maxTokensCeilingFor,
   prepareChatBody,
   rateLimitFrame,
+  resetLearnedContextWindows,
   resetTokenCeilings,
   setMaxTokenOverride,
   setMaxTokenOverrides,
@@ -21,6 +25,7 @@ import {
   MAX_TOKENS_CEILING,
   upstreamErrorMessage,
 } from '../src/upstream.ts'
+import { REQUEST_IMAGE_BUDGETS, resolveCodeArtsRetryPolicy } from '../src/adapter.ts'
 
 describe('canonicalModel', () => {
   it('maps the friendly alias to the upstream-registered spelling', () => {
@@ -437,5 +442,47 @@ describe('TPM rate limiting', () => {
     expect(upstreamErrorMessage('InferHub.4004.200: benefit not found'))
       .toContain('限时福利')
     expect(upstreamErrorMessage('weird failure', 500)).toContain('weird failure')
+  })
+})
+
+describe('context window learning guard (issue #18)', () => {
+  afterEach(() => {
+    delete process.env.CODEARTS_IGNORE_LEARNED
+    resetLearnedContextWindows()
+  })
+
+  // 字节侧超限与真超窗共用 InferHub.001001005.400，只有后者能学窗口上界。
+  it('only treats the explicit overflow wording as a window overflow', () => {
+    expect(isContextOverflowText(
+      'data: {"error_code":"InferHub.001001005.400","error_msg":"input token limit is 1048576"}',
+    )).toBe(true)
+    expect(isContextOverflowText(
+      'data: {"error_code":"InferHub.001001005.400","error_msg":"The request param is invalid, Please check it"}',
+    )).toBe(false)
+    expect(isContextOverflowText('')).toBe(false)
+  })
+
+  it('ignores learned windows while CODEARTS_IGNORE_LEARNED=1', () => {
+    learnContextWindow('deepseek-v4.1-flash-1017', 717_069)
+    expect(learnedContextWindowFor('deepseek-v4.1-flash-1017')).toBe(717_069)
+    process.env.CODEARTS_IGNORE_LEARNED = '1'
+    expect(learnedContextWindowFor('deepseek-v4.1-flash-1017')).toBeUndefined()
+    delete process.env.CODEARTS_IGNORE_LEARNED
+    expect(learnedContextWindowFor('deepseek-v4.1-flash-1017')).toBe(717_069)
+  })
+})
+
+describe('codearts retry policy', () => {
+  // retryableCodes 是替换语义：漏掉宿主默认项会让限流/超时不再重试。
+  it('retries MALFORMED_RESPONSE while keeping every host default code', () => {
+    const policy = resolveCodeArtsRetryPolicy()
+    expect(policy.mode).toBe('normal')
+    expect(policy.retryableCodes).toEqual(expect.arrayContaining([
+      'EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'MALFORMED_RESPONSE',
+    ]))
+  })
+
+  it('keeps the aggregate image budget under the upstream ~10 MB refusal', () => {
+    expect(REQUEST_IMAGE_BUDGETS.maxRequestImageBytes).toBeLessThan(8 * 1024 * 1024)
   })
 })

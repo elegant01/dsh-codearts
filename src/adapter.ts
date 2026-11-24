@@ -55,6 +55,23 @@ export const DEFAULT_CODEARTS_MAX_RETRIES = 8
 const DEFAULT_CODEARTS_INITIAL_DELAY_MS = 500
 const DEFAULT_CODEARTS_MAX_DELAY_MS = 10_000
 
+/**
+ * 重试码 = 宿主默认五项 + MALFORMED_RESPONSE。
+ *
+ * 模型偶尔把 tool_call 参数写成非法 JSON（未转义引号、流内 JSON 损坏），
+ * pi-ai 在**派发工具之前**就判整轮失败 —— 用户看到的是一轮报错、选项全无。
+ * 重发一次让模型重新生成，多数自愈。宿主的默认集合不含这个码，而
+ * `retryableCodes` 是替换语义（不是并入），所以五项默认值必须显式列全。
+ */
+const RETRYABLE_CODES = [
+  'EMPTY_RESPONSE',
+  'RATE_LIMIT',
+  'SERVER',
+  'TIMEOUT',
+  'TRANSPORT',
+  'MALFORMED_RESPONSE',
+] as const
+
 /** 用户在 `llm-codearts.config.retryPolicy` 里可调的三个旋钮。 */
 export interface CodeArtsRetryPolicyConfig {
   /** 首次请求之后最多重试几次（默认 8，覆盖 30s 冷却窗）。 */
@@ -75,6 +92,7 @@ export function resolveCodeArtsRetryPolicy(config?: CodeArtsRetryPolicyConfig): 
   const resolved: RetryPolicyConfig = {
     mode: 'normal',
     maxRetries: positiveInt(config?.maxRetries) ?? DEFAULT_CODEARTS_MAX_RETRIES,
+    retryableCodes: [...RETRYABLE_CODES],
     backoff: {
       initialDelayMs: positiveInt(config?.initialDelayMs) ?? DEFAULT_CODEARTS_INITIAL_DELAY_MS,
       maxDelayMs: positiveInt(config?.maxDelayMs) ?? DEFAULT_CODEARTS_MAX_DELAY_MS,
@@ -89,8 +107,15 @@ export function resolveCodeArtsRetryPolicy(config?: CodeArtsRetryPolicyConfig): 
 /** No per-token pricing is knowable for a subscription quota; report zero. */
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
 
-const REQUEST_IMAGE_BUDGETS = {
-  maxRequestImageBytes: 20_971_520,
+/**
+ * 6 MiB 而不是 20 MiB：上游网关对**整个请求体**约 10 MB 就拒（issue #18 实测
+ * 9.71 MB 过、10.41 MB 拒，且纯文本 1 MB 能过 ⇒ 是字节而非 token）。20 MiB 的
+ * 预算会让图片总量 10 MB 左右的请求直接发给上游，撞 InferHub.001001005.400，
+ * 再被误判成上下文超限。压到 6 MiB 后，宿主会把最老的图片换成占位文本
+ * （`read_image` 按需重读），给文本与工具定义留出约 4 MB 余量。
+ */
+export const REQUEST_IMAGE_BUDGETS = {
+  maxRequestImageBytes: 6_291_456,
   requestImagePixelBudget: 4_194_304,
   requestImageMaxBytes: 1_048_576,
 } as const

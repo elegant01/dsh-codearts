@@ -353,6 +353,8 @@ describe('max_tokens 上限降档自愈', () => {
 //  3) 用户在设置里的覆盖值要即时生效，不用等下一轮模型发现。
 describe('装不下时学到真实窗口并指向上下文', () => {
   const PARAM_INVALID = 'data: {"error_code":"InferHub.001001005.400","error_msg":"The request param is invalid, Please check it"}\n\n'
+  // 真超窗：同一个错误码，但文案里点名了超窗上限（issue #18 的区分依据）。
+  const OVERFLOW = 'data: {"error_code":"InferHub.001001005.400","error_msg":"This model\'s input token limit is 1048576, please reduce the prompt length"}\n\n'
   const BIG = 'x'.repeat(400_000) // 非 CJK，估算 ≈ 10 万 tokens
   const ASK_BIG = { model: 'GLM-5.2', messages: [{ role: 'user', content: BIG }], stream: true, max_tokens: 65_536 }
 
@@ -361,7 +363,7 @@ describe('装不下时学到真实窗口并指向上下文', () => {
     await startShim(
       body => {
         sent.push((JSON.parse(body) as { max_tokens?: number }).max_tokens ?? 0)
-        return [PARAM_INVALID]
+        return [OVERFLOW]
       },
       [{ id: 'GLM-5.2', contextWindow: 1_048_576, maxTokens: 65_536 }],
     )
@@ -373,6 +375,21 @@ describe('装不下时学到真实窗口并指向上下文', () => {
     const learned = learnedContextWindowFor('GLM-5.2')
     expect(learned).toBeGreaterThan(90_000)
     expect(learned).toBeLessThan(120_000)
+  })
+
+  // issue #18：图片/附件把请求体撑到约 10 MB 时上游回同一个通用码 —— 那不是
+  // 窗口问题，绝不能被学成 token 上界（否则每条请求都会被本地守卫拦住）。
+  it('通用参数非法（非超窗文案）不学窗口，报请求体过大', async () => {
+    resetLearnedContextWindows()
+    await startShim(
+      () => [PARAM_INVALID],
+      [{ id: 'GLM-5.2', contextWindow: 1_048_576, maxTokens: 65_536 }],
+    )
+    const res = await postSse(port, bearer, ASK_BIG)
+    expect(res.status).toBe(400)
+    expect(res.text).toContain('请求体过大')
+    expect(res.text).not.toContain('上下文放不下')
+    expect(learnedContextWindowFor('GLM-5.2')).toBeUndefined()
   })
 
   it('学过之后再发同样大小的请求，本地直接拦下、不打上游', async () => {

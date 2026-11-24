@@ -171,6 +171,17 @@ export function isParamInvalidFrame(text: string): boolean {
 }
 
 /**
+ * 上游的**真超窗**文案（`input token limit is 1048576`）。
+ *
+ * `InferHub.001001005.400` 是通用「参数非法」，图片/附件把请求体撑到约 10 MB
+ * 也会回它（issue #18）。两者共用错误码，只有超窗这一种才能拿来学窗口上界；
+ * 把字节问题当 token 问题上限记下来会把会话永久锁死。
+ */
+export function isContextOverflowText(text: string): boolean {
+  return /input token limit is\s*\d+/i.test(text)
+}
+
+/**
  * 本次进程内学到的上限（小写 id → 上限）。
  *
  * 上游会把「实测过」的值悄悄调低（GLM-5.2 的 131072 于 2026-10-10 被收），
@@ -276,8 +287,15 @@ export function resetTokenCeilings(): void {
  */
 const learnedContextWindow = new Map<string, number>()
 
-/** 该模型学到的真实窗口上界；没学过返回 undefined。 */
+/**
+ * 该模型学到的真实窗口上界；没学过返回 undefined。
+ *
+ * `CODEARTS_IGNORE_LEARNED=1` 是逃生门：旧版把请求体字节超限误学成 token
+ * 上界，会话会在本地被永久拦住（issue #18）。置这个环境变量后读取侧忽略
+ * 已学值（不清表），重启进程仍有效，用于自救已锁死的会话。
+ */
 export function learnedContextWindowFor(id: string): number | undefined {
+  if (process.env.CODEARTS_IGNORE_LEARNED === '1') return undefined
   return learnedContextWindow.get(ceilingKey(id))
 }
 

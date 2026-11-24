@@ -28,6 +28,7 @@ import {
   degradeTokenCeiling,
   firstFrameError,
   isConcurrencyCap,
+  isContextOverflowText,
   isIamTokenError,
   isModelNotAccessible,
   isNotMultimodal,
@@ -525,23 +526,38 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       if (!shouldHeal) return { prepared, result, head }
       await result.stream.cancel().catch(() => {})
       if (degradeTokenCeiling(prepared.model) === 0) {
-        // max_tokens 已经到地板还被判参数非法 ⇒ 不是 max_tokens 的问题，是 prompt 装不下。
-        // 把本次估算记成该模型的真实窗口上界（下一轮守卫会直接拦下来），并把报错指向
-        // 上下文 —— 继续让用户看到「max_tokens」只会把他引到重发/换号上（issue #9）。
-        if (prepared.promptTokens > 0) {
+        // max_tokens 已经到地板还被判参数非法。只有报错文案明确是超窗时才学
+        // 窗口上界：图片/附件把请求体撑到约 10 MB 也回同一个通用码（issue #18），
+        // 把字节问题记成 token 上界会让会话在本地被永久拦住。
+        const overflow = isContextOverflowText(headText ?? '')
+        if (overflow && prepared.promptTokens > 0) {
           const learned = learnContextWindow(prepared.model, prepared.promptTokens)
           logger?.warn(
-            `dsh-codearts: ${prepared.model} 在 max_tokens 地板仍被判参数非法，按本次 prompt 估算 ${prepared.promptTokens} tokens 学习窗口上界 ${learned}`,
+            `dsh-codearts: ${prepared.model} 上游明确报超窗，按本次 prompt 估算 ${prepared.promptTokens} tokens 学习窗口上界 ${learned}`,
           )
         }
-        const estimate = prepared.promptTokens > 0 ? `本次 prompt 估算约 ${prepared.promptTokens} tokens，` : ''
+        if (overflow) {
+          const estimate = prepared.promptTokens > 0 ? `本次 prompt 估算约 ${prepared.promptTokens} tokens，` : ''
+          return {
+            prepared,
+            result: {
+              ok: false,
+              kind: 'client',
+              status: 400,
+              message: `${prepared.model}: 上下文放不下 —— ${estimate}max_tokens 已降到 ${MAX_TOKENS_FLOOR} 仍被上游判参数非法。请压缩上下文（/compact）或新建会话；如果目录里的窗口值不准，可在设置里覆盖该模型的 contextWindow。`,
+            },
+          }
+        }
+        logger?.warn(
+          `dsh-codearts: ${prepared.model} 在 max_tokens 地板仍被判参数非法，但文案不是超窗 —— 按请求体过大处理，不学习窗口上界`,
+        )
         return {
           prepared,
           result: {
             ok: false,
             kind: 'client',
             status: 400,
-            message: `${prepared.model}: 上下文放不下 —— ${estimate}max_tokens 已降到 ${MAX_TOKENS_FLOOR} 仍被上游判参数非法。请压缩上下文（/compact）或新建会话；如果目录里的窗口值不准，可在设置里覆盖该模型的 contextWindow。`,
+            message: `${prepared.model}: 上游判定参数非法，但 max_tokens 已降到 ${MAX_TOKENS_FLOOR}，报错里也没有超窗口文案 —— 多半是请求体过大（内联图片/附件过多，上游约 10 MB 就拒）。请减少图片或附件后重试；这不是上下文窗口问题，本次没有记录窗口上界。`,
           },
         }
       }
