@@ -29,6 +29,7 @@ import {
   firstFrameError,
   isConcurrencyCap,
   isContextOverflowText,
+  isCreditExhausted,
   isIamTokenError,
   isModelNotAccessible,
   isNotMultimodal,
@@ -252,6 +253,13 @@ const QUEUE_HEARTBEAT_MS = 20_000
 const SERVER_COOLDOWN_MS = 30_000
 /** 零散错误累计到阈值后冷却该账号。 */
 const ERROR_COOLDOWN_MS = 60_000
+/**
+ * 积分耗尽后的冷却。积分是账号级的，不会在几十秒内回来（要等套餐周期刷新或
+ * 领取活动积分），30 秒的短冷却只会让它被反复选中、反复失败一遍。30 分钟是
+ * 「不反复白撞」与「用户中途领到积分后还能恢复」之间的折中；用户也可以在
+ * 卡片上暂停这个号。
+ */
+const CREDIT_COOLDOWN_MS = 30 * 60_000
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -494,12 +502,18 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
         logger?.warn(`dsh-codearts: ${prepared.model} 首帧被判排队，本地退避重发`)
         return { prepared, result: { ok: false, kind: 'client', status: 400, message: `queued: ${queued.message}` } }
       }
-      // 凭据失效 / 模型无权限 / 不吃图也都是流内首帧，与限流同样绕过了 classify()。
-      // 必须在转发之前认出来：凭据失效要能强制续期后重发，另外两种要翻成人话。
+      // 凭据失效 / 模型无权限 / 不吃图 / 积分耗尽也都是流内首帧，与限流同样绕过了
+      // classify()。必须在转发之前认出来：凭据失效要能强制续期后重发，积分耗尽要
+      // 换号（issue #20），另外两种要翻成人话。
       const upstreamError = headText === undefined ? undefined : firstFrameError(headText)
       if (upstreamError !== undefined) {
         const detail = `${upstreamError.code}: ${upstreamError.message}`.replace(/^: /, '')
-        if (isIamTokenError(detail) || isModelNotAccessible(detail) || isNotMultimodal(detail)) {
+        if (
+          isIamTokenError(detail)
+          || isModelNotAccessible(detail)
+          || isNotMultimodal(detail)
+          || isCreditExhausted(detail)
+        ) {
           reader.releaseLock()
           await result.stream.cancel().catch(() => {})
           logger?.warn(`dsh-codearts: ${prepared.model} 首帧报上游错误（${detail.slice(0, 160)}）`)
@@ -510,7 +524,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             ? 'iam_stale'
             : isModelNotAccessible(detail)
               ? 'not_found'
-              : 'client'
+              : isCreditExhausted(detail)
+                ? 'hard_credit'
+                : 'client'
           return { prepared, result: { ok: false, kind, status: KIND_STATUS[kind], message: detail } }
         }
       }
@@ -787,6 +803,12 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
             pool.disable(id, result.message)
             continue
           }
+          if (result.kind === 'hard_credit') {
+            // 积分耗尽是单号属性、不可跨号挪用（issue #20）：换号继续，而不是把
+            // 用户的可恢复请求判死。冷却要长 —— 积分不会在一条请求的预算内回来。
+            pool.cooldown(id, CREDIT_COOLDOWN_MS, '该账号积分已耗尽（TM.00001050），额度刷新或领取积分后恢复')
+            continue
+          }
           if (result.kind === 'server' || result.kind === 'soft_rate') {
             pool.cooldown(id, SERVER_COOLDOWN_MS, result.message)
             break
@@ -990,7 +1012,9 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       if (ev.error === undefined) return
       const code = String(ev.error.code ?? '')
       const message = String(ev.error.message ?? '').slice(0, 200)
-      logger?.error(`dsh-codearts: 上游流内报错 model=${model} code=${code} msg=${message}`)
+      // `code=` 这种 key=value 会被宿主的日志脱敏器整段打成 `****`，而上游错误码
+      // 不是密钥、正是排查最需要的那一项。换个写法避开它（issue #20）。
+      logger?.error(`dsh-codearts: 上游流内报错 model=${model} 错误码 ${code} msg=${message}`)
     } catch {
       // 帧被切断或不是 JSON：忽略
     }

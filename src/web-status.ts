@@ -495,9 +495,21 @@ export interface CodeArtsDoctorReport {
   hints: string[]
 }
 
+/** provider 注册状态（issue #19）：插件活着但模型选择器里没有 CodeArts 时，靠它自查。 */
+export interface CodeArtsProviderStatus {
+  /** `llm.registerAdapter` / `registerConfigurableProviders` 是否已成功。 */
+  registered: boolean
+  /** 启动引导走到哪一步：shim / register / discovery / ready。 */
+  stage: string
+  /** 注册抛错时的原文（注册失败才有）。 */
+  error?: string
+}
+
 export interface CodeArtsStatusRouteOptions {
   store: CodeArtsAccountStore
   models: () => readonly CodeArtsModelInfo[]
+  /** provider 注册状态（doctor 的 `provider` 一项）。 */
+  providerStatus?: () => CodeArtsProviderStatus
   enabledModels?: () => readonly string[] | undefined
   /** 账号池运行时（槽位占用/冷却/禁用）。省略则卡片不显示槽位区块。 */
   pool?: () => readonly AccountRuntime[]
@@ -914,6 +926,20 @@ async function doctorReport(deps: CodeArtsStatusRouteOptions): Promise<CodeArtsD
 
   checks.push({ id: 'models', ok: models.length > 0, detail: `${models.length}` })
   if (models.length === 0) hints.add('empty-catalog')
+
+  // 「插件 HTTP 面全活、模型选择器里却没有 CodeArts」是 issue #19 的现场。这一项
+  // 是用户唯一不靠重启就能分辨「注册了没有、卡在哪一步、注册时抛了什么」的地方。
+  const provider = deps.providerStatus?.()
+  if (provider !== undefined) {
+    checks.push({
+      id: 'provider',
+      ok: provider.registered,
+      detail: provider.registered
+        ? `registered (stage=${provider.stage})`
+        : `not registered (stage=${provider.stage}${provider.error === undefined ? '' : `; ${provider.error}`})`,
+    })
+    if (!provider.registered) hints.add('provider-not-registered')
+  }
 
   checks.push({
     id: 'usage',

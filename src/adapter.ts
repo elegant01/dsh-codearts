@@ -117,7 +117,32 @@ const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
 export const REQUEST_IMAGE_BUDGETS = {
   maxRequestImageBytes: 6_291_456,
   requestImagePixelBudget: 4_194_304,
+  /**
+   * 单图上限。这个字段在宿主里有两个拼写：0.2.2 及以前读 `requestImageMaxBytes`，
+   * 0.2.3 起 resolved profile 改叫 `maxImageBytes`（配置里的旧名由 resolveProfiles
+   * 映射过去）。本插件是手搓 profile、不走 resolveProfiles，两处都得写，各自忽略
+   * 不认识的那一个。
+   */
   requestImageMaxBytes: 1_048_576,
+  maxImageBytes: 1_048_576,
+  /**
+   * 0.2.3 起宿主要求的字节预算除数（issue #21）：
+   *   allocated = floor(maxRequestImageBytes / requestImageBudgetCount / 4) * 3
+   *   cap       = min(allocated, maxImageBytes)
+   * 漏掉它时分母是 undefined ⇒ NaN，`NaN < 1` 为 false 绕过宿主自检，带图请求
+   * 必然在附件层抛 INVALID_ATTACHMENT_REF。
+   *
+   * 取 4 而不是宿主默认的 20：allocated 只是 min() 的候选，除数必须让商仍盖过
+   * 1 MiB 单图上限，否则没人选的更小数字会悄悄顶替单图上限（6 MiB 时
+   * 20 → 235,929 字节，4 → 1,179,648）。5 已差一点（943,716），所以是 4。
+   */
+  requestImageBudgetCount: 4,
+  /**
+   * 0.2.2-rc.1 起 resolved profile 的必填项（宿主默认 50 / 10）。
+   * 不写等于「数量不设限」，在带图长会话里会先撞上游请求体上限才轮到宿主 offload。
+   */
+  maxRequestImages: 50,
+  imageOffloadCountQuantum: 10,
 } as const
 
 /** Inert pi-ai auth plane: the codearts route authenticates only via the shim secret. */

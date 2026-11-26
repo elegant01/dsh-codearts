@@ -485,4 +485,18 @@ describe('codearts retry policy', () => {
   it('keeps the aggregate image budget under the upstream ~10 MB refusal', () => {
     expect(REQUEST_IMAGE_BUDGETS.maxRequestImageBytes).toBeLessThan(8 * 1024 * 1024)
   })
+
+  // issue #21：宿主 0.2.3+ 会拿 requestImageBudgetCount 做除数，漏了它得到 NaN，
+  // 带图请求在附件层就炸（INVALID_ATTACHMENT_REF）；除数太小又会让「均分」悄悄
+  // 顶替 1 MiB 的单图上限。两条都钉住。
+  it('declares every image budget field host 0.2.3 divides by', () => {
+    const budget = REQUEST_IMAGE_BUDGETS
+    expect(budget.requestImageBudgetCount).toBeGreaterThan(0)
+    expect(Number.isInteger(budget.requestImageBudgetCount)).toBe(true)
+    const share = Math.floor(budget.maxRequestImageBytes / budget.requestImageBudgetCount / 4) * 3
+    expect(Number.isFinite(share)).toBe(true)
+    expect(share).toBeGreaterThanOrEqual(budget.maxImageBytes)
+    // 0.2.2 读旧拼写、0.2.3 读新拼写，两个必须是同一个上限。
+    expect(budget.maxImageBytes).toBe(budget.requestImageMaxBytes)
+  })
 })

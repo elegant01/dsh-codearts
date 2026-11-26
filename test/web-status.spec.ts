@@ -485,6 +485,22 @@ describe('GET /api/codearts/doctor', () => {
     const res = await call(routes.get(CODEARTS_DOCTOR_PATH)!, POST, CODEARTS_DOCTOR_PATH)
     expect(res.status).toBe(405)
   })
+
+  // issue #19：「插件 HTTP 面全活、模型选择器里却没有 CodeArts」只能靠这一项自查。
+  it('reports the provider registration state and where startup stopped', async () => {
+    const withProvider = mountRoutes({
+      store,
+      models: () => [],
+      providerStatus: () => ({ registered: false, stage: 'register', error: 'registerAdapter failed' }),
+    })
+    const res = await call(withProvider.get(CODEARTS_DOCTOR_PATH)!, GET, CODEARTS_DOCTOR_PATH)
+    const checks = res.body?.checks as { id: string; ok: boolean; detail?: string }[]
+    const provider = checks.find(check => check.id === 'provider')
+    expect(provider?.ok).toBe(false)
+    expect(provider?.detail).toContain('stage=register')
+    expect(provider?.detail).toContain('registerAdapter failed')
+    expect(res.body?.hints as string[]).toContain('provider-not-registered')
+  })
 })
 
 describe('GET /api/codearts/status', () => {

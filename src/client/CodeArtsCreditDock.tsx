@@ -21,7 +21,7 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactElement, type MouseEvent } from 'react'
-import { Button, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import { type CodeArtsDockFlags, type CodeArtsWebStatus } from '../web-status.ts'
 import type { UsageTotals } from '../usage.ts'
 import { stripModelSuffixes } from '../catalog.ts'
@@ -623,6 +623,11 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock', onOpenSett
           >
             {rows.length === 0 && <span>{t('creditsDockEmpty')}</span>}
 
+            {/* 多账号时说明合计的来历：上游积分是账号级的，合计多不代表每个号都能用。 */}
+            {rows.length > 1 && (
+              <span style={{ fontSize: 11, lineHeight: '15px' }}>{t('creditsDockPerAccountNote')}</span>
+            )}
+
             {rows.map(row => (
               // 一行「名 + 余额」、一行灰字用量，但**不带表头**：一旦有「账号 / 积分」
               // 两列表头，每个号占两行就立刻显得对不齐；名字和余额本身自带语义。
@@ -637,7 +642,9 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock', onOpenSett
                   }}
                 >
                   <span style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
-                    <StateDot state={row.remain === null ? 'warning' : 'done'} />
+                    {/* 余额 0 和「拿不到数」都是需要注意的状态（issue #20：合计很多不代表
+                        这个号能用），所以圆点也退到 warning，不再显示成一切正常。 */}
+                    <StateDot state={row.remain === null || row.remain < 1 ? 'warning' : 'done'} />
                     <span
                       style={{
                         overflow: 'hidden',
@@ -649,6 +656,9 @@ export function CodeArtsCreditDock({ useProjection, t, zone = 'dock', onOpenSett
                     >
                       {row.name}
                     </span>
+                    {row.remain !== null && row.remain < 1 && (
+                      <Tag tone="warning">{t('creditsDockExhausted')}</Tag>
+                    )}
                   </span>
                   <span style={PANEL_NUM_CELL}>{row.remain === null ? '—' : formatNumber(row.remain)}</span>
                 </div>

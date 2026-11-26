@@ -729,9 +729,27 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
     return summarizeClaims(results)
   }
 
+  /**
+   * 启动引导的进度（issue #19）。
+   *
+   * 「插件 HTTP 面全活、模型选择器里却没有 CodeArts」是宿主上真实出现过的分裂状态；
+   * 那一刻唯一能区分「shim 没起来 / 注册被首轮发现拖住 / 注册抛错」的证据就在这里，
+   * 由 /api/codearts/doctor 的 `provider` 一项读出去。
+   */
+  const startup: {
+    stage: 'shim' | 'register' | 'discovery' | 'ready'
+    registered: boolean
+    error?: string
+  } = { stage: 'shim', registered: false }
+
   ctx.inject(['webServer'], webCtx => registerCodeArtsStatusRoute(webCtx, {
     store,
     models: () => catalog.current(),
+    providerStatus: () => ({
+      registered: startup.registered,
+      stage: startup.stage,
+      ...(startup.error === undefined ? {} : { error: startup.error }),
+    }),
     enabledModels,
     setEnabledModels,
     // 卡片模型列表里那个窗口/输出上限输入框（issue #9 / #15）：读当前覆盖值 + 写入。
@@ -1061,9 +1079,15 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
   // 账本懒加载：读盘失败/文件不存在都不影响插件启动。
   void usage.load().catch(() => {})
 
-  // 启动引导：shim 起来 → 首轮发现 → 注册 provider，整条链作为 apply 的返回值等待
+  // 启动引导：shim 起来 → 注册 provider → 首轮发现，整条链作为 apply 的返回值等待
   // （issue #13）。一次性宿主（--list-models、headless 任务）在 profile 加载完立即
   // 列模型/解析模型，原来的同步 apply 让「加载完成」不等于「provider 就绪」。
+  //
+  // 注册必须排在首轮发现**之前**（issue #19）：发现要打上游、有自己的预算，一旦它
+  // 卡住（或只是慢过宿主的加载窗口），注册就永远轮不到 —— 表现就是插件 HTTP 面全活、
+  // 模型选择器和第三方提供商里却什么都没有。注册空目录是安全的：adapter 的
+  // getModels/listModels 每次都实时读 catalog，发现完成后模型自然出现；apply 仍然
+  // 等首轮发现，一次性宿主照样拿得到清单。
   const bootstrap = shim.ready
     .then(async () => {
       if (stopped) return
@@ -1073,13 +1097,12 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
       armAutoClaim()
       // 守护进程跟着启动：开关开着才起，关着什么都不做。
       armKeepAliveDaemon()
-      // 首轮发现等它完成（自带超时）；超时就按空目录继续注册，发现循环随后补上。
-      // 必须等完再注册：注册之后宿主随时会来列模型，目录还没填就是空列表。
-      await discover(AbortSignal.any([abort.signal, AbortSignal.timeout(STARTUP_DISCOVERY_MS)]))
-      if (stopped) return
+      startup.stage = 'register'
       // 版本不兼容时每条消息都会死在出网之前，所以要在这里说明白（卡片上也显示）。
+      // probe 只读模块、毫秒级，不挡注册。
       const incompatible = await probePiAiCompat()
       if (incompatible !== undefined) ctx.logger.error(`dsh-codearts: ${incompatible}`)
+      writeDebugLog?.(`bootstrap: shim ready, registering provider (catalog=${catalog.current().length})`)
       const codearts = createCodeArtsAdapter({
         shim,
         catalog,
@@ -1099,6 +1122,11 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
           settingsPath: [],
           declared: false,
         }])
+        startup.registered = true
+        writeDebugLog?.('bootstrap: provider registered')
+      } catch (error: unknown) {
+        startup.error = error instanceof Error ? error.message : String(error)
+        throw error
       } finally {
         if (releaseAdapter === undefined || releaseDirectory === undefined) {
           releaseAdapter?.()
@@ -1114,6 +1142,10 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
         releaseAdapter?.()
         releaseDirectory?.()
       }
+      startup.stage = 'discovery'
+      // 首轮发现等它完成（自带超时）；超时就按空目录继续，发现循环随后补上。
+      await discover(AbortSignal.any([abort.signal, AbortSignal.timeout(STARTUP_DISCOVERY_MS)]))
+      if (stopped) return
       // 全静默是 issue #13 的 C 项：注册时目录仍是空的，至少留一条 warn（宿主侧
       // 拿不到模型时不会报错）。有货的这一轮由 discover 自己打 debug。
       if (catalog.current().length === 0) {
@@ -1122,17 +1154,31 @@ export async function apply(ctx: Context, rawConfig: Config): Promise<void> {
             + 'models stay unavailable until discovery succeeds',
         )
       }
+      startup.stage = 'ready'
+      writeDebugLog?.(`bootstrap: ready (catalog=${catalog.current().length})`)
       if (!stopped) scheduleDiscovery(nextDiscoveryDelay())
     })
   const settled = bootstrap.catch((error: unknown) => {
+    startup.error = error instanceof Error ? error.message : String(error)
     ctx.logger.error('dsh-codearts: loopback shim failed to start; provider not registered', error)
   })
   // 外层兜底：shim 启动或 probe 自己卡住时，不能无限期拖住 profile 加载。
+  let startupTimedOut = false
   await Promise.race([
     settled,
     new Promise<void>(resolve => {
-      const timer = setTimeout(resolve, STARTUP_WAIT_MS)
+      const timer = setTimeout(() => {
+        startupTimedOut = true
+        resolve()
+      }, STARTUP_WAIT_MS)
       timer.unref?.()
     }),
   ])
+  // 超时说明引导链没走完：必须留一句能看见的话，否则用户只看到「模型里没有 CodeArts」。
+  if (startupTimedOut) {
+    ctx.logger.warn(
+      `dsh-codearts: 启动等待超时（阶段 ${startup.stage}，provider ${startup.registered ? '已注册' : '尚未注册'}），`
+        + '引导链继续在后台执行；可打开设置卡片查看体检，或读取 /api/codearts/doctor 自查',
+    )
+  }
 }

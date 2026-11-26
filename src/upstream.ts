@@ -830,6 +830,9 @@ export function upstreamErrorMessage(message: string, status = 0): string {
   if (isIamTokenError(message)) {
     return '上游判定本次登录凭据（IAM token）已失效。插件已尝试自动续期；若反复出现，请到设置卡片重新登录。'
   }
+  if (isCreditExhausted(message)) {
+    return '该账号的 CodeArts 积分已耗尽（上游 TM.00001050）。积分按账号独立计算、不能跨号挪用：多账号时到这个号的冷却结束或暂停它即可，积分周期刷新/领取活动积分后自动恢复。'
+  }
   if (isModelNotAccessible(message)) {
     return '上游说这个模型不存在或当前账号没有权限（可能已下线或改名）。请刷新模型列表后换一个模型；换号没有用，这是模型级的限制。'
   }
@@ -840,6 +843,22 @@ export function upstreamErrorMessage(message: string, status = 0): string {
     return '上游没有注册这个模型，它可能已经下线；请刷新模型列表后重选。'
   }
   return `codearts 上游错误 (http ${status}): ${message.slice(0, 400)}`
+}
+
+/**
+ * 「这个账号的套餐积分已耗尽」。
+ *
+ * 2026-11-25 实测（issue #20）：上游回 HTTP 400 + body
+ * `{"text":"[DONE]","error_code":"TM.00001050","error_msg":"您的积分已耗尽…"}`；
+ * 同一错误也可能以**流内首帧**（HTTP 200）出现，所以两条路都要认。
+ *
+ * 它是**确定不可恢复的单号属性**：积分是账号级的，不能跨号挪用，重发同一个号
+ * 只会再撞一次。处置和 iam_stale 一样 —— 换下一个号，并把这个号冷却足够久。
+ */
+export const CREDIT_EXHAUSTED_CODE = 'TM.00001050'
+
+export function isCreditExhausted(text: string): boolean {
+  return text.includes(CREDIT_EXHAUSTED_CODE) || text.includes('积分已耗尽')
 }
 
 /**
@@ -940,6 +959,8 @@ function classify(status: number, message: string): UpstreamErrorKind {
   // 不是「停用账号等重新登录」。
   if (isIamTokenError(message)) return 'iam_stale'
   if (isModelNotAccessible(message)) return 'not_found'
+  // 积分耗尽实测是 HTTP 400（不是 402），按措辞认，处置是换号。
+  if (isCreditExhausted(message)) return 'hard_credit'
   if (status === 401 || status === 403) return 'session_dead'
   if (status === 402) return 'hard_credit'
   if (status === 429) return 'soft_rate'

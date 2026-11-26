@@ -199,6 +199,8 @@ export interface CodeArtsSettingsKey {
   creditsDockEmpty: string
   creditsDockExpiring: string
   creditsDockUpdated: string
+  creditsDockExhausted: string
+  creditsDockPerAccountNote: string
   dockProvider: string
   dockModel: string
   dockNoModel: string
@@ -429,6 +431,8 @@ export const zh: CodeArtsSettingsKey = {
   creditsDockEmpty: '暂时没有积分数据',
   creditsDockExpiring: '{account}：{expiring} 积分将在本周期结束时作废',
   creditsDockUpdated: '最近刷新 {time}',
+  creditsDockExhausted: '已耗尽',
+  creditsDockPerAccountNote: '积分按账号独立计算、不能跨号挪用；底部合计是所有号的总和。',
   dockProvider: 'Provider {provider}',
   dockModel: 'Model {model}',
   dockNoModel: '未选择模型',
@@ -657,6 +661,8 @@ export const en: CodeArtsSettingsKey = {
   creditsDockEmpty: 'No credit data yet',
   creditsDockExpiring: '{account}: {expiring} credits expire when this cycle ends',
   creditsDockUpdated: 'Last updated {time}',
+  creditsDockExhausted: 'Exhausted',
+  creditsDockPerAccountNote: 'Credits are counted per account and cannot be pooled; the dock total is just the sum of every account.',
   dockProvider: 'Provider {provider}',
   dockModel: 'Model {model}',
   dockNoModel: 'No model selected',

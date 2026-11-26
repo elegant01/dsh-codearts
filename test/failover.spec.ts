@@ -35,6 +35,17 @@ const CAP_BODY = JSON.stringify({
 const TPM_FRAME = 'data: {"error_code":"InferHub.ModelArts.81114.429","error_msg":"Too many requests, the rate limit is 50000000 tokens per minute."}\n\n'
 
 /**
+ * 单账号积分耗尽（issue #20）。实测是 HTTP 400 + 这个 body；同一错误也会以
+ * 流内首帧（HTTP 200）出现，所以两种形态各准备一份。
+ */
+const CREDIT_BODY = JSON.stringify({
+  text: '[DONE]',
+  error_code: 'TM.00001050',
+  error_msg: '您的积分已耗尽，请关注活动积分领取活动或者升级套餐。',
+})
+const CREDIT_FRAME = 'data: {"text":"[DONE]","error_code":"TM.00001050","error_msg":"您的积分已耗尽"}\n\n'
+
+/**
  * 出网走 upstream.ts 的 dispatch：只给「字符串 URL + 普通 init」，头部是键已小写的
  * 普通对象（不能传 Request —— 邻居插件换了 globalThis.fetch 后会认不出）。
  */
@@ -134,14 +145,18 @@ function stubUpstream(options: {
   tpmTimes?: number
   capIds?: string[]
   capOnceIds?: string[]
+  creditIds?: string[]
+  creditFrameIds?: string[]
 } = {}): void {
   let aCalls = 0
   const capTimes = options.capTimes ?? (options.tpmTimes === undefined ? Number.POSITIVE_INFINITY : 0)
   const tpmTimes = options.tpmTimes ?? 0
   const capIds = new Set(options.capIds ?? [])
   const capOnceIds = new Set(options.capOnceIds ?? [])
+  const creditIds = new Set(options.creditIds ?? [])
+  const creditFrameIds = new Set(options.creditFrameIds ?? [])
   const callsByToken = new Map<string, number>()
-  const byId = capIds.size > 0 || capOnceIds.size > 0
+  const byId = capIds.size > 0 || capOnceIds.size > 0 || creditIds.size > 0 || creditFrameIds.size > 0
   vi.stubGlobal('fetch', vi.fn(async (_input: unknown, init?: { headers?: unknown }) => {
     const token = authTokenOf(init)
     seenTokens.push(token)
@@ -149,6 +164,10 @@ function stubUpstream(options: {
       const calls = (callsByToken.get(token) ?? 0) + 1
       callsByToken.set(token, calls)
       const id = idOfToken(token)
+      if (creditFrameIds.has(id)) return sseResponse([CREDIT_FRAME])
+      if (creditIds.has(id)) {
+        return new Response(CREDIT_BODY, { status: 400, headers: { 'content-type': 'application/json' } })
+      }
       if (capIds.has(id) || (capOnceIds.has(id) && calls === 1)) {
         return new Response(CAP_BODY, { status: 400, headers: { 'content-type': 'application/json' } })
       }
@@ -167,7 +186,14 @@ function stubUpstream(options: {
 
 async function start(
   accountIds: string[],
-  options: { capTimes?: number; tpmTimes?: number; capIds?: string[]; capOnceIds?: string[] } = {},
+  options: {
+    capTimes?: number
+    tpmTimes?: number
+    capIds?: string[]
+    capOnceIds?: string[]
+    creditIds?: string[]
+    creditFrameIds?: string[]
+  } = {},
 ): Promise<void> {
   ids = accountIds
   seenTokens = []
@@ -397,6 +423,43 @@ describe('cross-account failover', () => {
  * 签名请求要用 CodeArts 凭据重签，找不到凭据就在**本地**回 403（根本没出网）。
  * 这绝不能被当成凭据失效 —— 否则账号被永久禁用，重启、重新登录都救不回来。
  */
+describe('out-of-credit account (issue #20)', () => {
+  // 积分是账号级的、不能跨号挪用：一个号耗尽不该把整轮请求判死。
+  it('hands the request to the next account on HTTP 400 TM.00001050', async () => {
+    await start(['A', 'B'], { creditIds: ['A'] })
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('来自 B')
+    expect(seenTokens).toEqual([TOKEN_A, TOKEN_B])
+    // 是冷却而不是禁用：额度周期刷新/领取积分后它会自己回来。
+    const a = pool.get('A')
+    expect(a?.disabled).toBe(false)
+    expect(a?.coolUntil).toBeGreaterThan(Date.now() + 10 * 60_000)
+  })
+
+  it('recognises the first-frame form (HTTP 200 + in-stream error_code)', async () => {
+    await start(['A', 'B'], { creditFrameIds: ['A'] })
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('来自 B')
+    expect(seenTokens).toEqual([TOKEN_A, TOKEN_B])
+    expect(pool.get('A')?.disabled).toBe(false)
+  })
+
+  it('answers 402 with an actionable message when every account is exhausted', async () => {
+    await start(['A'], { creditIds: ['A'] })
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(402)
+    expect(res.text).toContain('积分已耗尽')
+    // 不能是「重新登录」那种误导：凭据是好的，缺的是额度。
+    expect(res.text).not.toContain('token')
+    expect(pool.get('A')?.disabled).toBe(false)
+  })
+})
+
 describe('local proxy resign refusal (issue #1)', () => {
   /** billion-context 拒签时的真实响应形状（403 + 这两个标记）。 */
   const RESIGN_BODY = JSON.stringify({
