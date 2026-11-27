@@ -12,6 +12,9 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { Readable } from 'node:stream'
 import { signRequest, type SignCredential } from './signer.ts'
 import {
   backfillParams,
@@ -992,11 +995,67 @@ async function dispatch(req: Request, body: BodyInit | undefined, signal?: Abort
   req.headers.forEach((value, key) => {
     headers[key] = value
   })
-  return fetch(req.url, {
+  const res = await fetch(req.url, {
     method: req.method,
     headers,
     ...(body === undefined ? {} : { body }),
     ...(signal === undefined ? {} : { signal }),
+  })
+  if (!isNeighborGateRefusal(res)) return res
+  await res.body?.cancel().catch(() => {})
+  return dispatchDirect(req.url, req.method, headers, body, signal)
+}
+
+/**
+ * billion-context 这类宿主层压缩代理会**在本地**拒收「不属于 bili 会话、又超过
+ * 静默直连字节上限」的请求（实测上限 8 MiB），回 422 + `x-bili-gate:
+ * oversize-refusal*`，根本没出网（issue #23）。它的拦截只挂在 `globalThis.fetch`
+ * 上，所以收到这个标记时换一份自己的 node:http(s) 连接直发 —— 签名与请求体
+ * 都不变，只是不再经过这层代理。
+ *
+ * 只认它自己的标记头：真正的上游 422 不带这个头，照常按 no_live_state 等
+ * 分类处理。
+ */
+function isNeighborGateRefusal(res: Response): boolean {
+  if (res.status !== 422) return false
+  return (res.headers.get('x-bili-gate') ?? '').startsWith('oversize-refusal')
+}
+
+/** 绕开 `globalThis.fetch` 的直连发送；响应流原样转成 web Response。 */
+function dispatchDirect(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  body: BodyInit | undefined,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const target = new URL(url)
+  const send = target.protocol === 'http:' ? httpRequest : httpsRequest
+  return new Promise<Response>((resolve, reject) => {
+    if (signal?.aborted === true) {
+      reject(new Error('This operation was aborted'))
+      return
+    }
+    const req = send(target, { method, headers }, res => {
+      const stream = Readable.toWeb(res) as unknown as ReadableStream<Uint8Array>
+      resolve(new Response(stream, {
+        status: res.statusCode ?? 502,
+        headers: res.headers as unknown as Record<string, string>,
+      }))
+    })
+    const onAbort = (): void => {
+      const error = new Error('This operation was aborted')
+      error.name = 'AbortError'
+      req.destroy(error)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    req.on('error', error => {
+      signal?.removeEventListener('abort', onAbort)
+      reject(error)
+    })
+    req.on('close', () => signal?.removeEventListener('abort', onAbort))
+    if (body !== undefined) req.write(body as string | Uint8Array)
+    req.end()
   })
 }
 

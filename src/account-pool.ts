@@ -42,6 +42,9 @@ const CAP_SAMPLE_KEEP = 5
 /** 连续出错多少次后短时冷却。 */
 export const ERROR_THRESHOLD = 3
 
+/** 睡到解冻时刻后再多醒一点，防止定时器抖动导致醒来时 `coolUntil` 还差几毫秒。 */
+const COOLDOWN_WAKE_EPSILON_MS = 250
+
 export interface AccountRuntime {
   id: string
   /** 我们这边正在飞的请求数。 */
@@ -324,6 +327,50 @@ export class CodeArtsAccountPool {
       const timer = setTimeout(() => finish(false), maxWaitMs)
       timer.unref?.()
       this.waiters.add(check)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  /**
+   * 最近一个冷却账号的解冻时刻（epoch ms）；没有冷却中的号返回 undefined。
+   *
+   * 与「槽位满」不同：解冻时刻是池子自己记的倒计时，精确已知 —— 值得内联等到
+   * 那一刻再发，而不是立刻回 429 让宿主在冷却窗里盲退避（issue #22）。禁用/暂停
+   * 的号不会自己恢复，不参与。
+   */
+  earliestCooldownEnd(): number | undefined {
+    const now = this.now()
+    let soonest: number | undefined
+    for (const account of this.accounts.values()) {
+      if (account.disabled || this.paused.has(account.id) || account.coolUntil <= now) continue
+      if (soonest === undefined || account.coolUntil < soonest) soonest = account.coolUntil
+    }
+    return soonest
+  }
+
+  /**
+   * 睡到最近一个冷却账号解冻，最多 `maxWaitMs`。
+   *
+   * 返回 true = 已经醒了（可能刚好到解冻时刻）；false = 没有冷却中的号、预算不够
+   * 或等待被中止。调用方醒后要重新走一遍选号：解冻的号可能又发了新请求。
+   */
+  waitForCooldownEnd(maxWaitMs: number, signal?: AbortSignal): Promise<boolean> {
+    const thawAt = this.earliestCooldownEnd()
+    if (thawAt === undefined || maxWaitMs <= 0) return Promise.resolve(false)
+    if (signal?.aborted === true) return Promise.resolve(false)
+    const waitMs = Math.min(maxWaitMs, Math.max(0, thawAt - this.now()))
+    return new Promise<boolean>(resolve => {
+      let settled = false
+      const finish = (value: boolean): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        resolve(value)
+      }
+      const onAbort = (): void => finish(false)
+      const timer = setTimeout(() => finish(true), waitMs + COOLDOWN_WAKE_EPSILON_MS)
+      timer.unref?.()
       signal?.addEventListener('abort', onAbort, { once: true })
     })
   }

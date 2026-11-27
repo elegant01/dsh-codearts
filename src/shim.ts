@@ -221,6 +221,11 @@ const MAX_CEILING_HEALS = 3
  */
 const ROTATE_MIN_ATTEMPTS = 3
 const ROTATE_MAX_ATTEMPTS = 6
+/**
+ * 轮换最多跑几轮：每轮重新按账号试一遍。轮间要么等本地槽位释放（槽满），
+ * 要么等冷却到点解冻（全在冷却）—— 两种都会让时间往前走，所以是有限的。
+ */
+const ROTATE_MAX_ROUNDS = 3
 /** 开始下一次尝试前必须留下的预算：一次挂号短探（默认 5 秒）再加一次开流。 */
 const ATTEMPT_RESERVE_MS = 20_000
 /**
@@ -701,6 +706,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     let queuedAccount: string | undefined
     let queueWaitedMs = 0
     let localSlotWaitedMs = 0
+    let cooldownWaitedMs = 0
     let lastKind: UpstreamErrorKind | undefined
     let lastAccountId: string | undefined
     let lastStatus = 0
@@ -717,7 +723,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
      * 再跑第二轮。以前这里直接落到「没有可用账号」的 429，并发派发（一次 5 个
      * subagent）必然误伤（issue #8）。
      */
-    for (let round = 0; round < 2; round += 1) {
+    for (let round = 0; round < ROTATE_MAX_ROUNDS; round += 1) {
       tried.clear()
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         // 剩下的预算还得够过一次挂号短探（queue.ts 的 maxWaitMs 默认 5 秒）和一次开流，
@@ -823,9 +829,25 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
       }
 
       if (lastKind !== undefined || controller.signal.aborted) break
-      // 一个号都没选出来：先分辨是不是「全都只是本地槽位满」。是的话等一个槽位
-      // 空出来再跑一轮；预算从共用截止点里扣，等待期间不占任何槽位。
-      if (!pool.hasBusyWaitable()) break
+      // 一个号都没选出来：先分辨是「全在冷却」还是「全都只是本地槽位满」。
+      // 冷却的解冻时刻精确已知，内联等到那一刻再跑一轮 —— 立刻回 429 只会让宿主
+      // 在冷却窗里按固定退避盲试，窗内每一次重试都注定失败（issue #22）。
+      // 积分冷却 30 分钟这类超预算的会落到下面的 break，照旧报剩余秒数。
+      if (!pool.hasBusyWaitable()) {
+        const thawAt = pool.earliestCooldownEnd()
+        const thawBudget = rotateDeadline - ATTEMPT_RESERVE_MS - Date.now()
+        if (thawAt === undefined || thawBudget <= 0) break
+        if (thawAt - Date.now() > thawBudget) break
+        const coolingSince = Date.now()
+        debug?.(`cooldown wait start req=${requestTag} thawIn=${thawAt - coolingSince}ms`)
+        const thawed = await pool.waitForCooldownEnd(thawBudget, controller.signal)
+        cooldownWaitedMs += Date.now() - coolingSince
+        debug?.(`cooldown wait ${thawed ? 'done' : 'timeout'} req=${requestTag} waited=${Date.now() - coolingSince}ms`)
+        if (!thawed) break
+        continue
+      }
+      // 全都只是本地槽位满：等一个槽位空出来再跑一轮；预算从共用截止点里扣，
+      // 等待期间不占任何槽位。
       const waitBudget = Math.min(localSlotWaitBudgetMs, rotateDeadline - ATTEMPT_RESERVE_MS - Date.now())
       if (waitBudget <= 0) break
       const waitingSince = Date.now()
@@ -896,6 +918,7 @@ export function createCodeArtsShim(options: CodeArtsShimOptions): CodeArtsShim {
     const waits: string[] = []
     if (queueWaitedMs >= 1_000) waits.push(`排队重试 ${Math.round(queueWaitedMs / 1000)} 秒`)
     if (localSlotWaitedMs >= 1_000) waits.push(`等本地槽位 ${Math.round(localSlotWaitedMs / 1000)} 秒`)
+    if (cooldownWaitedMs >= 1_000) waits.push(`等冷却解冻 ${Math.round(cooldownWaitedMs / 1000)} 秒`)
     const waited = waits.length > 0 ? `（本地已${waits.join('、')}）` : ''
     const failedKind = isQueueRejectText(lastMessage) ? 'queued' : lastKind
     usage?.noteFailure(failedKind, lastAccountId)

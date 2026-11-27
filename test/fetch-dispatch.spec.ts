@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createServer, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import {
   chatStream,
   clearQueueStatus,
@@ -149,5 +151,101 @@ describe('outbound requests never carry a Request object', () => {
     const headers = headerRecord(calls[0]!.init)
     expect(headers['agent-type']).toBe('PromptCenter')
     expect(headers.authorization).toMatch(/^SDK-HMAC-SHA256 /)
+  })
+})
+
+/**
+ * issue #23：billion-context 把 `globalThis.fetch` 接进它自己的链路，对「未归属
+ * 会话、又超过静默直连上限」的请求在**本地**回 422 + `x-bili-gate:
+ * oversize-refusal*`，根本没出网。插件要能认出这个标记，换自己的 node:http(s)
+ * 连接直发，而不是把它的本地拒绝当成上游错误。
+ */
+describe('neighbor gate refusal falls back to a direct connection', () => {
+  const biliRefusal = (): Response => new Response(JSON.stringify({
+    error: {
+      type: 'server_error',
+      code: 'bili_gate_oversize_refusal_unattributed_bytes',
+      message: 'billion-context refused this request locally',
+      retryable: true,
+    },
+  }), { status: 422, headers: { 'content-type': 'application/json', 'x-bili-gate': 'oversize-refusal-unattributed-bytes' } })
+
+  const payload = JSON.stringify({ model: 'GLM-5.2', messages: [{ role: 'user', content: '你好' }], stream: true })
+
+  /** 假上游：记录直连收到的请求，回一段最小 SSE。 */
+  async function listen(): Promise<{ server: Server; url: string; seen: { body: string; authorization: string; count: number } }> {
+    const seen = { body: '', authorization: '', count: 0 }
+    const server = createServer((req, res) => {
+      seen.count += 1
+      seen.authorization = String(req.headers.authorization ?? '')
+      const chunks: Buffer[] = []
+      req.on('data', (chunk: Buffer) => chunks.push(chunk))
+      req.on('end', () => {
+        seen.body = Buffer.concat(chunks).toString('utf8')
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(
+          'data: {"choices":[{"index":0,"delta":{"content":"直连成功"},"finish_reason":"stop"}]}\n\n'
+          + 'data: [DONE]\n\n',
+        )
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()))
+    const { port } = server.address() as AddressInfo
+    return { server, url: `http://127.0.0.1:${port}/api/v2/chat/completions`, seen }
+  }
+
+  async function drain(stream: ReadableStream<Uint8Array>): Promise<string> {
+    const reader = stream.getReader()
+    const decoder = new TextDecoder()
+    let text = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return text
+      text += decoder.decode(value, { stream: true })
+    }
+  }
+
+  it('resends the signed request over its own connection', async () => {
+    const upstream = await listen()
+    try {
+      const calls = foreignFetch(biliRefusal)
+      const result = await chatStream(credential, {
+        url: upstream.url,
+        body: payload,
+        model: 'GLM-5.2',
+        chatId: 'chat-1',
+      })
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) throw new Error(result.message)
+      // 先走了全局 fetch（发现被本地拒收），再改走自己的连接。
+      expect(calls).toHaveLength(1)
+      expect(upstream.seen.count).toBe(1)
+      // 请求体与签名头原样保留：直连只是换传输，不改协议内容。
+      expect(upstream.seen.body).toBe(payload)
+      expect(upstream.seen.authorization).toMatch(/^SDK-HMAC-SHA256 /)
+      expect(await drain(result.stream)).toContain('直连成功')
+    } finally {
+      upstream.server.closeAllConnections()
+      await new Promise<void>(resolve => upstream.server.close(() => resolve()))
+    }
+  })
+
+  it('leaves a genuine upstream 422 alone', async () => {
+    const upstream = await listen()
+    try {
+      foreignFetch(() => new Response('{"error":{"code":"something_real"}}', {
+        status: 422,
+        headers: { 'content-type': 'application/json' },
+      }))
+      const result = await chatStream(credential, { url: upstream.url, body: payload, model: 'GLM-5.2' })
+
+      expect(result.ok).toBe(false)
+      // 没有 bili 标记头就按上游错误处理，不偷偷重发。
+      expect(upstream.seen.count).toBe(0)
+    } finally {
+      upstream.server.closeAllConnections()
+      await new Promise<void>(resolve => upstream.server.close(() => resolve()))
+    }
   })
 })

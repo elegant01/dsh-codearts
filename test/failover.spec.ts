@@ -613,14 +613,33 @@ describe('no-account error message', () => {
     await Promise.all(inflight)
   })
 
-  it('says how long the cooldown lasts when every account is cooling', async () => {
+  // issue #22：解冻时刻是池子自己记的倒计时，精确已知 —— 请求应当内联等到那一刻
+  // 再发，而不是立刻回 429 把「有死线的等待」交给宿主盲退避（窗内重试必败）。
+  it('waits out a short cooldown in-process instead of answering 429', async () => {
     await start(['A'], { capTimes: 0 })
     pool.sync(['A'])
-    pool.cooldown('A', 30_000, 'upstream 500')
+    pool.cooldown('A', 200, 'upstream 500')
+
+    const started = Date.now()
+    const res = await post(port, bearer)
+
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('来自 B')
+    expect(Date.now() - started).toBeGreaterThanOrEqual(150)
+    // 冷却期内一次失败都没记：等到了解冻才真正发请求。
+    expect(seenTokens).toEqual([TOKEN_A])
+  }, 10_000)
+
+  // 超预算的冷却照旧快速失败：积分耗尽的 30 分钟冷却不可能在一条请求里等完。
+  it('says how long the cooldown lasts when it outlasts the wait budget', async () => {
+    await start(['A'], { capTimes: 0 })
+    pool.sync(['A'])
+    pool.cooldown('A', 120_000, 'upstream 500')
 
     const res = await post(port, bearer)
     expect(res.status).toBe(429)
     expect(res.text).toContain('冷却')
+    expect(res.text).toContain('约 120 秒')
     expect(seenTokens.length).toBe(0)
   })
 })
